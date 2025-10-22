@@ -1,0 +1,49 @@
+{
+  "$schema": "https://raw.githubusercontent.com/grafana/grafana/master/docs/sources/developers/plugins/plugin.schema.json",
+  "type": "datasource",
+  "name": "Arc",
+  "id": "basekick-arc-datasource",
+  "metrics": true,
+  "backend": true,
+  "executable": "gpx_arc",
+  "info": {
+    "description": "High-performance datasource for Arc time-series database using Apache Arrow",
+    "author": {
+      "name": "Basekick Labs",
+      "url": "https://github.com/basekick-labs"
+    },
+    "keywords": [
+      "arc",
+      "timeseries",
+      "arrow",
+      "sql",
+      "columnar",
+      "analytics"
+    ],
+    "logos": {
+      "small": "img/logo.svg",
+      "large": "img/logo.svg"
+    },
+    "links": [
+      {
+        "name": "GitHub",
+        "url": "https://github.com/basekick-labs/grafana-arc-datasource"
+      },
+      {
+        "name": "Arc Documentation",
+        "url": "https://github.com/basekick-labs/arc"
+      },
+      {
+        "name": "License",
+        "url": "https://github.com/basekick-labs/grafana-arc-datasource/blob/main/LICENSE"
+      }
+    ],
+    "screenshots": [],
+    "version": "1.0.0",
+    "updated": "2025-10-22"
+  },
+  "dependencies": {
+    "grafanaDependency": ">=10.0.0",
+    "plugins": []
+  }
+}
