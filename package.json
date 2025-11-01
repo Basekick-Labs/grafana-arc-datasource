@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "description": "High-performance Grafana datasource for Arc using Apache Arrow",
   "scripts": {
-    "build": "webpack -c ./.config/webpack/webpack.config.ts --env production",
-    "dev": "webpack -w -c ./.config/webpack/webpack.config.ts --env development",
+    "build": "webpack -c ./.config/webpack/webpack.config.js --env production",
+    "dev": "webpack -w -c ./.config/webpack/webpack.config.js --env development",
     "test": "jest --watch --onlyChanged",
     "test:ci": "jest --passWithNoTests --maxWorkers 4",
     "typecheck": "tsc --noEmit",

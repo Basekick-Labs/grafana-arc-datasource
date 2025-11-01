@@ -1,11 +1,6 @@
 {
   "extends": ["@grafana/eslint-config"],
   "root": true,
-  "plugins": ["@emotion", "lodash", "jest", "import", "jsx-a11y"],
-  "settings": {
-    "import/internal-regex": "^(app/)|(@grafana)",
-    "import/external-module-folders": ["node_modules", ".yarn"]
-  },
   "rules": {
     "react/prop-types": "off",
     "@typescript-eslint/no-explicit-any": "off"

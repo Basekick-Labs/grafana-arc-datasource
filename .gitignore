@@ -120,3 +120,14 @@ public.pem
 
 # Local development
 .local/
+
+# Build artifacts and development files
+*.backup
+*.bak
+src.backup/
+pkg.backup/
+docker-compose.yml
+grafana-arc-datasource-plugin.tar.gz
+
+# Screenshot instructions (the actual screenshots should be committed)
+img/SCREENSHOTS.md

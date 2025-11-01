@@ -6,6 +6,7 @@
   "metrics": true,
   "backend": true,
   "executable": "gpx_arc",
+  "alerting": true,
   "info": {
     "description": "High-performance datasource for Arc time-series database using Apache Arrow",
     "author": {

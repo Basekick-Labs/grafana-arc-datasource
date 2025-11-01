@@ -2,22 +2,45 @@
 
 High-performance Grafana datasource plugin for Arc time-series database using Apache Arrow for efficient data transfer.
 
+## Screenshots
+
+### Dashboard with Real-time Monitoring
+![System monitoring dashboard showing CPU, memory, disk, and network metrics](img/dashboard.png)
+
+### Query Editor
+![SQL query editor with Arc datasource](img/query-editor.png)
+
+### Data Inspector
+![Query results and data inspection](img/inspect.png)
+
+### Variable Configuration
+![Template variable configuration with dynamic host selection](img/variables.png)
+
+### Datasource Configuration
+![Arc datasource settings and connection setup](img/datasource.png)
+
+### Alerting
+![Alert rule configuration with Arc SQL queries](img/alerts.png)
+
 ## Features
 
 - **Apache Arrow Protocol**: Uses Arc's `/api/v1/query/arrow` endpoint for columnar data transfer
-- **High Performance**: 3-5x faster than JSON with 43% smaller payloads
-- **Zero-Copy**: Direct Arrow IPC deserialization for minimal overhead
+- **High Performance**: Optimized data processing with streaming deserialization
+- **JSON Fallback**: Automatic fallback to JSON endpoint for compatibility
+- **Alerting Support**: Full support for Grafana alerting and notifications
 - **SQL Query Editor**: Full SQL support with syntax highlighting
-- **Time-series Optimized**: Native support for time_bucket aggregations
+- **Template Variables**: Dynamic dashboard filters with variable support
+- **Time-series Optimized**: Native support for DuckDB time functions
 - **Multi-database**: Query across different Arc databases/schemas
 - **Secure**: API key authentication with secure credential storage
 
 ## Performance
 
-Compared to traditional JSON datasources:
-- **7.36x faster** for large result sets (100K+ rows)
-- **43% smaller** network payloads
-- **Zero-copy** data deserialization
+Real-world performance metrics:
+- **Data processing**: <1ms for time-series conversion
+- **Query execution**: Depends on Arc server (typically 100-500ms)
+- **Streaming deserialization**: Zero-copy Arrow IPC parsing
+- **Optimized sorting**: O(n log n) time-series sorting
 
 ## Installation
 
@@ -89,41 +112,42 @@ The Arc datasource provides a SQL query editor with:
 **Basic time-series query:**
 ```sql
 SELECT
-  time,
-  host,
-  usage_idle
-FROM cpu
-WHERE $__timeFilter(time)
-ORDER BY time
+  DATE_TRUNC('minute', time) AS time,
+  AVG(usage_idle) * -1 + 100 AS cpu_usage,
+  host
+FROM telegraf.cpu
+WHERE cpu = 'cpu-total'
+  AND $__timeFilter(time)
+GROUP BY DATE_TRUNC('minute', time), host
+ORDER BY time ASC
 ```
 
-**Aggregated metrics:**
+**Memory usage:**
 ```sql
 SELECT
-  time_bucket(INTERVAL '1 minute', time) as time,
-  host,
-  AVG(usage_idle) as avg_cpu_idle,
-  MAX(usage_user) as max_cpu_user
-FROM cpu
+  DATE_TRUNC('minute', time) AS time,
+  AVG(used_percent) AS memory_used,
+  host
+FROM telegraf.mem
 WHERE $__timeFilter(time)
-GROUP BY time, host
-ORDER BY time
+GROUP BY DATE_TRUNC('minute', time), host
+ORDER BY time ASC
 ```
 
-**Multi-database query:**
+**Network traffic (bytes to bits):**
 ```sql
 SELECT
-  p.time,
-  p.host,
-  p.usage_idle as prod_cpu,
-  s.usage_idle as staging_cpu
-FROM production.cpu p
-JOIN staging.cpu s
-  ON p.time = s.time
-  AND p.host = s.host
-WHERE $__timeFilter(p.time)
-ORDER BY p.time DESC
-LIMIT 1000
+  DATE_TRUNC('minute', time) AS time,
+  GREATEST(
+    AVG(bytes_recv) - LAG(AVG(bytes_recv)) OVER (PARTITION BY host, interface ORDER BY DATE_TRUNC('minute', time)),
+    0
+  ) / 60.0 * 8 AS bits_in,
+  host,
+  interface
+FROM telegraf.net
+WHERE $__timeFilter(time)
+GROUP BY DATE_TRUNC('minute', time), host, interface
+ORDER BY time ASC
 ```
 
 ### Macros
@@ -135,8 +159,7 @@ The datasource provides several macros for dynamic queries:
 | `$__timeFilter(column)` | Adds time range filter | `WHERE $__timeFilter(time)` |
 | `$__timeFrom()` | Start of time range | `time >= $__timeFrom()` |
 | `$__timeTo()` | End of time range | `time < $__timeTo()` |
-| `$__interval` | Grafana's calculated interval | `time_bucket(INTERVAL '$__interval', time)` |
-| `$__timeGroup(column, interval)` | Time bucketing | `$__timeGroup(time, '1m')` |
+| `$__interval` | Grafana's calculated interval | `DATE_TRUNC('$__interval', time)` |
 
 ### Variables
 
@@ -144,18 +167,50 @@ Create dashboard variables to make queries dynamic:
 
 **Host variable:**
 ```sql
-SELECT DISTINCT host FROM cpu ORDER BY host
+SELECT DISTINCT host FROM telegraf.cpu ORDER BY host
 ```
 
-**Measurement variable:**
+**Interface variable:**
 ```sql
-SHOW TABLES
+SELECT DISTINCT interface FROM telegraf.net ORDER BY interface
 ```
 
-Use in queries:
+**Database variable:**
 ```sql
-SELECT * FROM $measurement WHERE host = '$host'
+SHOW DATABASES
 ```
+
+Use variables in queries with `${variable:raw}` syntax:
+```sql
+SELECT
+  DATE_TRUNC('minute', time) AS time,
+  AVG(usage_idle) AS cpu_idle,
+  host
+FROM telegraf.cpu
+WHERE host = '${server:raw}'
+  AND cpu = '${cpu:raw}'
+  AND $__timeFilter(time)
+GROUP BY DATE_TRUNC('minute', time), host
+ORDER BY time ASC
+```
+
+### Alerting
+
+The datasource fully supports Grafana alerting. Create alert rules with Arc queries:
+
+**Example alert query (CPU usage > 80%):**
+```sql
+SELECT
+  time,
+  100 - usage_idle AS cpu_usage,
+  host
+FROM telegraf.cpu
+WHERE cpu = 'cpu-total'
+  AND time >= NOW() - INTERVAL '5 minutes'
+ORDER BY time ASC
+```
+
+Then set alert condition: `WHEN avg() OF query(A, 5m, now) IS ABOVE 80`
 
 ## Development
 

@@ -1,122 +1,102 @@
 import {
-  DataQueryRequest,
   DataQueryResponse,
-  DataSourceApi,
-  DataSourceInstanceSettings,
   MetricFindValue,
+  DataSourceInstanceSettings,
+  CoreApp,
+  ScopedVars,
+  VariableWithMultiSupport,
 } from '@grafana/data';
+import { frameToMetricFindValue, DataSourceWithBackend, getTemplateSrv } from '@grafana/runtime';
+import { ArcQuery, ArcDataSourceOptions, defaultQuery } from './types';
+import { lastValueFrom } from 'rxjs';
 
-import { getBackendSrv } from '@grafana/runtime';
-
-import { ArcQuery, ArcDataSourceOptions } from './types';
-
-export class ArcDataSource extends DataSourceApi<ArcQuery, ArcDataSourceOptions> {
-  url?: string;
-  database?: string;
-
+/**
+ * Arc DataSource - extends DataSourceWithBackend to automatically handle
+ * all backend communication and frame parsing
+ */
+export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSourceOptions> {
   constructor(instanceSettings: DataSourceInstanceSettings<ArcDataSourceOptions>) {
     super(instanceSettings);
-    this.url = instanceSettings.jsonData.url;
-    this.database = instanceSettings.jsonData.database || 'default';
   }
 
   /**
-   * Query Arc datasource
-   * Called by Grafana when a panel needs data
+   * Query for template variables
    */
-  async query(options: DataQueryRequest<ArcQuery>): Promise<DataQueryResponse> {
-    // Use backend plugin to execute queries
-    return getBackendSrv().fetch({
-      url: '/api/ds/query',
-      method: 'POST',
-      data: {
-        queries: options.targets.map((target) => ({
-          ...target,
-          datasourceId: this.id,
-        })),
-        range: options.range,
-        from: options.range.from.valueOf().toString(),
-        to: options.range.to.valueOf().toString(),
-      },
-    }).toPromise() as Promise<DataQueryResponse>;
+  async metricFindQuery(query: any, options?: any): Promise<MetricFindValue[]> {
+    // Handle both string SQL and query object
+    let sqlQuery: string;
+
+    if (typeof query === 'string') {
+      // Simple string query
+      sqlQuery = query;
+    } else if (query && typeof query === 'object') {
+      // Query object - extract SQL from various possible field names
+      sqlQuery = query.sql || query.query || query.rawSql || '';
+
+      // Log to help debug
+      if (!sqlQuery) {
+        console.warn('metricFindQuery received object without sql:', query);
+      }
+    } else {
+      sqlQuery = '';
+    }
+
+    const target: ArcQuery = {
+      refId: 'metricFindQuery',
+      sql: sqlQuery,
+      format: 'table',
+      rawQuery: true,
+    };
+
+    return lastValueFrom(
+      super.query({
+        ...(options ?? {}), // includes 'range'
+        targets: [target],
+      })
+    ).then(this.toMetricFindValue);
   }
 
-  /**
-   * Test datasource connection
-   * Called when user clicks "Save & Test"
-   */
-  async testDatasource() {
-    // Backend plugin handles health check
-    return getBackendSrv()
-      .fetch({
-        url: `/api/datasources/${this.id}/health`,
-        method: 'GET',
-      })
-      .toPromise()
-      .then((response: any) => {
-        if (response.status === 200) {
-          return {
-            status: 'success',
-            message: 'Arc datasource is working',
-            title: 'Success',
-          };
-        }
-
-        return {
-          status: 'error',
-          message: response.message || 'Unknown error',
-          title: 'Error',
-        };
-      })
-      .catch((error: any) => {
-        return {
-          status: 'error',
-          message: error.message || 'Failed to connect to Arc',
-          title: 'Error',
-        };
-      });
+  toMetricFindValue(rsp: DataQueryResponse): MetricFindValue[] {
+    const data = rsp.data ?? [];
+    // Create MetricFindValue object for all frames
+    const values = data.map((d) => frameToMetricFindValue(d)).flat();
+    // Filter out duplicate elements
+    return values.filter((elm, idx, self) => idx === self.findIndex((t) => t.text === elm.text));
   }
 
-  /**
-   * Get metric find values for template variables
-   */
-  async metricFindQuery(query: string): Promise<MetricFindValue[]> {
-    // Use backend to execute query
-    const response = await getBackendSrv()
-      .fetch({
-        url: '/api/ds/query',
-        method: 'POST',
-        data: {
-          queries: [
-            {
-              refId: 'metricFindQuery',
-              sql: query,
-              datasourceId: this.id,
-            },
-          ],
-        },
-      })
-      .toPromise();
+  getDefaultQuery(_: CoreApp): Partial<ArcQuery> {
+    return defaultQuery;
+  }
 
-    if (!response.data || !response.data.results) {
-      return [];
+  quoteLiteral(value: string) {
+    return "'" + value.replace(/'/g, "''") + "'";
+  }
+
+  interpolateVariable = (value: string | string[] | number, variable: VariableWithMultiSupport) => {
+    if (typeof value === 'string') {
+      if (variable?.multi || variable?.includeAll) {
+        return this.quoteLiteral(value);
+      } else {
+        return String(value).replace(/'/g, "''");
+      }
     }
 
-    const result = response.data.results['metricFindQuery'];
-    if (!result || !result.frames || result.frames.length === 0) {
-      return [];
+    if (typeof value === 'number') {
+      return value;
     }
 
-    const frame = result.frames[0];
-    if (!frame.data || !frame.data.values || frame.data.values.length === 0) {
-      return [];
+    if (Array.isArray(value)) {
+      const quotedValues = value.map((v) => this.quoteLiteral(v));
+      return quotedValues.join(',');
     }
 
-    // Convert first column to metric find values
-    const values = frame.data.values[0];
-    return values.map((value: any) => ({
-      text: String(value),
-      value: value,
-    }));
+    return value;
+  };
+
+  applyTemplateVariables(query: ArcQuery, scopedVars: ScopedVars): ArcQuery {
+    return {
+      ...query,
+      sql: getTemplateSrv().replace(query.sql, scopedVars, this.interpolateVariable),
+    };
   }
 }

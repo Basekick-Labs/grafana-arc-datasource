@@ -25,7 +25,7 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
     <div className="gf-form-group">
       <InlineField
         label="Format"
-        labelWidth={20}
+        labelWidth={14}
         tooltip="Choose how to format the query results"
       >
         <RadioButtonGroup
@@ -35,32 +35,28 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
         />
       </InlineField>
 
-      <div className="gf-form">
-        <label className="gf-form-label width-20">SQL Query</label>
-        <div className="gf-form-input" style={{ width: '100%' }}>
-          <TextArea
-            value={query.sql || ''}
-            onChange={onSQLChange}
-            onBlur={onRunQuery}
-            placeholder="SELECT * FROM cpu WHERE $__timeFilter(time) LIMIT 100"
-            rows={10}
-            style={{
-              width: '100%',
-              fontFamily: 'monospace',
-              fontSize: '13px'
-            }}
-          />
-        </div>
-      </div>
-
-      <div className="gf-form">
-        <label className="gf-form-label width-20"></label>
-        <div className="gf-form-label">
-          <small style={{ color: '#999' }}>
-            <strong>Macros:</strong> $__timeFilter(column), $__timeFrom(), $__timeTo(), $__interval
-            <br />
-            <strong>Example:</strong> SELECT time, AVG(usage_idle) FROM cpu WHERE $__timeFilter(time) GROUP BY time_bucket(INTERVAL '$__interval', time)
-          </small>
+      <div className="gf-form" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>
+        <label className="gf-form-label" style={{ marginBottom: '8px' }}>SQL Query</label>
+        <TextArea
+          value={query.sql || ''}
+          onChange={onSQLChange}
+          onBlur={onRunQuery}
+          placeholder="SELECT * FROM systems.cpu ORDER BY time DESC LIMIT 100"
+          rows={8}
+          style={{
+            width: '100%',
+            fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace',
+            fontSize: '14px',
+            lineHeight: '1.5'
+          }}
+        />
+        <div style={{ marginTop: '8px', fontSize: '12px', color: '#6e6e6e' }}>
+          <div style={{ marginBottom: '4px' }}>
+            <strong>Available Macros:</strong> $__timeFilter(time), $__timeFrom(), $__timeTo(), $__interval
+          </div>
+          <div style={{ fontFamily: 'ui-monospace, SFMono-Regular, monospace', fontSize: '11px', color: '#888' }}>
+            Example: SELECT time, host, AVG(value) FROM metrics WHERE $__timeFilter(time) GROUP BY time_bucket(&apos;$__interval&apos;, time), host ORDER BY time
+          </div>
         </div>
       </div>
     </div>

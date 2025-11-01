@@ -25,7 +25,7 @@ export const VariableQueryEditor: React.FC<VariableQueryProps> = ({ query, onCha
   };
 
   return (
-    <div className="gf-form-group">
+    <>
       <InlineField
         label="Query"
         labelWidth={20}
@@ -36,31 +36,27 @@ export const VariableQueryEditor: React.FC<VariableQueryProps> = ({ query, onCha
           value={state.query || ''}
           onChange={handleChange}
           onBlur={saveQuery}
-          placeholder="SELECT DISTINCT host FROM cpu ORDER BY host"
-          rows={4}
+          placeholder="SELECT DISTINCT host FROM telegraf.cpu ORDER BY host"
+          rows={3}
           style={{
             fontFamily: 'monospace',
-            fontSize: '13px'
+            fontSize: '13px',
+            width: '100%'
           }}
         />
       </InlineField>
 
-      <div className="gf-form">
-        <label className="gf-form-label width-20"></label>
-        <div className="gf-form-label">
-          <small style={{ color: '#999' }}>
-            <strong>Examples:</strong>
-            <br />
-            • Get distinct hosts: SELECT DISTINCT host FROM cpu ORDER BY host
-            <br />
-            • Get tables: SHOW TABLES
-            <br />
-            • Get databases: SHOW DATABASES
-            <br />
-            • Custom values: SELECT name FROM measurements WHERE type = 'cpu'
-          </small>
-        </div>
+      <div style={{ marginTop: '8px', marginLeft: '20px', paddingLeft: '8px' }}>
+        <small style={{ color: '#6e6e6e', display: 'block', lineHeight: '1.6' }}>
+          <strong>Examples:</strong>
+          <br />
+          • Get distinct hosts: <code style={{ fontSize: '12px' }}>SELECT DISTINCT host FROM telegraf.cpu ORDER BY host</code>
+          <br />
+          • Get tables: <code style={{ fontSize: '12px' }}>SHOW TABLES</code>
+          <br />
+          • Get databases: <code style={{ fontSize: '12px' }}>SHOW DATABASES</code>
+        </small>
       </div>
-    </div>
+    </>
   );
 };
