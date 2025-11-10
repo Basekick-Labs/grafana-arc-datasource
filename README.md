@@ -112,41 +112,38 @@ The Arc datasource provides a SQL query editor with:
 **Basic time-series query (CPU usage):**
 ```sql
 SELECT
-  time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)) as time,
+  time_bucket(INTERVAL '$__interval', time) as time,
   AVG(usage_idle) * -1 + 100 AS cpu_usage,
   host
 FROM telegraf.cpu
 WHERE cpu = 'cpu-total'
-  AND time >= epoch_us(TIMESTAMP $__timeFrom())
-  AND time < epoch_us(TIMESTAMP $__timeTo())
-GROUP BY time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)), host
+  AND $__timeFilter(time)
+GROUP BY time_bucket(INTERVAL '$__interval', time), host
 ORDER BY time ASC
 ```
 
 **Memory usage:**
 ```sql
 SELECT
-  time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)) as time,
+  time_bucket(INTERVAL '$__interval', time) as time,
   AVG(used_percent) AS memory_used,
   host
 FROM telegraf.mem
-WHERE time >= epoch_us(TIMESTAMP $__timeFrom())
-  AND time < epoch_us(TIMESTAMP $__timeTo())
-GROUP BY time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)), host
+WHERE $__timeFilter(time)
+GROUP BY time_bucket(INTERVAL '$__interval', time), host
 ORDER BY time ASC
 ```
 
 **Network traffic (bytes to bits):**
 ```sql
 SELECT
-  time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)) as time,
+  time_bucket(INTERVAL '$__interval', time) as time,
   AVG(bytes_recv) * 8 AS bits_in,
   host,
   interface
 FROM telegraf.net
-WHERE time >= epoch_us(TIMESTAMP $__timeFrom())
-  AND time < epoch_us(TIMESTAMP $__timeTo())
-GROUP BY time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)), host, interface
+WHERE $__timeFilter(time)
+GROUP BY time_bucket(INTERVAL '$__interval', time), host, interface
 ORDER BY time ASC
 ```
 
@@ -156,9 +153,10 @@ The datasource provides several macros for dynamic queries:
 
 | Macro | Description | Example |
 |-------|-------------|---------|
-| `$__timeFrom()` | Start of time range | `time >= epoch_us(TIMESTAMP $__timeFrom())` |
-| `$__timeTo()` | End of time range | `time < epoch_us(TIMESTAMP $__timeTo())` |
-| `$__interval` | Grafana's calculated interval | `time_bucket(INTERVAL '$__interval', ...)` |
+| `$__timeFilter(columnName)` | Complete time range filter | `WHERE $__timeFilter(time)` |
+| `$__timeFrom()` | Start of time range | `time >= $__timeFrom()` |
+| `$__timeTo()` | End of time range | `time < $__timeTo()` |
+| `$__interval` | Grafana's calculated interval | `time_bucket(INTERVAL '$__interval', time)` |
 
 ### Variables
 
@@ -177,14 +175,13 @@ SELECT DISTINCT interface FROM telegraf.net ORDER BY interface
 Use variables in queries with `$variable` syntax:
 ```sql
 SELECT
-  time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)) as time,
+  time_bucket(INTERVAL '$__interval', time) as time,
   AVG(usage_idle) * -1 + 100 AS cpu_usage
 FROM telegraf.cpu
 WHERE host = '$server'
   AND cpu = 'cpu-total'
-  AND time >= epoch_us(TIMESTAMP $__timeFrom())
-  AND time < epoch_us(TIMESTAMP $__timeTo())
-GROUP BY time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000))
+  AND $__timeFilter(time)
+GROUP BY time_bucket(INTERVAL '$__interval', time)
 ORDER BY time ASC
 ```
 
@@ -195,12 +192,12 @@ The datasource fully supports Grafana alerting. Create alert rules with Arc quer
 **Example alert query (CPU usage > 80%):**
 ```sql
 SELECT
-  epoch_ms(time // 1000) as time,
+  time,
   100 - usage_idle AS cpu_usage,
   host
 FROM telegraf.cpu
 WHERE cpu = 'cpu-total'
-  AND time >= epoch_us(NOW() - INTERVAL '5 minutes')
+  AND time >= NOW() - INTERVAL '5 minutes'
 ORDER BY time ASC
 ```
 
