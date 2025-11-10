@@ -109,44 +109,44 @@ The Arc datasource provides a SQL query editor with:
 
 #### Example Queries
 
-**Basic time-series query:**
+**Basic time-series query (CPU usage):**
 ```sql
 SELECT
-  DATE_TRUNC('minute', time) AS time,
+  time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)) as time,
   AVG(usage_idle) * -1 + 100 AS cpu_usage,
   host
 FROM telegraf.cpu
 WHERE cpu = 'cpu-total'
-  AND $__timeFilter(time)
-GROUP BY DATE_TRUNC('minute', time), host
+  AND time >= epoch_us(TIMESTAMP $__timeFrom())
+  AND time < epoch_us(TIMESTAMP $__timeTo())
+GROUP BY time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)), host
 ORDER BY time ASC
 ```
 
 **Memory usage:**
 ```sql
 SELECT
-  DATE_TRUNC('minute', time) AS time,
+  time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)) as time,
   AVG(used_percent) AS memory_used,
   host
 FROM telegraf.mem
-WHERE $__timeFilter(time)
-GROUP BY DATE_TRUNC('minute', time), host
+WHERE time >= epoch_us(TIMESTAMP $__timeFrom())
+  AND time < epoch_us(TIMESTAMP $__timeTo())
+GROUP BY time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)), host
 ORDER BY time ASC
 ```
 
 **Network traffic (bytes to bits):**
 ```sql
 SELECT
-  DATE_TRUNC('minute', time) AS time,
-  GREATEST(
-    AVG(bytes_recv) - LAG(AVG(bytes_recv)) OVER (PARTITION BY host, interface ORDER BY DATE_TRUNC('minute', time)),
-    0
-  ) / 60.0 * 8 AS bits_in,
+  time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)) as time,
+  AVG(bytes_recv) * 8 AS bits_in,
   host,
   interface
 FROM telegraf.net
-WHERE $__timeFilter(time)
-GROUP BY DATE_TRUNC('minute', time), host, interface
+WHERE time >= epoch_us(TIMESTAMP $__timeFrom())
+  AND time < epoch_us(TIMESTAMP $__timeTo())
+GROUP BY time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)), host, interface
 ORDER BY time ASC
 ```
 
@@ -156,10 +156,9 @@ The datasource provides several macros for dynamic queries:
 
 | Macro | Description | Example |
 |-------|-------------|---------|
-| `$__timeFilter(column)` | Adds time range filter | `WHERE $__timeFilter(time)` |
-| `$__timeFrom()` | Start of time range | `time >= $__timeFrom()` |
-| `$__timeTo()` | End of time range | `time < $__timeTo()` |
-| `$__interval` | Grafana's calculated interval | `DATE_TRUNC('$__interval', time)` |
+| `$__timeFrom()` | Start of time range | `time >= epoch_us(TIMESTAMP $__timeFrom())` |
+| `$__timeTo()` | End of time range | `time < epoch_us(TIMESTAMP $__timeTo())` |
+| `$__interval` | Grafana's calculated interval | `time_bucket(INTERVAL '$__interval', ...)` |
 
 ### Variables
 
@@ -175,22 +174,17 @@ SELECT DISTINCT host FROM telegraf.cpu ORDER BY host
 SELECT DISTINCT interface FROM telegraf.net ORDER BY interface
 ```
 
-**Database variable:**
-```sql
-SHOW DATABASES
-```
-
-Use variables in queries with `${variable:raw}` syntax:
+Use variables in queries with `$variable` syntax:
 ```sql
 SELECT
-  DATE_TRUNC('minute', time) AS time,
-  AVG(usage_idle) AS cpu_idle,
-  host
+  time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000)) as time,
+  AVG(usage_idle) * -1 + 100 AS cpu_usage
 FROM telegraf.cpu
-WHERE host = '${server:raw}'
-  AND cpu = '${cpu:raw}'
-  AND $__timeFilter(time)
-GROUP BY DATE_TRUNC('minute', time), host
+WHERE host = '$server'
+  AND cpu = 'cpu-total'
+  AND time >= epoch_us(TIMESTAMP $__timeFrom())
+  AND time < epoch_us(TIMESTAMP $__timeTo())
+GROUP BY time_bucket(INTERVAL '$__interval', epoch_ms(time // 1000))
 ORDER BY time ASC
 ```
 
@@ -201,12 +195,12 @@ The datasource fully supports Grafana alerting. Create alert rules with Arc quer
 **Example alert query (CPU usage > 80%):**
 ```sql
 SELECT
-  time,
+  epoch_ms(time // 1000) as time,
   100 - usage_idle AS cpu_usage,
   host
 FROM telegraf.cpu
 WHERE cpu = 'cpu-total'
-  AND time >= NOW() - INTERVAL '5 minutes'
+  AND time >= epoch_us(NOW() - INTERVAL '5 minutes')
 ORDER BY time ASC
 ```
 
@@ -354,11 +348,11 @@ Benefits:
 
 ## Performance Tips
 
-1. **Use time filters**: Always use `$__timeFilter()` macro
-2. **Limit results**: Add `LIMIT` clause for large datasets
-3. **Aggregate data**: Use `time_bucket()` for long time ranges
-4. **Enable caching**: Configure Grafana query caching
-5. **Use Arrow**: Keep Arrow protocol enabled (default)
+1. **Use Arrow protocol**: Arrow is enabled by default and provides significantly faster data transfer compared to JSON
+2. **Optimize time ranges**: Smaller time ranges mean faster queries. Use Grafana's time picker to narrow down your analysis
+3. **Leverage time_bucket**: Use appropriate intervals in `time_bucket()` to avoid returning millions of points. Grafana will automatically adjust `$__interval` based on your dashboard width
+4. **Index your time column**: Arc automatically indexes time columns, but ensure your queries filter by time first for optimal performance
+5. **Enable caching**: Configure Grafana query caching for frequently accessed data
 
 ## Contributing
 
