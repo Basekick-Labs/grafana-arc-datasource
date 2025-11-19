@@ -59,7 +59,7 @@ desktop.ini
 go.work
 go.work.sum
 /bin/
-/pkg/
+# /pkg/ - Un-commented to include backend source code
 
 # Mage
 magefile
