@@ -53,9 +53,14 @@ jobs:
           # Clean up backup
           rm -rf .frontend-backup
 
-          # Copy one platform's binary to root for validation
-          # The validator expects to find at least one binary at the root
-          cp dist/linux_amd64/gpx_arc dist/gpx_arc || true
+          # Copy all platform binaries to root with Grafana naming convention
+          # Grafana expects binaries named: executable_os_arch (e.g., gpx_arc_linux_amd64)
+          cp dist/linux_amd64/gpx_arc dist/gpx_arc_linux_amd64
+          cp dist/linux_arm64/gpx_arc dist/gpx_arc_linux_arm64
+          cp dist/linux_arm/gpx_arc dist/gpx_arc_linux_arm
+          cp dist/darwin_amd64/gpx_arc dist/gpx_arc_darwin_amd64
+          cp dist/darwin_arm64/gpx_arc dist/gpx_arc_darwin_arm64
+          cp dist/windows_amd64/gpx_arc.exe dist/gpx_arc_windows_amd64.exe
 
       # Signing disabled - requires Grafana Labs approval for plugin.publisher scope
       # Plugin will be distributed as unsigned until officially approved by Grafana
