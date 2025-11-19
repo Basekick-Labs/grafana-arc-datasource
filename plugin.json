@@ -43,11 +43,6 @@
     "version": "1.0.0",
     "updated": "2025-11-19"
   },
-  "rootUrls": [
-    "https://basekick.net",
-    "https://docs.basekick.net",
-    "https://github.com/basekick-labs"
-  ],
   "dependencies": {
     "grafanaDependency": ">=10.0.0",
     "plugins": []

@@ -50,6 +50,10 @@ jobs:
           # Clean up backup
           rm -rf .frontend-backup
 
+          # Copy one platform's binary to root for validation
+          # The validator expects to find at least one binary at the root
+          cp dist/linux_amd64/gpx_arc dist/gpx_arc || true
+
       # Signing disabled - requires Grafana Labs approval for plugin.publisher scope
       # Plugin will be distributed as unsigned until officially approved by Grafana
       # - name: Sign plugin
