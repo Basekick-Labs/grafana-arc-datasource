@@ -50,11 +50,13 @@ jobs:
           # Clean up backup
           rm -rf .frontend-backup
 
-      - name: Sign plugin
-        run: npm run sign
-        env:
-          GRAFANA_ACCESS_POLICY_TOKEN: ${{ secrets.GRAFANA_ACCESS_POLICY_TOKEN }}
-        if: ${{ env.GRAFANA_ACCESS_POLICY_TOKEN != '' }}
+      # Signing disabled - requires Grafana Labs approval for plugin.publisher scope
+      # Plugin will be distributed as unsigned until officially approved by Grafana
+      # - name: Sign plugin
+      #   run: npm run sign
+      #   env:
+      #     GRAFANA_ACCESS_POLICY_TOKEN: ${{ secrets.GRAFANA_ACCESS_POLICY_TOKEN }}
+      #   if: ${{ env.GRAFANA_ACCESS_POLICY_TOKEN != '' }}
 
       - name: Get plugin metadata
         id: metadata
