@@ -34,15 +34,27 @@ jobs:
       - name: Test frontend
         run: npm run test:ci
 
+      - name: Preserve frontend build
+        run: |
+          # Backend build will clean dist/, so save frontend artifacts
+          mkdir -p .frontend-backup
+          cp -r dist/* .frontend-backup/
+
       - name: Build backend
         run: mage -v buildAll
 
-      # Signing disabled - plugin.json gets moved during backend build
-      # - name: Sign plugin
-      #   run: npm run sign
-      #   env:
-      #     GRAFANA_ACCESS_POLICY_TOKEN: ${{ secrets.GRAFANA_ACCESS_POLICY_TOKEN }}
-      #   if: ${{ env.GRAFANA_ACCESS_POLICY_TOKEN != '' }}
+      - name: Merge frontend and backend builds
+        run: |
+          # Copy frontend artifacts back to dist/
+          cp -r .frontend-backup/* dist/
+          # Clean up backup
+          rm -rf .frontend-backup
+
+      - name: Sign plugin
+        run: npm run sign
+        env:
+          GRAFANA_ACCESS_POLICY_TOKEN: ${{ secrets.GRAFANA_ACCESS_POLICY_TOKEN }}
+        if: ${{ env.GRAFANA_ACCESS_POLICY_TOKEN != '' }}
 
       - name: Get plugin metadata
         id: metadata
