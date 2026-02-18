@@ -296,6 +296,13 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		splitting = false
 	}
 
+	// Skip splitting for queries without $__timeFilter — the query doesn't use
+	// the time range at all, so splitting would just run it N times.
+	if splitting && !strings.Contains(qm.SQL, "$__timeFilter") && !strings.Contains(qm.SQL, "$__timeFrom") {
+		log.DefaultLogger.Debug("Skipping split for query without time filter", "refId", qm.RefID)
+		splitting = false
+	}
+
 	// Auto-add ORDER BY time ASC for time series queries without one
 	if qm.Format == "time_series" {
 		qm.SQL = OptimizeTimeSeriesQuery(qm.SQL)
