@@ -287,6 +287,11 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		splitting = false
 	}
 
+	// Auto-add ORDER BY time ASC for time series queries without one
+	if qm.Format == "time_series" {
+		qm.SQL = OptimizeTimeSeriesQuery(qm.SQL)
+	}
+
 	if !splitting {
 		// No splitting — execute as before
 		return d.querySingle(ctx, settings, query, qm)
