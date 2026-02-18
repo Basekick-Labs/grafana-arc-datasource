@@ -147,18 +147,49 @@ func parseSplitDuration(s string, tr backend.TimeRange) (time.Duration, bool) {
 	}
 }
 
-// splitTimeRange divides a time range into chunks of the given duration
+// splitTimeRange divides a time range into chunks aligned to epoch boundaries.
+// Alignment ensures common aggregation intervals (1h, 10m, etc.) never span a
+// chunk boundary, which would produce incorrect partial aggregations.
+// Example with 6h chunks, range 14:30–02:30:
+//   [14:30, 18:00), [18:00, 00:00), [00:00, 02:30)
+// All internal boundaries land on 6h multiples from epoch.
 func splitTimeRange(from, to time.Time, chunkSize time.Duration) []backend.TimeRange {
+	chunkSecs := int64(chunkSize.Seconds())
+	if chunkSecs <= 0 {
+		return []backend.TimeRange{{From: from, To: to}}
+	}
+
+	// Find the next epoch-aligned boundary after 'from'
+	fromEpoch := from.Unix()
+	nextBoundary := ((fromEpoch / chunkSecs) + 1) * chunkSecs
+	firstEnd := time.Unix(nextBoundary, 0).UTC()
+
+	// If the entire range fits before the first boundary, no splitting needed
+	if !firstEnd.Before(to) {
+		return []backend.TimeRange{{From: from, To: to}}
+	}
+
 	var chunks []backend.TimeRange
-	current := from
-	for current.Before(to) {
+
+	// First chunk: from -> first aligned boundary
+	chunks = append(chunks, backend.TimeRange{From: from, To: firstEnd})
+
+	// Middle chunks: all fully aligned
+	current := firstEnd
+	for {
 		end := current.Add(chunkSize)
-		if end.After(to) {
-			end = to
+		if !end.Before(to) {
+			break
 		}
 		chunks = append(chunks, backend.TimeRange{From: current, To: end})
 		current = end
 	}
+
+	// Last chunk: last aligned boundary -> to
+	if current.Before(to) {
+		chunks = append(chunks, backend.TimeRange{From: current, To: to})
+	}
+
 	return chunks
 }
 
