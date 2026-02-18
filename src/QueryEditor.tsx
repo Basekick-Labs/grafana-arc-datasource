@@ -54,44 +54,43 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
 
   return (
     <div className="gf-form-group">
-      <InlineField
-        label="Format"
-        labelWidth={14}
-        tooltip="Choose how to format the query results"
-      >
-        <RadioButtonGroup
-          options={FORMAT_OPTIONS}
-          value={query.format || 'time_series'}
-          onChange={onFormatChange}
-        />
-      </InlineField>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 16px', alignItems: 'center', marginBottom: '8px' }}>
+        <InlineField
+          label="Format"
+          tooltip="Choose how to format the query results"
+        >
+          <RadioButtonGroup
+            options={FORMAT_OPTIONS}
+            value={query.format || 'time_series'}
+            onChange={onFormatChange}
+          />
+        </InlineField>
 
-      <InlineField
-        label="Query splitting"
-        labelWidth={14}
-        tooltip="Split large time ranges into parallel chunks. Use for slow queries over long periods (e.g. 30d+). Each chunk runs in parallel against Arc."
-      >
-        <Select
-          options={SPLIT_OPTIONS}
-          value={query.splitDuration || 'auto'}
-          onChange={onSplitChange}
-          width={20}
-        />
-      </InlineField>
+        <InlineField
+          label="Splitting"
+          tooltip="Parallel time-range chunking for faster results. Applies to: time-bucketed ($__timeGroup) and raw queries. Auto-skipped for: GROUP BY, DISTINCT, COUNT/SUM/AVG without $__timeGroup, LIMIT, and no $__timeFilter."
+        >
+          <Select
+            options={SPLIT_OPTIONS}
+            value={query.splitDuration || 'auto'}
+            onChange={onSplitChange}
+            width={16}
+          />
+        </InlineField>
 
-      <InlineField
-        label="Database"
-        labelWidth={14}
-        tooltip="Override the default database for this query. Leave empty to use the datasource default."
-      >
-        <Input
-          value={query.database || ''}
-          onChange={onDatabaseChange}
-          onBlur={onDatabaseBlur}
-          placeholder="default"
-          width={20}
-        />
-      </InlineField>
+        <InlineField
+          label="Database"
+          tooltip="Override the default database for this query. Leave empty to use the datasource default."
+        >
+          <Input
+            value={query.database || ''}
+            onChange={onDatabaseChange}
+            onBlur={onDatabaseBlur}
+            placeholder="default"
+            width={16}
+          />
+        </InlineField>
+      </div>
 
       <div className="gf-form" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>
         <label className="gf-form-label" style={{ marginBottom: '8px' }}>SQL Query</label>
