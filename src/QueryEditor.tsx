@@ -1,6 +1,6 @@
 import React from 'react';
 import { QueryEditorProps } from '@grafana/data';
-import { InlineField, TextArea, RadioButtonGroup, Select } from '@grafana/ui';
+import { InlineField, Input, TextArea, RadioButtonGroup, Select } from '@grafana/ui';
 import { ArcDataSource } from './datasource';
 import { ArcDataSourceOptions, ArcQuery } from './types';
 
@@ -43,6 +43,14 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
     onRunQuery();
   };
 
+  const onDatabaseChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    onChange({ ...query, database: event.target.value });
+  };
+
+  const onDatabaseBlur = () => {
+    onRunQuery();
+  };
+
   return (
     <div className="gf-form-group">
       <InlineField
@@ -66,6 +74,20 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
           options={SPLIT_OPTIONS}
           value={query.splitDuration || 'off'}
           onChange={onSplitChange}
+          width={20}
+        />
+      </InlineField>
+
+      <InlineField
+        label="Database"
+        labelWidth={14}
+        tooltip="Override the default database for this query. Leave empty to use the datasource default."
+      >
+        <Input
+          value={query.database || ''}
+          onChange={onDatabaseChange}
+          onBlur={onDatabaseBlur}
+          placeholder="default"
           width={20}
         />
       </InlineField>

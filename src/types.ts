@@ -26,6 +26,7 @@ export interface ArcQuery extends DataQuery {
   rawQuery?: boolean;
   rawSql?: string; // Postgres/MySQL/MSSQL/ClickHouse compatibility
   splitDuration?: string; // "off", "1h", "6h", "12h", "1d", "3d", "7d"
+  database?: string; // Per-query database override (empty = use datasource default)
 }
 
 /**
