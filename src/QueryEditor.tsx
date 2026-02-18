@@ -22,6 +22,13 @@ const SPLIT_OPTIONS = [
 ];
 
 export function QueryEditor({ query, onChange, onRunQuery }: Props) {
+  // Migrate rawSql from Postgres/MySQL/MSSQL/ClickHouse datasources
+  React.useEffect(() => {
+    if (!query.sql && query.rawSql) {
+      onChange({ ...query, sql: query.rawSql, rawSql: undefined });
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   const onSQLChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
     onChange({ ...query, sql: event.target.value });
   };

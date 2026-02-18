@@ -25,9 +25,10 @@ type ArcDataSourceSettings struct {
 type ArcQuery struct {
 	RefID         string `json:"refId"`
 	SQL           string `json:"sql"`
-	Format        string `json:"format"` // "time_series" or "table"
+	RawSQL        string `json:"rawSql"`        // Postgres/MySQL/MSSQL/ClickHouse compatibility
+	Format        string `json:"format"`         // "time_series" or "table"
 	MaxDataPoints int64  `json:"maxDataPoints"`
-	SplitDuration string `json:"splitDuration"` // e.g. "1d", "6h", "12h" — empty means no splitting
+	SplitDuration string `json:"splitDuration"`  // e.g. "1d", "6h", "12h" — empty means no splitting
 }
 
 // ArcInstanceSettings holds per-instance settings
@@ -182,6 +183,11 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	}
 
 	qm.RefID = query.RefID
+
+	// Migrate rawSql from Postgres/MySQL/MSSQL/ClickHouse datasources
+	if qm.SQL == "" && qm.RawSQL != "" {
+		qm.SQL = qm.RawSQL
+	}
 
 	// Check if query splitting is enabled
 	chunkSize, splitting := parseSplitDuration(qm.SplitDuration)
