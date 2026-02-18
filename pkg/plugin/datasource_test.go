@@ -393,7 +393,7 @@ func TestContainsLIMIT(t *testing.T) {
 func TestExpandTimeGroup_Basic(t *testing.T) {
 	sql := "SELECT $__timeGroup(time, '1h') AS time FROM t"
 	result := expandTimeGroup(sql)
-	expected := "SELECT to_timestamp(CAST(epoch(time)/3600 AS BIGINT) * 3600) AS time FROM t"
+	expected := "SELECT to_timestamp((epoch_ns(time) // 1000000000 // 3600) * 3600) AS time FROM t"
 	if result != expected {
 		t.Errorf("expected:\n  %s\ngot:\n  %s", expected, result)
 	}
@@ -402,7 +402,7 @@ func TestExpandTimeGroup_Basic(t *testing.T) {
 func TestExpandTimeGroup_10Minutes(t *testing.T) {
 	sql := "$__timeGroup(time, '10 minutes')"
 	result := expandTimeGroup(sql)
-	expected := "to_timestamp(CAST(epoch(time)/600 AS BIGINT) * 600)"
+	expected := "to_timestamp((epoch_ns(time) // 1000000000 // 600) * 600)"
 	if result != expected {
 		t.Errorf("expected:\n  %s\ngot:\n  %s", expected, result)
 	}
@@ -422,7 +422,7 @@ func TestExpandTimeGroup_Multiple(t *testing.T) {
 	if result == sql {
 		t.Errorf("expected macros to be expanded")
 	}
-	if !contains(result, "epoch(time)/3600") || !contains(result, "epoch(created_at)/86400") {
+	if !contains(result, "epoch_ns(time) // 1000000000 // 3600") || !contains(result, "epoch_ns(created_at) // 1000000000 // 86400") {
 		t.Errorf("expected both macros expanded, got: %s", result)
 	}
 }

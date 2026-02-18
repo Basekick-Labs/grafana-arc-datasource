@@ -494,7 +494,11 @@ func expandTimeGroup(sql string) string {
 		interval := strings.Trim(strings.TrimSpace(parts[1]), "'\"")
 		secs := intervalToSeconds(interval)
 
-		replacement := fmt.Sprintf("to_timestamp(CAST(epoch(%s)/%d AS BIGINT) * %d)", column, secs, secs)
+		// Use epoch_ns() (BIGINT) with // (integer division) instead of epoch() (DOUBLE)
+		// to avoid floating-point precision loss that causes timestamps near hour
+		// boundaries (e.g. 05:59:59.999) to round up to the next bucket (06:00:00).
+		// DuckDB's / operator returns DOUBLE; // returns BIGINT.
+		replacement := fmt.Sprintf("to_timestamp((epoch_ns(%s) // 1000000000 // %d) * %d)", column, secs, secs)
 		sql = sql[:idx] + replacement + sql[end+1:]
 	}
 }
