@@ -24,6 +24,7 @@ export interface ArcQuery extends DataQuery {
   sql: string;
   format?: 'time_series' | 'table';
   rawQuery?: boolean;
+  splitDuration?: string; // "off", "1h", "6h", "12h", "1d", "3d", "7d"
 }
 
 /**

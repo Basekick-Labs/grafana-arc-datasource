@@ -1,6 +1,6 @@
 import React from 'react';
 import { QueryEditorProps } from '@grafana/data';
-import { InlineField, TextArea, RadioButtonGroup } from '@grafana/ui';
+import { InlineField, TextArea, RadioButtonGroup, Select } from '@grafana/ui';
 import { ArcDataSource } from './datasource';
 import { ArcDataSourceOptions, ArcQuery } from './types';
 
@@ -11,6 +11,16 @@ const FORMAT_OPTIONS = [
   { label: 'Table', value: 'table' },
 ];
 
+const SPLIT_OPTIONS = [
+  { label: 'Off', value: 'off' },
+  { label: '1 hour', value: '1h' },
+  { label: '6 hours', value: '6h' },
+  { label: '12 hours', value: '12h' },
+  { label: '1 day', value: '1d' },
+  { label: '3 days', value: '3d' },
+  { label: '7 days', value: '7d' },
+];
+
 export function QueryEditor({ query, onChange, onRunQuery }: Props) {
   const onSQLChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
     onChange({ ...query, sql: event.target.value });
@@ -18,6 +28,11 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
 
   const onFormatChange = (value: string) => {
     onChange({ ...query, format: value as 'time_series' | 'table' });
+    onRunQuery();
+  };
+
+  const onSplitChange = (option: any) => {
+    onChange({ ...query, splitDuration: option?.value || 'off' });
     onRunQuery();
   };
 
@@ -32,6 +47,19 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
           options={FORMAT_OPTIONS}
           value={query.format || 'time_series'}
           onChange={onFormatChange}
+        />
+      </InlineField>
+
+      <InlineField
+        label="Query splitting"
+        labelWidth={14}
+        tooltip="Split large time ranges into parallel chunks. Use for slow queries over long periods (e.g. 30d+). Each chunk runs in parallel against Arc."
+      >
+        <Select
+          options={SPLIT_OPTIONS}
+          value={query.splitDuration || 'off'}
+          onChange={onSplitChange}
+          width={20}
         />
       </InlineField>
 

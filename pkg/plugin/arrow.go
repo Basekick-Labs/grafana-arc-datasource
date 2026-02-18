@@ -54,13 +54,13 @@ func QueryArrow(ctx context.Context, settings *ArcInstanceSettings, sql string, 
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("%s", formatRequestError(err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Arc returned status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("%s", parseArcError(resp.StatusCode, body))
 	}
 
 	// Read Arrow IPC stream

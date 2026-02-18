@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
@@ -26,6 +27,7 @@ type ArcQuery struct {
 	SQL           string `json:"sql"`
 	Format        string `json:"format"` // "time_series" or "table"
 	MaxDataPoints int64  `json:"maxDataPoints"`
+	SplitDuration string `json:"splitDuration"` // e.g. "1d", "6h", "12h" — empty means no splitting
 }
 
 // ArcInstanceSettings holds per-instance settings
@@ -93,7 +95,83 @@ func (d *ArcDatasource) QueryData(ctx context.Context, req *backend.QueryDataReq
 	return response, nil
 }
 
-// query executes a single query
+// parseSplitDuration converts a split duration string ("1d", "6h", "12h") to time.Duration
+func parseSplitDuration(s string) (time.Duration, bool) {
+	if s == "" || s == "off" {
+		return 0, false
+	}
+
+	switch s {
+	case "1h":
+		return time.Hour, true
+	case "6h":
+		return 6 * time.Hour, true
+	case "12h":
+		return 12 * time.Hour, true
+	case "1d":
+		return 24 * time.Hour, true
+	case "3d":
+		return 3 * 24 * time.Hour, true
+	case "7d":
+		return 7 * 24 * time.Hour, true
+	default:
+		return 0, false
+	}
+}
+
+// splitTimeRange divides a time range into chunks of the given duration
+func splitTimeRange(from, to time.Time, chunkSize time.Duration) []backend.TimeRange {
+	var chunks []backend.TimeRange
+	current := from
+	for current.Before(to) {
+		end := current.Add(chunkSize)
+		if end.After(to) {
+			end = to
+		}
+		chunks = append(chunks, backend.TimeRange{From: current, To: end})
+		current = end
+	}
+	return chunks
+}
+
+// executeChunk runs a single query chunk against Arc
+func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceSettings, rawSQL string, chunk backend.TimeRange, originalRange backend.TimeRange) (*data.Frame, error) {
+	// Apply macros with the chunk's time range for time filtering,
+	// but keep the original range for $__interval calculation
+	sql := ApplyMacrosWithSplit(rawSQL, chunk, originalRange)
+
+	if settings.settings.UseArrow {
+		return QueryArrowFlightSQLStyle(ctx, settings, sql, chunk)
+	}
+	return QueryJSON(ctx, settings, sql, chunk)
+}
+
+// mergeFrames appends rows from all chunk frames into a single frame
+func mergeFrames(frames []*data.Frame) *data.Frame {
+	if len(frames) == 0 {
+		return nil
+	}
+	if len(frames) == 1 {
+		return frames[0]
+	}
+
+	merged := frames[0]
+	for _, f := range frames[1:] {
+		if f == nil {
+			continue
+		}
+		rowLen, err := f.RowLen()
+		if err != nil {
+			continue
+		}
+		for i := 0; i < rowLen; i++ {
+			merged.AppendRow(f.RowCopy(i)...)
+		}
+	}
+	return merged
+}
+
+// query executes a single query, with optional time-range splitting for large ranges
 func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings, query backend.DataQuery) backend.DataResponse {
 	var response backend.DataResponse
 
@@ -105,11 +183,110 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 
 	qm.RefID = query.RefID
 
+	// Check if query splitting is enabled
+	chunkSize, splitting := parseSplitDuration(qm.SplitDuration)
+
+	if !splitting {
+		// No splitting — execute as before
+		return d.querySingle(ctx, settings, query, qm)
+	}
+
+	// Split the time range into chunks
+	chunks := splitTimeRange(query.TimeRange.From, query.TimeRange.To, chunkSize)
+
+	log.DefaultLogger.Info("Splitting query into chunks",
+		"refId", qm.RefID,
+		"splitDuration", qm.SplitDuration,
+		"chunks", len(chunks),
+		"from", query.TimeRange.From,
+		"to", query.TimeRange.To,
+	)
+
+	// Execute chunks in parallel
+	type chunkResult struct {
+		index int
+		frame *data.Frame
+		err   error
+	}
+
+	results := make([]chunkResult, len(chunks))
+	var wg sync.WaitGroup
+
+	// Limit concurrency to avoid overwhelming Arc under multi-user load
+	semaphore := make(chan struct{}, 4)
+
+	for i, chunk := range chunks {
+		wg.Add(1)
+		go func(idx int, ch backend.TimeRange) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			frame, err := d.executeChunk(ctx, settings, qm.SQL, ch, query.TimeRange)
+			if err != nil {
+				err = fmt.Errorf("[chunk %s to %s] %w",
+					ch.From.Format("2006-01-02 15:04"),
+					ch.To.Format("2006-01-02 15:04"),
+					err)
+			}
+			results[idx] = chunkResult{index: idx, frame: frame, err: err}
+		}(i, chunk)
+	}
+
+	wg.Wait()
+
+	// Collect frames in order, fail on first error
+	orderedFrames := make([]*data.Frame, 0, len(chunks))
+	for _, r := range results {
+		if r.err != nil {
+			return backend.ErrDataResponse(backend.StatusInternal, r.err.Error())
+		}
+		if r.frame != nil {
+			orderedFrames = append(orderedFrames, r.frame)
+		}
+	}
+
+	merged := mergeFrames(orderedFrames)
+	if merged == nil {
+		log.DefaultLogger.Warn("No data from split query", "refId", qm.RefID)
+		return response
+	}
+
+	merged.Meta = &data.FrameMeta{
+		ExecutedQueryString: qm.SQL,
+		Custom: map[string]interface{}{
+			"splitChunks": len(chunks),
+		},
+	}
+
+	// Prepare frames (long-to-wide conversion, etc.)
+	prepareStart := time.Now()
+	processedFrames := prepareFrames(merged, qm)
+	prepareDuration := time.Since(prepareStart)
+
+	if len(processedFrames) == 0 {
+		log.DefaultLogger.Warn("No frames after prepare", "refId", qm.RefID)
+		return response
+	}
+
+	response.Frames = append(response.Frames, processedFrames...)
+
+	log.DefaultLogger.Info("Split query completed",
+		"refId", qm.RefID,
+		"chunks", len(chunks),
+		"totalRows", processedFrames[0].Rows(),
+		"prepareDuration_ms", prepareDuration.Milliseconds(),
+	)
+
+	return response
+}
+
+// querySingle executes a query without splitting (original behavior)
+func (d *ArcDatasource) querySingle(ctx context.Context, settings *ArcInstanceSettings, query backend.DataQuery, qm ArcQuery) backend.DataResponse {
+	var response backend.DataResponse
+
 	// Apply time range macros
 	sql := ApplyMacros(qm.SQL, query.TimeRange)
-
-	// Note: Users should add "ORDER BY time ASC" to their queries for best performance
-	// This prevents expensive in-memory sorting during long-to-wide conversion
 
 	log.DefaultLogger.Debug("Executing Arc query",
 		"refId", qm.RefID,
@@ -123,14 +300,13 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	var err error
 
 	if settings.settings.UseArrow {
-		// Use FlightSQL-style Arrow handling (proven to work)
 		frame, err = QueryArrowFlightSQLStyle(ctx, settings, sql, query.TimeRange)
 	} else {
 		frame, err = QueryJSON(ctx, settings, sql, query.TimeRange)
 	}
 
 	if err != nil {
-		return backend.ErrDataResponse(backend.StatusInternal, fmt.Sprintf("query failed: %v", err))
+		return backend.ErrDataResponse(backend.StatusInternal, err.Error())
 	}
 
 	// Time the frame preparation (conversion)
@@ -229,53 +405,35 @@ func prepareFrames(frame *data.Frame, qm ArcQuery) data.Frames {
 		return data.Frames{frame}
 	}
 
-	// Handle long format time series (needs conversion)
+	// Handle long format time series — convert to wide for compatibility with all
+	// Grafana versions (including < v8) and existing dashboards/alerts.
 	if schema.Type == data.TimeSeriesTypeLong {
 		frame.Meta.Type = data.FrameTypeTimeSeriesLong
 
 		log.DefaultLogger.Debug("Detected long format time series",
-			"timeIndex", schema.TimeIndex,
 			"rows", frame.Rows(),
 			"fields", len(frame.Fields),
-			"fieldNames", func() []string {
-				names := make([]string, len(frame.Fields))
-				for i, f := range frame.Fields {
-					names[i] = f.Name
-				}
-				return names
-			}(),
 		)
 
 		longFrame := ensureAscendingTimes(frame, schema.TimeIndex)
 
-		// Configure fill missing policy for long-to-wide conversion
-		fillMissing := &data.FillMissing{
-			Mode: data.FillModeNull, // Use null for missing values
-		}
-
-		wideFrame, err := data.LongToWide(longFrame, fillMissing)
+		// Convert long to wide WITHOUT fill. Passing nil avoids the FillModeNull bug
+		// that expanded hourly data into per-second null-filled rows (604K rows / 59MB).
+		// Use $__timeGroup macro for proper time bucketing instead of date_trunc.
+		wideFrame, err := data.LongToWide(longFrame, nil)
 		if err != nil {
-			log.DefaultLogger.Warn("Failed to convert long series to wide format",
+			log.DefaultLogger.Warn("LongToWide conversion failed, returning long format",
 				"error", err,
-				"schema", schema,
 			)
-			// Return the long frame as-is, let Grafana handle it
-			longFrame.Meta.Type = data.FrameTypeTimeSeriesLong
 			longFrame.Meta.PreferredVisualization = data.VisTypeGraph
 			longFrame.RefID = qm.RefID
 			return data.Frames{longFrame}
 		}
 
 		log.DefaultLogger.Debug("Converted to wide format",
+			"inputRows", longFrame.Rows(),
 			"wideRows", wideFrame.Rows(),
 			"wideFields", len(wideFrame.Fields),
-			"wideFieldNames", func() []string {
-				names := make([]string, len(wideFrame.Fields))
-				for i, f := range wideFrame.Fields {
-					names[i] = f.Name
-				}
-				return names
-			}(),
 		)
 
 		if wideFrame.Meta == nil {

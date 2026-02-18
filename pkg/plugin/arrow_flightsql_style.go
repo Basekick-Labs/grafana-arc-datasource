@@ -55,13 +55,13 @@ func QueryArrowFlightSQLStyle(ctx context.Context, settings *ArcInstanceSettings
 	resp, err := client.Do(req)
 	httpDuration := time.Since(start)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("%s", formatRequestError(err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Arc returned status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("%s", parseArcError(resp.StatusCode, body))
 	}
 
 	// Stream Arrow IPC directly from response body (no intermediate buffer)
