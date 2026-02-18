@@ -29,7 +29,7 @@ type ArcQuery struct {
 	Database      string `json:"database"`       // Per-query database override (empty = use datasource default)
 	Format        string `json:"format"`         // "time_series" or "table"
 	MaxDataPoints int64  `json:"maxDataPoints"`
-	SplitDuration string `json:"splitDuration"`  // e.g. "1d", "6h", "12h" — empty means no splitting
+	SplitDuration string `json:"splitDuration"`  // "auto" (default), "off", or explicit: "1h", "6h", "12h", "1d", "3d", "7d"
 }
 
 // ArcInstanceSettings holds per-instance settings
@@ -97,10 +97,36 @@ func (d *ArcDatasource) QueryData(ctx context.Context, req *backend.QueryDataReq
 	return response, nil
 }
 
-// parseSplitDuration converts a split duration string ("1d", "6h", "12h") to time.Duration
-func parseSplitDuration(s string) (time.Duration, bool) {
-	if s == "" || s == "off" {
+// autoSplitDuration picks a split chunk size based on the query time range.
+//   - < 3h  → no split (overhead not worth it)
+//   - 3h–24h → 1h
+//   - 1d–7d  → 6h
+//   - 7d–30d → 1d
+//   - > 30d  → 7d
+func autoSplitDuration(tr backend.TimeRange) (time.Duration, bool) {
+	span := tr.To.Sub(tr.From)
+	switch {
+	case span < 3*time.Hour:
 		return 0, false
+	case span < 24*time.Hour:
+		return time.Hour, true
+	case span < 7*24*time.Hour:
+		return 6 * time.Hour, true
+	case span < 30*24*time.Hour:
+		return 24 * time.Hour, true
+	default:
+		return 7 * 24 * time.Hour, true
+	}
+}
+
+// parseSplitDuration converts a split duration string to time.Duration.
+// "auto" or "" uses autoSplitDuration; "off" disables splitting.
+func parseSplitDuration(s string, tr backend.TimeRange) (time.Duration, bool) {
+	if s == "off" {
+		return 0, false
+	}
+	if s == "" || s == "auto" {
+		return autoSplitDuration(tr)
 	}
 
 	switch s {
@@ -204,7 +230,7 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	}
 
 	// Check if query splitting is enabled
-	chunkSize, splitting := parseSplitDuration(qm.SplitDuration)
+	chunkSize, splitting := parseSplitDuration(qm.SplitDuration, query.TimeRange)
 
 	if !splitting {
 		// No splitting — execute as before

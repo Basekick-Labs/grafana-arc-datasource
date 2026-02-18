@@ -12,6 +12,7 @@ const FORMAT_OPTIONS = [
 ];
 
 const SPLIT_OPTIONS = [
+  { label: 'Auto', value: 'auto' },
   { label: 'Off', value: 'off' },
   { label: '1 hour', value: '1h' },
   { label: '6 hours', value: '6h' },
@@ -39,7 +40,7 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
   };
 
   const onSplitChange = (option: any) => {
-    onChange({ ...query, splitDuration: option?.value || 'off' });
+    onChange({ ...query, splitDuration: option?.value || 'auto' });
     onRunQuery();
   };
 
@@ -72,7 +73,7 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
       >
         <Select
           options={SPLIT_OPTIONS}
-          value={query.splitDuration || 'off'}
+          value={query.splitDuration || 'auto'}
           onChange={onSplitChange}
           width={20}
         />
