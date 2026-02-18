@@ -205,7 +205,8 @@ func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceS
 	return QueryJSON(ctx, settings, sql, chunk)
 }
 
-// mergeFrames appends rows from all chunk frames into a single frame
+// mergeFrames appends rows from all chunk frames into a single frame.
+// Skips frames with incompatible schemas (different field count) to avoid panics.
 func mergeFrames(frames []*data.Frame) *data.Frame {
 	if len(frames) == 0 {
 		return nil
@@ -214,9 +215,24 @@ func mergeFrames(frames []*data.Frame) *data.Frame {
 		return frames[0]
 	}
 
-	merged := frames[0]
-	for _, f := range frames[1:] {
-		if f == nil {
+	// Find the first non-empty frame to use as the base
+	var merged *data.Frame
+	var startIdx int
+	for i, f := range frames {
+		if f != nil && len(f.Fields) > 0 {
+			merged = f
+			startIdx = i + 1
+			break
+		}
+	}
+	if merged == nil {
+		return frames[0]
+	}
+
+	expectedFields := len(merged.Fields)
+
+	for _, f := range frames[startIdx:] {
+		if f == nil || len(f.Fields) != expectedFields {
 			continue
 		}
 		rowLen, err := f.RowLen()
@@ -296,6 +312,14 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		wg.Add(1)
 		go func(idx int, ch backend.TimeRange) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					results[idx] = chunkResult{
+						index: idx,
+						err:   fmt.Errorf("[chunk %s to %s] panic: %v", ch.From.Format("2006-01-02 15:04"), ch.To.Format("2006-01-02 15:04"), r),
+					}
+				}
+			}()
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
