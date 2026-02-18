@@ -109,10 +109,10 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
         />
         <div style={{ marginTop: '8px', fontSize: '12px', color: '#6e6e6e' }}>
           <div style={{ marginBottom: '4px' }}>
-            <strong>Available Macros:</strong> $__timeFilter(time), $__timeFrom(), $__timeTo(), $__interval
+            <strong>Available Macros:</strong> $__timeFilter(time), $__timeFrom(), $__timeTo(), $__interval, $__timeGroup(column, interval)
           </div>
           <div style={{ fontFamily: 'ui-monospace, SFMono-Regular, monospace', fontSize: '11px', color: '#888' }}>
-            Example: SELECT time, host, AVG(value) FROM metrics WHERE $__timeFilter(time) GROUP BY time_bucket(&apos;$__interval&apos;, time), host ORDER BY time
+            Example: SELECT $__timeGroup(time, &apos;$__interval&apos;) AS time, host, AVG(value) FROM metrics WHERE $__timeFilter(time) GROUP BY 1, host ORDER BY 1
           </div>
         </div>
       </div>
