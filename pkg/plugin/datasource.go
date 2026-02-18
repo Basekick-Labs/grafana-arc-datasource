@@ -287,6 +287,15 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		splitting = false
 	}
 
+	// Skip splitting for queries with aggregation but no $__timeGroup — aggregations
+	// without time bucketing span the full range and produce wrong results when
+	// each chunk aggregates independently (e.g. COUNT per status gets duplicated,
+	// DISTINCT returns duplicates, bare COUNT(*) returns N rows instead of 1).
+	if splitting && containsAggregationWithoutTimeGroup(qm.SQL) {
+		log.DefaultLogger.Debug("Skipping split for aggregation without $__timeGroup", "refId", qm.RefID)
+		splitting = false
+	}
+
 	// Auto-add ORDER BY time ASC for time series queries without one
 	if qm.Format == "time_series" {
 		qm.SQL = OptimizeTimeSeriesQuery(qm.SQL)
@@ -633,6 +642,29 @@ func ensureAscendingTimes(frame *data.Frame, timeIdx int) *data.Frame {
 // containsLIMIT checks if SQL contains a LIMIT clause (case-insensitive).
 func containsLIMIT(sql string) bool {
 	return strings.Contains(strings.ToUpper(sql), " LIMIT ")
+}
+
+// containsAggregationWithoutTimeGroup returns true if the SQL has aggregation
+// (GROUP BY, DISTINCT, or aggregate functions) but no $__timeGroup macro.
+// Such queries aggregate across the full time range and would produce wrong
+// results if split into chunks (duplicated groups, inflated counts, etc.).
+func containsAggregationWithoutTimeGroup(sql string) bool {
+	if strings.Contains(sql, "$__timeGroup") {
+		return false
+	}
+	upper := strings.ToUpper(sql)
+	if strings.Contains(upper, "GROUP BY") {
+		return true
+	}
+	if strings.Contains(upper, "DISTINCT") {
+		return true
+	}
+	for _, fn := range []string{"SUM(", "COUNT(", "AVG(", "MIN(", "MAX("} {
+		if strings.Contains(upper, fn) {
+			return true
+		}
+	}
+	return false
 }
 
 func toTime(val interface{}) (time.Time, bool) {
