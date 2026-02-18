@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -278,6 +279,13 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 
 	// Check if query splitting is enabled
 	chunkSize, splitting := parseSplitDuration(qm.SplitDuration, query.TimeRange)
+
+	// Skip splitting for queries with LIMIT — LIMIT applies per-chunk and would
+	// return N×chunks rows instead of N rows.
+	if splitting && containsLIMIT(qm.SQL) {
+		log.DefaultLogger.Debug("Skipping split for query with LIMIT", "refId", qm.RefID)
+		splitting = false
+	}
 
 	if !splitting {
 		// No splitting — execute as before
@@ -615,6 +623,11 @@ func ensureAscendingTimes(frame *data.Frame, timeIdx int) *data.Frame {
 	}
 
 	return sorted
+}
+
+// containsLIMIT checks if SQL contains a LIMIT clause (case-insensitive).
+func containsLIMIT(sql string) bool {
+	return strings.Contains(strings.ToUpper(sql), " LIMIT ")
 }
 
 func toTime(val interface{}) (time.Time, bool) {

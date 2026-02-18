@@ -366,6 +366,28 @@ func TestMergeFrames_SkipsEmptyFirstFrame(t *testing.T) {
 	}
 }
 
+// --- containsLIMIT ---
+
+func TestContainsLIMIT(t *testing.T) {
+	cases := []struct {
+		sql      string
+		expected bool
+	}{
+		{"SELECT * FROM t LIMIT 10", true},
+		{"SELECT * FROM t limit 10", true},
+		{"SELECT * FROM t Limit 10", true},
+		{"SELECT * FROM t WHERE x > 1", false},
+		{"SELECT * FROM t ORDER BY time", false},
+		{"SELECT limited FROM t", false}, // "limited" is not " LIMIT "
+	}
+	for _, c := range cases {
+		result := containsLIMIT(c.sql)
+		if result != c.expected {
+			t.Errorf("containsLIMIT(%q): expected %v, got %v", c.sql, c.expected, result)
+		}
+	}
+}
+
 // --- expandTimeGroup ---
 
 func TestExpandTimeGroup_Basic(t *testing.T) {
