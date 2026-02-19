@@ -286,6 +286,35 @@ func TestSplitTimeRange_1dChunks_30dRange(t *testing.T) {
 	}
 }
 
+func TestSplitTimeRange_BoundaryNoDuplicates(t *testing.T) {
+	// Verify that adjacent chunks use >= / < semantics so a row at exactly
+	// the boundary timestamp matches only one chunk (no duplicates).
+	from := time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 2, 18, 13, 0, 0, 0, time.UTC)
+	chunks := splitTimeRange(from, to, time.Hour)
+
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %d", len(chunks))
+	}
+
+	// Expand each chunk's $__timeFilter and verify boundary semantics
+	boundaryTime := chunks[0].To // e.g. 11:00:00
+	sql := "SELECT * FROM t WHERE $__timeFilter(time)"
+
+	chunk1SQL := ApplyMacrosWithSplit(sql, chunks[0], backend.TimeRange{From: from, To: to})
+	chunk2SQL := ApplyMacrosWithSplit(sql, chunks[1], backend.TimeRange{From: from, To: to})
+
+	// Chunk 1 should use: time < '...11:00:00Z' (exclusive end)
+	boundaryStr := boundaryTime.Format(time.RFC3339)
+	if !strings.Contains(chunk1SQL, "time < '"+boundaryStr+"'") {
+		t.Errorf("chunk 1 should exclude boundary with <: %s", chunk1SQL)
+	}
+	// Chunk 2 should use: time >= '...11:00:00Z' (inclusive start)
+	if !strings.Contains(chunk2SQL, "time >= '"+boundaryStr+"'") {
+		t.Errorf("chunk 2 should include boundary with >=: %s", chunk2SQL)
+	}
+}
+
 // --- mergeFrames ---
 
 func TestMergeFrames_Empty(t *testing.T) {

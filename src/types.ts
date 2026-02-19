@@ -8,6 +8,7 @@ export interface ArcDataSourceOptions extends DataSourceJsonData {
   database?: string;
   timeout?: number;
   useArrow?: boolean;
+  maxConcurrency?: number;
 }
 
 /**

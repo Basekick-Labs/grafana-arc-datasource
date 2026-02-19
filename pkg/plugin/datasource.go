@@ -16,10 +16,11 @@ import (
 
 // ArcDataSourceSettings contains Arc connection settings
 type ArcDataSourceSettings struct {
-	URL      string `json:"url"`
-	Database string `json:"database"`
-	Timeout  int    `json:"timeout"` // seconds
-	UseArrow bool   `json:"useArrow"`
+	URL            string `json:"url"`
+	Database       string `json:"database"`
+	Timeout        int    `json:"timeout"`        // seconds
+	UseArrow       bool   `json:"useArrow"`
+	MaxConcurrency int    `json:"maxConcurrency"` // max parallel chunks for query splitting (default 4)
 }
 
 // ArcQuery represents a query to Arc
@@ -68,6 +69,9 @@ func getSettings(ctx context.Context, pluginCtx backend.PluginContext) (*ArcInst
 	}
 	if dsSettings.Database == "" {
 		dsSettings.Database = "default"
+	}
+	if dsSettings.MaxConcurrency <= 0 {
+		dsSettings.MaxConcurrency = 4
 	}
 	// Note: UseArrow defaults to false in Go struct initialization
 	// The frontend defaults to true in the UI (ConfigEditor.tsx line 145)
@@ -369,8 +373,10 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	results := make([]chunkResult, len(chunks))
 	var wg sync.WaitGroup
 
-	// Limit concurrency to avoid overwhelming Arc under multi-user load
-	semaphore := make(chan struct{}, 4)
+	// Limit concurrency to avoid overwhelming Arc under multi-user load.
+	// With 6 panels × N concurrent users, each dashboard can spawn
+	// maxConcurrency × 6 requests. Default 4 balances throughput vs load.
+	semaphore := make(chan struct{}, settings.settings.MaxConcurrency)
 
 	for i, chunk := range chunks {
 		wg.Add(1)
