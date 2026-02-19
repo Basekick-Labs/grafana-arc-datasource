@@ -694,9 +694,10 @@ func containsAggregationWithoutTimeGroup(sql string) bool {
 	if strings.Contains(upper, "GROUP BY") {
 		return true
 	}
-	// Match "DISTINCT " (with trailing space) to avoid false positives
-	// on values like 'DISTINCT_VALUE' inside string literals
-	if strings.Contains(upper, "DISTINCT ") || strings.HasSuffix(upper, "DISTINCT") {
+	// Match "DISTINCT " (with trailing space) or "DISTINCT(" to catch both
+	// SELECT DISTINCT col and functions like APPROX_COUNT_DISTINCT(col).
+	// Avoids false positives on values like 'DISTINCT_VALUE' in string literals.
+	if strings.Contains(upper, "DISTINCT ") || strings.Contains(upper, "DISTINCT(") || strings.HasSuffix(upper, "DISTINCT") {
 		return true
 	}
 	for _, fn := range []string{"SUM(", "COUNT(", "AVG(", "MIN(", "MAX("} {

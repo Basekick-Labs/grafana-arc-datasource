@@ -419,6 +419,10 @@ func TestContainsAggregationWithoutTimeGroup(t *testing.T) {
 
 		// Edge case: aggregate function name without parenthesis
 		{"SELECT summary FROM t", false, "SUM substring without paren"},
+
+		// Edge case: APPROX_COUNT_DISTINCT and similar DISTINCT-containing functions
+		{"SELECT APPROX_COUNT_DISTINCT(device_id) FROM t WHERE $__timeFilter(time)", true, "APPROX_COUNT_DISTINCT"},
+		{"SELECT COUNT(DISTINCT device_id) FROM t", true, "COUNT with DISTINCT inside"},
 	}
 	for _, c := range cases {
 		result := containsAggregationWithoutTimeGroup(c.sql)
