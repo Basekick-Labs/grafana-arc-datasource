@@ -326,6 +326,16 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		splitting = false
 	}
 
+	// Skip splitting for UNION queries — macro expansion in multi-statement
+	// queries produces mangled SQL.
+	if splitting {
+		upper := strings.ToUpper(qm.SQL)
+		if strings.Contains(upper, " UNION ") {
+			log.DefaultLogger.Debug("Skipping split for UNION query", "refId", qm.RefID)
+			splitting = false
+		}
+	}
+
 	// Auto-add ORDER BY time ASC for time series queries without one
 	if qm.Format == "time_series" {
 		qm.SQL = OptimizeTimeSeriesQuery(qm.SQL)
@@ -700,10 +710,29 @@ func containsAggregationWithoutTimeGroup(sql string) bool {
 	if strings.Contains(upper, "DISTINCT ") || strings.Contains(upper, "DISTINCT(") || strings.HasSuffix(upper, "DISTINCT") {
 		return true
 	}
-	for _, fn := range []string{"SUM(", "COUNT(", "AVG(", "MIN(", "MAX("} {
+	// Standard SQL + DuckDB aggregate functions
+	for _, fn := range []string{
+		"SUM(", "COUNT(", "AVG(", "MIN(", "MAX(",
+		"MEDIAN(", "MODE(",
+		"STDDEV(", "STDDEV_POP(", "STDDEV_SAMP(",
+		"VARIANCE(", "VAR_POP(", "VAR_SAMP(",
+		"STRING_AGG(", "LIST(", "ARRAY_AGG(",
+		"FIRST(", "LAST(", "ANY_VALUE(",
+		"ARG_MIN(", "ARG_MAX(",
+		"QUANTILE(", "QUANTILE_CONT(", "QUANTILE_DISC(",
+		"HISTOGRAM(", "PRODUCT(",
+		"BIT_AND(", "BIT_OR(", "BIT_XOR(",
+		"BOOL_AND(", "BOOL_OR(",
+		"CORR(", "COVAR_POP(", "COVAR_SAMP(",
+		"ENTROPY(", "KURTOSIS(", "SKEWNESS(",
+	} {
 		if strings.Contains(upper, fn) {
 			return true
 		}
+	}
+	// Window functions — each chunk restarts the window, producing wrong results
+	if strings.Contains(upper, " OVER(") || strings.Contains(upper, " OVER (") {
+		return true
 	}
 	return false
 }

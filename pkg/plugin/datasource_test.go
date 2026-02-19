@@ -420,9 +420,26 @@ func TestContainsAggregationWithoutTimeGroup(t *testing.T) {
 		// Edge case: aggregate function name without parenthesis
 		{"SELECT summary FROM t", false, "SUM substring without paren"},
 
-		// Edge case: APPROX_COUNT_DISTINCT and similar DISTINCT-containing functions
+		// DISTINCT-containing functions
 		{"SELECT APPROX_COUNT_DISTINCT(device_id) FROM t WHERE $__timeFilter(time)", true, "APPROX_COUNT_DISTINCT"},
 		{"SELECT COUNT(DISTINCT device_id) FROM t", true, "COUNT with DISTINCT inside"},
+
+		// DuckDB aggregate functions
+		{"SELECT MEDIAN(duration) FROM t WHERE $__timeFilter(time)", true, "MEDIAN"},
+		{"SELECT STDDEV(value) FROM t WHERE $__timeFilter(time)", true, "STDDEV"},
+		{"SELECT STRING_AGG(host, ',') FROM t WHERE $__timeFilter(time)", true, "STRING_AGG"},
+		{"SELECT LIST(value) FROM t WHERE $__timeFilter(time)", true, "LIST"},
+		{"SELECT ARG_MIN(host, duration) FROM t WHERE $__timeFilter(time)", true, "ARG_MIN"},
+		{"SELECT ARG_MAX(host, duration) FROM t WHERE $__timeFilter(time)", true, "ARG_MAX"},
+		{"SELECT HISTOGRAM(value) FROM t WHERE $__timeFilter(time)", true, "HISTOGRAM"},
+		{"SELECT QUANTILE_CONT(value, 0.5) FROM t WHERE $__timeFilter(time)", true, "QUANTILE_CONT"},
+		{"SELECT VARIANCE(value) FROM t WHERE $__timeFilter(time)", true, "VARIANCE"},
+		{"SELECT ANY_VALUE(host) FROM t WHERE $__timeFilter(time)", true, "ANY_VALUE"},
+
+		// Window functions — each chunk restarts the window
+		{"SELECT time, value, ROW_NUMBER() OVER (ORDER BY time) FROM t WHERE $__timeFilter(time)", true, "window ROW_NUMBER"},
+		{"SELECT time, LAG(value) OVER (ORDER BY time) FROM t WHERE $__timeFilter(time)", true, "window LAG"},
+		{"SELECT time, value, RANK() OVER(PARTITION BY host ORDER BY value) FROM t WHERE $__timeFilter(time)", true, "window RANK no space"},
 	}
 	for _, c := range cases {
 		result := containsAggregationWithoutTimeGroup(c.sql)
