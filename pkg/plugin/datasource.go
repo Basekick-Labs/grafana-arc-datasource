@@ -710,21 +710,34 @@ func containsAggregationWithoutTimeGroup(sql string) bool {
 	if strings.Contains(upper, "DISTINCT ") || strings.Contains(upper, "DISTINCT(") || strings.HasSuffix(upper, "DISTINCT") {
 		return true
 	}
-	// Standard SQL + DuckDB aggregate functions
+	// Standard SQL + DuckDB aggregate functions (complete list from DuckDB docs)
 	for _, fn := range []string{
-		"SUM(", "COUNT(", "AVG(", "MIN(", "MAX(",
-		"MEDIAN(", "MODE(",
+		// General aggregates
+		"SUM(", "FSUM(", "COUNT(", "COUNTIF(", "AVG(", "FAVG(",
+		"MIN(", "MAX(", "ANY_VALUE(",
+		"ARG_MIN(", "ARG_MIN_NULL(", "ARG_MAX(", "ARG_MAX_NULL(",
+		"FIRST(", "LAST(", "PRODUCT(",
+		"STRING_AGG(", "LIST(", "ARRAY_AGG(",
+		"BOOL_AND(", "BOOL_OR(",
+		"BIT_AND(", "BIT_OR(", "BIT_XOR(", "BITSTRING_AGG(",
+		"GEOMETRIC_MEAN(", "WEIGHTED_AVG(",
+		// Statistical
+		"MEDIAN(", "MODE(", "MAD(",
 		"STDDEV(", "STDDEV_POP(", "STDDEV_SAMP(",
 		"VARIANCE(", "VAR_POP(", "VAR_SAMP(",
-		"STRING_AGG(", "LIST(", "ARRAY_AGG(",
-		"FIRST(", "LAST(", "ANY_VALUE(",
-		"ARG_MIN(", "ARG_MAX(",
+		"SKEWNESS(", "SKEWNESS_POP(",
+		"KURTOSIS(", "KURTOSIS_POP(",
+		"ENTROPY(", "CORR(",
+		"COVAR_POP(", "COVAR_SAMP(",
 		"QUANTILE(", "QUANTILE_CONT(", "QUANTILE_DISC(",
-		"HISTOGRAM(", "PRODUCT(",
-		"BIT_AND(", "BIT_OR(", "BIT_XOR(",
-		"BOOL_AND(", "BOOL_OR(",
-		"CORR(", "COVAR_POP(", "COVAR_SAMP(",
-		"ENTROPY(", "KURTOSIS(", "SKEWNESS(",
+		"HISTOGRAM(", "HISTOGRAM_EXACT(", "HISTOGRAM_VALUES(",
+		// Approximate
+		"APPROX_COUNT_DISTINCT(", "APPROX_QUANTILE(", "APPROX_TOP_K(",
+		"RESERVOIR_QUANTILE(",
+		// Regression
+		"REGR_AVGX(", "REGR_AVGY(", "REGR_COUNT(",
+		"REGR_INTERCEPT(", "REGR_R2(", "REGR_SLOPE(",
+		"REGR_SXX(", "REGR_SXY(", "REGR_SYY(",
 	} {
 		if strings.Contains(upper, fn) {
 			return true

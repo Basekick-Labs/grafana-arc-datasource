@@ -435,6 +435,19 @@ func TestContainsAggregationWithoutTimeGroup(t *testing.T) {
 		{"SELECT QUANTILE_CONT(value, 0.5) FROM t WHERE $__timeFilter(time)", true, "QUANTILE_CONT"},
 		{"SELECT VARIANCE(value) FROM t WHERE $__timeFilter(time)", true, "VARIANCE"},
 		{"SELECT ANY_VALUE(host) FROM t WHERE $__timeFilter(time)", true, "ANY_VALUE"},
+		// Functions added after DuckDB docs audit
+		{"SELECT COUNTIF(status = 200) FROM t WHERE $__timeFilter(time)", true, "COUNTIF"},
+		{"SELECT FAVG(value) FROM t WHERE $__timeFilter(time)", true, "FAVG"},
+		{"SELECT FSUM(value) FROM t WHERE $__timeFilter(time)", true, "FSUM"},
+		{"SELECT GEOMETRIC_MEAN(value) FROM t WHERE $__timeFilter(time)", true, "GEOMETRIC_MEAN"},
+		{"SELECT WEIGHTED_AVG(value, weight) FROM t WHERE $__timeFilter(time)", true, "WEIGHTED_AVG"},
+		{"SELECT APPROX_QUANTILE(value, 0.5) FROM t WHERE $__timeFilter(time)", true, "APPROX_QUANTILE"},
+		{"SELECT MAD(value) FROM t WHERE $__timeFilter(time)", true, "MAD"},
+		{"SELECT RESERVOIR_QUANTILE(value, 0.5) FROM t WHERE $__timeFilter(time)", true, "RESERVOIR_QUANTILE"},
+		{"SELECT REGR_SLOPE(y, x) FROM t WHERE $__timeFilter(time)", true, "REGR_SLOPE"},
+		{"SELECT KURTOSIS_POP(value) FROM t WHERE $__timeFilter(time)", true, "KURTOSIS_POP"},
+		{"SELECT SKEWNESS_POP(value) FROM t WHERE $__timeFilter(time)", true, "SKEWNESS_POP"},
+		{"SELECT BITSTRING_AGG(flag) FROM t WHERE $__timeFilter(time)", true, "BITSTRING_AGG"},
 
 		// Window functions — each chunk restarts the window
 		{"SELECT time, value, ROW_NUMBER() OVER (ORDER BY time) FROM t WHERE $__timeFilter(time)", true, "window ROW_NUMBER"},
