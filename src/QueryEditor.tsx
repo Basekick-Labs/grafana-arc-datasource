@@ -28,7 +28,7 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
     if (!query.sql && query.rawSql) {
       onChange({ ...query, sql: query.rawSql, rawSql: undefined });
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- intentionally runs only on mount for one-time rawSql migration
 
   const onSQLChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
     onChange({ ...query, sql: event.target.value });
@@ -109,7 +109,10 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
         />
         <div style={{ marginTop: '8px', fontSize: '12px', color: '#6e6e6e' }}>
           <div style={{ marginBottom: '4px' }}>
-            <strong>Available Macros:</strong> $__timeFilter(time), $__timeFrom(), $__timeTo(), $__interval, $__timeGroup(column, interval)
+            <strong>Available Macros:</strong> $__timeFilter(column), $__timeFrom(), $__timeTo(), $__interval, $__timeGroup(column, interval)
+          </div>
+          <div style={{ marginBottom: '4px', fontSize: '11px', color: '#888' }}>
+            $__timeGroup intervals: &apos;$__interval&apos; (auto), &apos;1 hour&apos;, &apos;10 minutes&apos;, &apos;1 minute&apos;, &apos;10 seconds&apos;, &apos;1 day&apos; — or short forms: &apos;1h&apos;, &apos;10m&apos;, &apos;1m&apos;, &apos;1d&apos;
           </div>
           <div style={{ fontFamily: 'ui-monospace, SFMono-Regular, monospace', fontSize: '11px', color: '#888' }}>
             Example: SELECT $__timeGroup(time, &apos;$__interval&apos;) AS time, host, AVG(value) FROM metrics WHERE $__timeFilter(time) GROUP BY 1, host ORDER BY 1

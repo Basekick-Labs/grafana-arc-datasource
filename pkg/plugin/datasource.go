@@ -155,6 +155,8 @@ func parseSplitDuration(s string, tr backend.TimeRange) (time.Duration, bool) {
 //   [14:30, 18:00), [18:00, 00:00), [00:00, 02:30)
 // All internal boundaries land on 6h multiples from epoch.
 func splitTimeRange(from, to time.Time, chunkSize time.Duration) []backend.TimeRange {
+	// Truncates to whole seconds — sub-second chunk sizes are not supported,
+	// but all valid split durations (1h, 6h, 1d, etc.) are well above that.
 	chunkSecs := int64(chunkSize.Seconds())
 	if chunkSecs <= 0 {
 		return []backend.TimeRange{{From: from, To: to}}
@@ -684,9 +686,32 @@ func ensureAscendingTimes(frame *data.Frame, timeIdx int) *data.Frame {
 	return sorted
 }
 
+// stripStringLiterals removes content inside single-quoted string literals
+// so that keyword detection doesn't false-positive on values like 'THE LIMIT 10'.
+// Handles escaped quotes ('') inside literals.
+func stripStringLiterals(sql string) string {
+	var result strings.Builder
+	inQuote := false
+	for i := 0; i < len(sql); i++ {
+		if sql[i] == '\'' {
+			if inQuote && i+1 < len(sql) && sql[i+1] == '\'' {
+				i++ // skip escaped quote ('')
+				continue
+			}
+			inQuote = !inQuote
+			continue
+		}
+		if !inQuote {
+			result.WriteByte(sql[i])
+		}
+	}
+	return result.String()
+}
+
 // containsLIMIT checks if SQL contains a LIMIT clause (case-insensitive).
+// Strips string literals first to avoid false positives on LIMIT inside quoted values.
 func containsLIMIT(sql string) bool {
-	return strings.Contains(strings.ToUpper(sql), " LIMIT ")
+	return strings.Contains(strings.ToUpper(stripStringLiterals(sql)), " LIMIT ")
 }
 
 // containsAggregationWithoutTimeGroup returns true if the SQL has aggregation

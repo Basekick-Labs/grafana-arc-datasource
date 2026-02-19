@@ -379,7 +379,9 @@ func TestContainsLIMIT(t *testing.T) {
 		{"SELECT * FROM t Limit 10", true},
 		{"SELECT * FROM t WHERE x > 1", false},
 		{"SELECT * FROM t ORDER BY time", false},
-		{"SELECT limited FROM t", false}, // "limited" is not " LIMIT "
+		{"SELECT limited FROM t", false},                            // "limited" is not " LIMIT "
+		{"SELECT * FROM t WHERE name = 'THE LIMIT 10'", false},      // LIMIT inside string literal
+		{"SELECT * FROM t WHERE desc = 'NO LIMIT ' ORDER BY id", false}, // LIMIT inside string literal with trailing space
 	}
 	for _, c := range cases {
 		result := containsLIMIT(c.sql)
@@ -501,6 +503,14 @@ func TestExpandTimeGroup_Multiple(t *testing.T) {
 	}
 }
 
+func TestExpandTimeGroup_MalformedInput(t *testing.T) {
+	sql := "SELECT $__timeGroup(time) AS time FROM t"
+	result := expandTimeGroup(sql)
+	if result != sql {
+		t.Errorf("expected malformed macro to be left unexpanded, got: %s", result)
+	}
+}
+
 // --- intervalToSeconds ---
 
 func TestIntervalToSeconds(t *testing.T) {
@@ -545,6 +555,25 @@ func TestApplyMacros_TimeFilter(t *testing.T) {
 	}
 	if !strings.Contains(result, "2026-02-18T10:00:00Z") || !strings.Contains(result, "2026-02-18T11:00:00Z") {
 		t.Errorf("expected time range in result: %s", result)
+	}
+}
+
+func TestApplyMacros_TimeFilter_CustomColumn(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	sql := "SELECT * FROM t WHERE $__timeFilter(created_at)"
+	result := ApplyMacros(sql, tr)
+
+	if strings.Contains(result, "$__timeFilter") {
+		t.Errorf("macro not expanded: %s", result)
+	}
+	if !strings.Contains(result, "created_at >= '2026-02-18T10:00:00Z'") {
+		t.Errorf("expected custom column in filter: %s", result)
+	}
+	if !strings.Contains(result, "created_at < '2026-02-18T11:00:00Z'") {
+		t.Errorf("expected custom column in end filter: %s", result)
 	}
 }
 

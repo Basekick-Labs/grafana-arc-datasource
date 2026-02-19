@@ -373,15 +373,41 @@ func calculateInterval(duration time.Duration) string {
 	}
 }
 
+// expandTimeFilter replaces $__timeFilter(column) with column >= 'from' AND column < 'to'.
+// Extracts the column name from the macro argument instead of hardcoding 'time'.
+func expandTimeFilter(sql string, from, to time.Time) string {
+	for {
+		idx := strings.Index(sql, "$__timeFilter(")
+		if idx == -1 {
+			return sql
+		}
+
+		end := strings.Index(sql[idx:], ")")
+		if end == -1 {
+			return sql
+		}
+		end += idx
+
+		column := strings.TrimSpace(sql[idx+len("$__timeFilter(") : end])
+		if column == "" {
+			log.DefaultLogger.Warn("$__timeFilter macro has empty column argument, defaulting to 'time'")
+			column = "time"
+		}
+
+		replacement := fmt.Sprintf("%s >= '%s' AND %s < '%s'",
+			column,
+			from.Format(time.RFC3339),
+			column,
+			to.Format(time.RFC3339),
+		)
+		sql = sql[:idx] + replacement + sql[end+1:]
+	}
+}
+
 // ApplyMacros replaces Grafana macros in SQL query
 func ApplyMacros(sql string, timeRange backend.TimeRange) string {
 	// $__timeFilter(column) -> column >= 'start' AND column < 'end'
-	timeFilter := fmt.Sprintf(
-		"time >= '%s' AND time < '%s'",
-		timeRange.From.Format(time.RFC3339),
-		timeRange.To.Format(time.RFC3339),
-	)
-	sql = strings.ReplaceAll(sql, "$__timeFilter(time)", timeFilter)
+	sql = expandTimeFilter(sql, timeRange.From, timeRange.To)
 
 	// $__timeFrom() -> start time
 	sql = strings.ReplaceAll(sql, "$__timeFrom()", fmt.Sprintf("'%s'", timeRange.From.Format(time.RFC3339)))
@@ -405,12 +431,7 @@ func ApplyMacros(sql string, timeRange backend.TimeRange) string {
 // but the original full range for $__interval calculation (so bucket sizes stay consistent)
 func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange backend.TimeRange) string {
 	// $__timeFilter uses chunk boundaries
-	timeFilter := fmt.Sprintf(
-		"time >= '%s' AND time < '%s'",
-		chunk.From.Format(time.RFC3339),
-		chunk.To.Format(time.RFC3339),
-	)
-	sql = strings.ReplaceAll(sql, "$__timeFilter(time)", timeFilter)
+	sql = expandTimeFilter(sql, chunk.From, chunk.To)
 
 	// $__timeFrom/$__timeTo use chunk boundaries
 	sql = strings.ReplaceAll(sql, "$__timeFrom()", fmt.Sprintf("'%s'", chunk.From.Format(time.RFC3339)))
@@ -480,6 +501,8 @@ func expandTimeGroup(sql string) string {
 		inner := sql[idx+len("$__timeGroup(") : end]
 		parts := strings.SplitN(inner, ",", 2)
 		if len(parts) != 2 {
+			log.DefaultLogger.Warn("$__timeGroup requires two arguments: $__timeGroup(column, interval)",
+				"found", inner)
 			return sql
 		}
 
