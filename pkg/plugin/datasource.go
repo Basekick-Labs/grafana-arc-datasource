@@ -208,6 +208,7 @@ func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceS
 
 // mergeFrames appends rows from all chunk frames into a single frame.
 // Skips frames with incompatible schemas (different field count) to avoid panics.
+// Pre-allocates capacity to avoid O(n²) re-allocation from row-by-row appends.
 func mergeFrames(frames []*data.Frame) *data.Frame {
 	if len(frames) == 0 {
 		return nil
@@ -232,6 +233,31 @@ func mergeFrames(frames []*data.Frame) *data.Frame {
 
 	expectedFields := len(merged.Fields)
 
+	// Count total rows to add so we can pre-allocate
+	additionalRows := 0
+	for _, f := range frames[startIdx:] {
+		if f == nil || len(f.Fields) != expectedFields {
+			continue
+		}
+		rowLen, err := f.RowLen()
+		if err != nil {
+			continue
+		}
+		additionalRows += rowLen
+	}
+
+	if additionalRows == 0 {
+		return merged
+	}
+
+	// Pre-extend all fields to avoid repeated re-allocation
+	baseRows := merged.Rows()
+	for _, field := range merged.Fields {
+		field.Extend(additionalRows)
+	}
+
+	// Copy data using Set (single allocation, no per-row realloc)
+	writeIdx := baseRows
 	for _, f := range frames[startIdx:] {
 		if f == nil || len(f.Fields) != expectedFields {
 			continue
@@ -241,7 +267,10 @@ func mergeFrames(frames []*data.Frame) *data.Frame {
 			continue
 		}
 		for i := 0; i < rowLen; i++ {
-			merged.AppendRow(f.RowCopy(i)...)
+			for fieldIdx := 0; fieldIdx < expectedFields; fieldIdx++ {
+				merged.Fields[fieldIdx].Set(writeIdx, f.Fields[fieldIdx].CopyAt(i))
+			}
+			writeIdx++
 		}
 	}
 	return merged
@@ -266,15 +295,9 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 
 	// Per-query database override
 	if qm.Database != "" {
-		settings = &ArcInstanceSettings{
-			settings: ArcDataSourceSettings{
-				URL:      settings.settings.URL,
-				Database: qm.Database,
-				Timeout:  settings.settings.Timeout,
-				UseArrow: settings.settings.UseArrow,
-			},
-			apiKey: settings.apiKey,
-		}
+		overridden := *settings
+		overridden.settings.Database = qm.Database
+		settings = &overridden
 	}
 
 	// Check if query splitting is enabled
@@ -349,7 +372,12 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 					}
 				}
 			}()
-			semaphore <- struct{}{}
+			select {
+			case semaphore <- struct{}{}:
+			case <-ctx.Done():
+				results[idx] = chunkResult{index: idx, err: ctx.Err()}
+				return
+			}
 			defer func() { <-semaphore }()
 
 			frame, err := d.executeChunk(ctx, settings, qm.SQL, ch, query.TimeRange)
@@ -655,6 +683,9 @@ func containsLIMIT(sql string) bool {
 // (GROUP BY, DISTINCT, or aggregate functions) but no $__timeGroup macro.
 // Such queries aggregate across the full time range and would produce wrong
 // results if split into chunks (duplicated groups, inflated counts, etc.).
+// Note: this is a best-effort heuristic — it can false-positive on keywords
+// inside string literals or comments, but errs on the safe side (skipping
+// splitting is always correct, just slower).
 func containsAggregationWithoutTimeGroup(sql string) bool {
 	if strings.Contains(sql, "$__timeGroup") {
 		return false
@@ -663,7 +694,9 @@ func containsAggregationWithoutTimeGroup(sql string) bool {
 	if strings.Contains(upper, "GROUP BY") {
 		return true
 	}
-	if strings.Contains(upper, "DISTINCT") {
+	// Match "DISTINCT " (with trailing space) to avoid false positives
+	// on values like 'DISTINCT_VALUE' inside string literals
+	if strings.Contains(upper, "DISTINCT ") || strings.HasSuffix(upper, "DISTINCT") {
 		return true
 	}
 	for _, fn := range []string{"SUM(", "COUNT(", "AVG(", "MIN(", "MAX("} {

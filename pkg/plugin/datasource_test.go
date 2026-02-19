@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -388,6 +389,45 @@ func TestContainsLIMIT(t *testing.T) {
 	}
 }
 
+// --- containsAggregationWithoutTimeGroup ---
+
+func TestContainsAggregationWithoutTimeGroup(t *testing.T) {
+	cases := []struct {
+		sql      string
+		expected bool
+		desc     string
+	}{
+		// Should detect aggregation (no $__timeGroup)
+		{"SELECT COUNT(*) FROM t", true, "bare COUNT"},
+		{"SELECT SUM(value) FROM t", true, "bare SUM"},
+		{"SELECT AVG(value) FROM t", true, "bare AVG"},
+		{"SELECT MIN(value) FROM t", true, "bare MIN"},
+		{"SELECT MAX(value) FROM t", true, "bare MAX"},
+		{"SELECT * FROM t GROUP BY host", true, "GROUP BY without timeGroup"},
+		{"SELECT DISTINCT host FROM t", true, "DISTINCT keyword"},
+
+		// Should NOT detect aggregation (has $__timeGroup)
+		{"SELECT $__timeGroup(time, '1h'), COUNT(*) FROM t GROUP BY 1", false, "COUNT with timeGroup"},
+		{"SELECT $__timeGroup(time, '1h'), AVG(value) FROM t GROUP BY 1", false, "AVG with timeGroup"},
+
+		// Should NOT detect aggregation (no aggregation at all)
+		{"SELECT * FROM t WHERE $__timeFilter(time)", false, "simple select"},
+		{"SELECT time, value FROM t ORDER BY time", false, "select with order"},
+
+		// Edge case: DISTINCT inside a string value should not trigger (improved with trailing space)
+		{"SELECT * FROM t WHERE status = 'ACTIVE'", false, "no aggregation keywords"},
+
+		// Edge case: aggregate function name without parenthesis
+		{"SELECT summary FROM t", false, "SUM substring without paren"},
+	}
+	for _, c := range cases {
+		result := containsAggregationWithoutTimeGroup(c.sql)
+		if result != c.expected {
+			t.Errorf("%s: containsAggregationWithoutTimeGroup(%q): expected %v, got %v", c.desc, c.sql, c.expected, result)
+		}
+	}
+}
+
 // --- expandTimeGroup ---
 
 func TestExpandTimeGroup_Basic(t *testing.T) {
@@ -422,7 +462,7 @@ func TestExpandTimeGroup_Multiple(t *testing.T) {
 	if result == sql {
 		t.Errorf("expected macros to be expanded")
 	}
-	if !contains(result, "epoch_ns(time) // 1000000000 // 3600") || !contains(result, "epoch_ns(created_at) // 1000000000 // 86400") {
+	if !strings.Contains(result, "epoch_ns(time) // 1000000000 // 3600") || !strings.Contains(result, "epoch_ns(created_at) // 1000000000 // 86400") {
 		t.Errorf("expected both macros expanded, got: %s", result)
 	}
 }
@@ -466,10 +506,10 @@ func TestApplyMacros_TimeFilter(t *testing.T) {
 	sql := "SELECT * FROM t WHERE $__timeFilter(time)"
 	result := ApplyMacros(sql, tr)
 
-	if contains(result, "$__timeFilter") {
+	if strings.Contains(result, "$__timeFilter") {
 		t.Errorf("macro not expanded: %s", result)
 	}
-	if !contains(result, "2026-02-18T10:00:00Z") || !contains(result, "2026-02-18T11:00:00Z") {
+	if !strings.Contains(result, "2026-02-18T10:00:00Z") || !strings.Contains(result, "2026-02-18T11:00:00Z") {
 		t.Errorf("expected time range in result: %s", result)
 	}
 }
@@ -490,7 +530,7 @@ func TestApplyMacros_Interval(t *testing.T) {
 			To:   time.Date(2026, 2, 18, 0, 0, 0, 0, time.UTC).Add(time.Duration(c.hours) * time.Hour),
 		}
 		result := ApplyMacros("GROUP BY $__interval", tr)
-		if !contains(result, c.expected) {
+		if !strings.Contains(result, c.expected) {
 			t.Errorf("for %dh range, expected interval %q in: %s", c.hours, c.expected, result)
 		}
 	}
@@ -510,11 +550,11 @@ func TestApplyMacrosWithSplit_UsesChunkForFilter_OriginalForInterval(t *testing.
 	result := ApplyMacrosWithSplit(sql, chunk, originalRange)
 
 	// Time filter should use chunk boundaries
-	if !contains(result, "2026-02-18T06:00:00Z") {
+	if !strings.Contains(result, "2026-02-18T06:00:00Z") {
 		t.Errorf("expected chunk From in filter: %s", result)
 	}
 	// Interval should use original 8d range (> 7d) → "1 hour"
-	if !contains(result, "1 hour") {
+	if !strings.Contains(result, "1 hour") {
 		t.Errorf("expected '1 hour' interval from 8d original range: %s", result)
 	}
 }
@@ -528,15 +568,3 @@ func expect(t *testing.T, got, want time.Time, label string) {
 	}
 }
 
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsStr(s, substr))
-}
-
-func containsStr(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}

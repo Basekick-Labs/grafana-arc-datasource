@@ -1,5 +1,5 @@
 import React from 'react';
-import { QueryEditorProps } from '@grafana/data';
+import { QueryEditorProps, SelectableValue } from '@grafana/data';
 import { InlineField, Input, TextArea, RadioButtonGroup, Select } from '@grafana/ui';
 import { ArcDataSource } from './datasource';
 import { ArcDataSourceOptions, ArcQuery } from './types';
@@ -39,7 +39,7 @@ export function QueryEditor({ query, onChange, onRunQuery }: Props) {
     onRunQuery();
   };
 
-  const onSplitChange = (option: any) => {
+  const onSplitChange = (option: SelectableValue<string>) => {
     onChange({ ...query, splitDuration: option?.value || 'auto' });
     onRunQuery();
   };

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -54,13 +55,13 @@ func QueryArrow(ctx context.Context, settings *ArcInstanceSettings, sql string, 
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s", formatRequestError(err))
+		return nil, errors.New(formatRequestError(err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("%s", parseArcError(resp.StatusCode, body))
+		return nil, errors.New(parseArcError(resp.StatusCode, body))
 	}
 
 	// Read Arrow IPC stream

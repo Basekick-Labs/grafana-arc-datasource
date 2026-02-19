@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -89,13 +90,13 @@ func QueryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string, t
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s", formatRequestError(err))
+		return nil, errors.New(formatRequestError(err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("%s", parseArcError(resp.StatusCode, body))
+		return nil, errors.New(parseArcError(resp.StatusCode, body))
 	}
 
 	// Parse JSON response
@@ -358,6 +359,20 @@ func JSONToDataFrame(result map[string]interface{}) (*data.Frame, error) {
 	return frame, nil
 }
 
+// calculateInterval picks an appropriate aggregation interval for the given duration.
+func calculateInterval(duration time.Duration) string {
+	switch {
+	case duration > 7*24*time.Hour:
+		return "1 hour"
+	case duration > 24*time.Hour:
+		return "10 minutes"
+	case duration > 6*time.Hour:
+		return "1 minute"
+	default:
+		return "10 seconds"
+	}
+}
+
 // ApplyMacros replaces Grafana macros in SQL query
 func ApplyMacros(sql string, timeRange backend.TimeRange) string {
 	// $__timeFilter(column) -> column >= 'start' AND column < 'end'
@@ -375,18 +390,7 @@ func ApplyMacros(sql string, timeRange backend.TimeRange) string {
 	sql = strings.ReplaceAll(sql, "$__timeTo()", fmt.Sprintf("'%s'", timeRange.To.Format(time.RFC3339)))
 
 	// $__interval -> calculate interval based on time range
-	duration := timeRange.To.Sub(timeRange.From)
-	var interval string
-	if duration > 7*24*time.Hour {
-		interval = "1 hour"
-	} else if duration > 24*time.Hour {
-		interval = "10 minutes"
-	} else if duration > 6*time.Hour {
-		interval = "1 minute"
-	} else {
-		interval = "10 seconds"
-	}
-	sql = strings.ReplaceAll(sql, "$__interval", interval)
+	sql = strings.ReplaceAll(sql, "$__interval", calculateInterval(timeRange.To.Sub(timeRange.From)))
 
 	// $__timeGroup(column, interval) -> epoch-based bucketing
 	// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
@@ -413,18 +417,7 @@ func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange bac
 	sql = strings.ReplaceAll(sql, "$__timeTo()", fmt.Sprintf("'%s'", chunk.To.Format(time.RFC3339)))
 
 	// $__interval uses the ORIGINAL range so bucket sizes are consistent across all chunks
-	duration := originalRange.To.Sub(originalRange.From)
-	var interval string
-	if duration > 7*24*time.Hour {
-		interval = "1 hour"
-	} else if duration > 24*time.Hour {
-		interval = "10 minutes"
-	} else if duration > 6*time.Hour {
-		interval = "1 minute"
-	} else {
-		interval = "10 seconds"
-	}
-	sql = strings.ReplaceAll(sql, "$__interval", interval)
+	sql = strings.ReplaceAll(sql, "$__interval", calculateInterval(originalRange.To.Sub(originalRange.From)))
 
 	sql = expandTimeGroup(sql)
 
