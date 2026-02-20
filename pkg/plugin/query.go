@@ -35,22 +35,24 @@ func parseArcError(statusCode int, body []byte) string {
 	return fmt.Sprintf("Arc error (HTTP %d): %s", statusCode, text)
 }
 
-// formatRequestError converts Go HTTP client errors into user-friendly messages.
-func formatRequestError(err error) string {
+// formatRequestError converts Go HTTP client errors into user-friendly messages
+// while preserving the original error chain for programmatic inspection via errors.Is/As.
+func formatRequestError(err error) error {
 	msg := err.Error()
-	if strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "Client.Timeout") {
-		return "Query timed out — try reducing the time range, increasing the timeout in datasource settings, or enabling query splitting"
+	var friendly string
+	switch {
+	case strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "Client.Timeout"):
+		friendly = "Query timed out — try reducing the time range, increasing the timeout in datasource settings, or enabling query splitting"
+	case strings.Contains(msg, "connection refused"):
+		friendly = "Cannot connect to Arc — connection refused. Check that Arc is running and the URL is correct"
+	case strings.Contains(msg, "no such host"):
+		friendly = "Cannot connect to Arc — hostname not found. Check the URL in datasource settings"
+	case strings.Contains(msg, "EOF"):
+		friendly = "Arc closed the connection unexpectedly — the query may be too large. Try enabling query splitting or reducing the time range"
+	default:
+		friendly = "Request to Arc failed"
 	}
-	if strings.Contains(msg, "connection refused") {
-		return "Cannot connect to Arc — connection refused. Check that Arc is running and the URL is correct"
-	}
-	if strings.Contains(msg, "no such host") {
-		return "Cannot connect to Arc — hostname not found. Check the URL in datasource settings"
-	}
-	if strings.Contains(msg, "EOF") {
-		return "Arc closed the connection unexpectedly — the query may be too large. Try enabling query splitting or reducing the time range"
-	}
-	return fmt.Sprintf("Request to Arc failed: %s", msg)
+	return fmt.Errorf("%s: %w", friendly, err)
 }
 
 // QueryJSON executes a query using Arc's JSON endpoint (fallback)
@@ -90,7 +92,7 @@ func QueryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string, t
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, errors.New(formatRequestError(err))
+		return nil, formatRequestError(err)
 	}
 	defer resp.Body.Close()
 
