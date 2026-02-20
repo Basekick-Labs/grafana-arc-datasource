@@ -56,7 +56,7 @@ func QueryArrowFlightSQLStyle(ctx context.Context, settings *ArcInstanceSettings
 	resp, err := client.Do(req)
 	httpDuration := time.Since(start)
 	if err != nil {
-		return nil, errors.New(formatRequestError(err))
+		return nil, formatRequestError(err)
 	}
 	defer resp.Body.Close()
 

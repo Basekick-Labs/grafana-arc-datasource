@@ -731,7 +731,7 @@ func containsAggregationWithoutTimeGroup(sql string) bool {
 	if strings.Contains(sql, "$__timeGroup") {
 		return false
 	}
-	upper := strings.ToUpper(sql)
+	upper := strings.ToUpper(stripStringLiterals(sql))
 	if strings.Contains(upper, "GROUP BY") {
 		return true
 	}

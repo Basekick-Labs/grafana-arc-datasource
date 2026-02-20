@@ -55,7 +55,7 @@ func QueryArrow(ctx context.Context, settings *ArcInstanceSettings, sql string, 
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, errors.New(formatRequestError(err))
+		return nil, formatRequestError(err)
 	}
 	defer resp.Body.Close()
 
