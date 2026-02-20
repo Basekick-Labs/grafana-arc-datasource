@@ -54,6 +54,18 @@ export function ConfigEditor(props: Props) {
     });
   };
 
+  // Max Concurrency change handler
+  const onMaxConcurrencyChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const val = parseInt(event.target.value, 10);
+    onOptionsChange({
+      ...options,
+      jsonData: {
+        ...jsonData,
+        maxConcurrency: isNaN(val) || val < 1 ? 4 : val,
+      },
+    });
+  };
+
   // API Key change handler
   const onAPIKeyChange = (event: ChangeEvent<HTMLInputElement>) => {
     onOptionsChange({
@@ -133,6 +145,20 @@ export function ConfigEditor(props: Props) {
           value={jsonData.timeout || 30}
           placeholder="30"
           onChange={onTimeoutChange}
+        />
+      </InlineField>
+
+      <InlineField
+        label="Max Concurrency"
+        labelWidth={20}
+        tooltip="Maximum parallel chunks for query splitting. Each Grafana panel can spawn up to this many concurrent Arc requests. Lower values reduce Arc load in multi-user deployments."
+      >
+        <Input
+          width={40}
+          type="number"
+          value={jsonData.maxConcurrency || 4}
+          placeholder="4"
+          onChange={onMaxConcurrencyChange}
         />
       </InlineField>
 

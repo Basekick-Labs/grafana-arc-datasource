@@ -8,6 +8,7 @@ export interface ArcDataSourceOptions extends DataSourceJsonData {
   database?: string;
   timeout?: number;
   useArrow?: boolean;
+  maxConcurrency?: number;
 }
 
 /**
@@ -24,6 +25,9 @@ export interface ArcQuery extends DataQuery {
   sql: string;
   format?: 'time_series' | 'table';
   rawQuery?: boolean;
+  rawSql?: string; // Postgres/MySQL/MSSQL/ClickHouse compatibility
+  splitDuration?: string; // "off", "1h", "6h", "12h", "1d", "3d", "7d"
+  database?: string; // Per-query database override (empty = use datasource default)
 }
 
 /**

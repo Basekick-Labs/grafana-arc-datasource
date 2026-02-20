@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,43 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 )
+
+// parseArcError extracts a human-readable error from Arc's JSON error response.
+// Arc returns errors as: {"error": "message"} or plain text.
+func parseArcError(statusCode int, body []byte) string {
+	var parsed struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(body, &parsed) == nil && parsed.Error != "" {
+		return fmt.Sprintf("Arc error (HTTP %d): %s", statusCode, parsed.Error)
+	}
+	text := strings.TrimSpace(string(body))
+	if len(text) > 500 {
+		text = text[:500] + "..."
+	}
+	if text == "" {
+		return fmt.Sprintf("Arc returned HTTP %d with no error message", statusCode)
+	}
+	return fmt.Sprintf("Arc error (HTTP %d): %s", statusCode, text)
+}
+
+// formatRequestError converts Go HTTP client errors into user-friendly messages.
+func formatRequestError(err error) string {
+	msg := err.Error()
+	if strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "Client.Timeout") {
+		return "Query timed out — try reducing the time range, increasing the timeout in datasource settings, or enabling query splitting"
+	}
+	if strings.Contains(msg, "connection refused") {
+		return "Cannot connect to Arc — connection refused. Check that Arc is running and the URL is correct"
+	}
+	if strings.Contains(msg, "no such host") {
+		return "Cannot connect to Arc — hostname not found. Check the URL in datasource settings"
+	}
+	if strings.Contains(msg, "EOF") {
+		return "Arc closed the connection unexpectedly — the query may be too large. Try enabling query splitting or reducing the time range"
+	}
+	return fmt.Sprintf("Request to Arc failed: %s", msg)
+}
 
 // QueryJSON executes a query using Arc's JSON endpoint (fallback)
 func QueryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string, timeRange backend.TimeRange) (*data.Frame, error) {
@@ -52,19 +90,19 @@ func QueryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string, t
 	start := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, errors.New(formatRequestError(err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Arc returned status %d: %s", resp.StatusCode, string(body))
+		return nil, errors.New(parseArcError(resp.StatusCode, body))
 	}
 
 	// Parse JSON response
 	var result map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("failed to decode Arc JSON response: %w", err)
 	}
 
 	duration := time.Since(start)
@@ -75,7 +113,7 @@ func QueryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string, t
 	// Convert to DataFrame
 	frame, err := JSONToDataFrame(result)
 	if err != nil {
-		return nil, fmt.Errorf("failed to convert JSON to DataFrame: %w", err)
+		return nil, fmt.Errorf("failed to convert response to DataFrame: %w", err)
 	}
 
 	// Add metadata
@@ -321,15 +359,55 @@ func JSONToDataFrame(result map[string]interface{}) (*data.Frame, error) {
 	return frame, nil
 }
 
+// calculateInterval picks an appropriate aggregation interval for the given duration.
+func calculateInterval(duration time.Duration) string {
+	switch {
+	case duration > 7*24*time.Hour:
+		return "1 hour"
+	case duration > 24*time.Hour:
+		return "10 minutes"
+	case duration > 6*time.Hour:
+		return "1 minute"
+	default:
+		return "10 seconds"
+	}
+}
+
+// expandTimeFilter replaces $__timeFilter(column) with column >= 'from' AND column < 'to'.
+// Extracts the column name from the macro argument instead of hardcoding 'time'.
+func expandTimeFilter(sql string, from, to time.Time) string {
+	for {
+		idx := strings.Index(sql, "$__timeFilter(")
+		if idx == -1 {
+			return sql
+		}
+
+		end := strings.Index(sql[idx:], ")")
+		if end == -1 {
+			return sql
+		}
+		end += idx
+
+		column := strings.TrimSpace(sql[idx+len("$__timeFilter(") : end])
+		if column == "" {
+			log.DefaultLogger.Warn("$__timeFilter macro has empty column argument, defaulting to 'time'")
+			column = "time"
+		}
+
+		replacement := fmt.Sprintf("%s >= '%s' AND %s < '%s'",
+			column,
+			from.Format(time.RFC3339),
+			column,
+			to.Format(time.RFC3339),
+		)
+		sql = sql[:idx] + replacement + sql[end+1:]
+	}
+}
+
 // ApplyMacros replaces Grafana macros in SQL query
 func ApplyMacros(sql string, timeRange backend.TimeRange) string {
 	// $__timeFilter(column) -> column >= 'start' AND column < 'end'
-	timeFilter := fmt.Sprintf(
-		"time >= '%s' AND time < '%s'",
-		timeRange.From.Format(time.RFC3339),
-		timeRange.To.Format(time.RFC3339),
-	)
-	sql = strings.ReplaceAll(sql, "$__timeFilter(time)", timeFilter)
+	sql = expandTimeFilter(sql, timeRange.From, timeRange.To)
 
 	// $__timeFrom() -> start time
 	sql = strings.ReplaceAll(sql, "$__timeFrom()", fmt.Sprintf("'%s'", timeRange.From.Format(time.RFC3339)))
@@ -338,26 +416,107 @@ func ApplyMacros(sql string, timeRange backend.TimeRange) string {
 	sql = strings.ReplaceAll(sql, "$__timeTo()", fmt.Sprintf("'%s'", timeRange.To.Format(time.RFC3339)))
 
 	// $__interval -> calculate interval based on time range
-	duration := timeRange.To.Sub(timeRange.From)
-	var interval string
-	if duration > 7*24*time.Hour {
-		interval = "1 hour"
-	} else if duration > 24*time.Hour {
-		interval = "10 minutes"
-	} else if duration > 6*time.Hour {
-		interval = "1 minute"
-	} else {
-		interval = "10 seconds"
-	}
-	sql = strings.ReplaceAll(sql, "$__interval", interval)
+	sql = strings.ReplaceAll(sql, "$__interval", calculateInterval(timeRange.To.Sub(timeRange.From)))
 
-	// $__timeGroup(column, interval) -> time_bucket(INTERVAL 'interval', column)
-	// This is a simplified version - in production, parse properly
-	sql = strings.ReplaceAll(sql, "$__timeGroup(time, '1m')", "time_bucket(INTERVAL '1 minute', time)")
-	sql = strings.ReplaceAll(sql, "$__timeGroup(time, '5m')", "time_bucket(INTERVAL '5 minutes', time)")
-	sql = strings.ReplaceAll(sql, "$__timeGroup(time, '1h')", "time_bucket(INTERVAL '1 hour', time)")
+	// $__timeGroup(column, interval) -> epoch-based bucketing
+	// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
+	// causing GROUP BY to produce per-second rows instead of proper hourly buckets.
+	// Epoch math avoids this entirely.
+	sql = expandTimeGroup(sql)
 
 	return sql
+}
+
+// ApplyMacrosWithSplit replaces macros using the chunk's time range for filtering
+// but the original full range for $__interval calculation (so bucket sizes stay consistent)
+func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange backend.TimeRange) string {
+	// $__timeFilter uses chunk boundaries
+	sql = expandTimeFilter(sql, chunk.From, chunk.To)
+
+	// $__timeFrom/$__timeTo use chunk boundaries
+	sql = strings.ReplaceAll(sql, "$__timeFrom()", fmt.Sprintf("'%s'", chunk.From.Format(time.RFC3339)))
+	sql = strings.ReplaceAll(sql, "$__timeTo()", fmt.Sprintf("'%s'", chunk.To.Format(time.RFC3339)))
+
+	// $__interval uses the ORIGINAL range so bucket sizes are consistent across all chunks
+	sql = strings.ReplaceAll(sql, "$__interval", calculateInterval(originalRange.To.Sub(originalRange.From)))
+
+	sql = expandTimeGroup(sql)
+
+	return sql
+}
+
+// intervalToSeconds converts an interval string to seconds.
+func intervalToSeconds(interval string) int {
+	interval = strings.TrimSpace(interval)
+	switch interval {
+	case "1s", "1 second":
+		return 1
+	case "5s", "5 seconds":
+		return 5
+	case "10s", "10 seconds":
+		return 10
+	case "30s", "30 seconds":
+		return 30
+	case "1m", "1 minute":
+		return 60
+	case "5m", "5 minutes":
+		return 300
+	case "10m", "10 minutes":
+		return 600
+	case "15m", "15 minutes":
+		return 900
+	case "30m", "30 minutes":
+		return 1800
+	case "1h", "1 hour":
+		return 3600
+	case "6h", "6 hours":
+		return 21600
+	case "12h", "12 hours":
+		return 43200
+	case "1d", "1 day":
+		return 86400
+	default:
+		return 3600
+	}
+}
+
+// expandTimeGroup replaces $__timeGroup(column, interval) with epoch-based bucketing SQL.
+// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
+// causing GROUP BY to produce per-second rows. Epoch math avoids this.
+func expandTimeGroup(sql string) string {
+	for {
+		idx := strings.Index(sql, "$__timeGroup(")
+		if idx == -1 {
+			return sql
+		}
+
+		// Find the closing paren
+		end := strings.Index(sql[idx:], ")")
+		if end == -1 {
+			return sql
+		}
+		end += idx
+
+		// Extract arguments: $__timeGroup(column, 'interval')
+		inner := sql[idx+len("$__timeGroup(") : end]
+		parts := strings.SplitN(inner, ",", 2)
+		if len(parts) != 2 {
+			log.DefaultLogger.Warn("$__timeGroup requires two arguments: $__timeGroup(column, interval)",
+				"found", inner)
+			return sql
+		}
+
+		column := strings.TrimSpace(parts[0])
+		interval := strings.Trim(strings.TrimSpace(parts[1]), "'\"")
+		secs := intervalToSeconds(interval)
+
+		// Use epoch_ns() (BIGINT) with // (integer division) instead of epoch() (DOUBLE)
+		// to avoid floating-point precision loss that causes timestamps near hour
+		// boundaries (e.g. 05:59:59.999) to round up to the next bucket (06:00:00).
+		// DuckDB's / operator returns DOUBLE; // returns BIGINT.
+		replacement := fmt.Sprintf("to_timestamp((epoch_ns(%s) // 1000000000 // %d) * %d)", column, secs, secs)
+		sql = sql[:idx] + replacement + sql[end+1:]
+	}
 }
 
 // OptimizeTimeSeriesQuery adds ORDER BY time ASC if missing for better performance
