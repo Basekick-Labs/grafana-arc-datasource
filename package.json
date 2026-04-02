@@ -1,6 +1,6 @@
 {
   "name": "grafana-arc-datasource",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "High-performance Grafana datasource for Arc using Apache Arrow",
   "scripts": {
     "build": "webpack -c ./.config/webpack/webpack.config.js --env production",

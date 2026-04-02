@@ -188,10 +188,13 @@ func createEmptyField(f arrow.Field) *data.Field {
 		}
 		return data.NewField(f.Name, nil, []int32{})
 	case arrow.INT64:
+		// Promote to float64 so Grafana Stat/Time series panels treat it as a
+		// numeric value field. DuckDB aggregates (SUM, COUNT) return int64 after
+		// Arc's decimal normalization — Grafana auto-detection requires float64.
 		if f.Nullable {
-			return data.NewField(f.Name, nil, []*int64{})
+			return data.NewField(f.Name, nil, []*float64{})
 		}
-		return data.NewField(f.Name, nil, []int64{})
+		return data.NewField(f.Name, nil, []float64{})
 	case arrow.UINT8:
 		if f.Nullable {
 			return data.NewField(f.Name, nil, []*uint8{})
@@ -208,10 +211,11 @@ func createEmptyField(f arrow.Field) *data.Field {
 		}
 		return data.NewField(f.Name, nil, []uint32{})
 	case arrow.UINT64:
+		// Promote to float64 for same reason as INT64.
 		if f.Nullable {
-			return data.NewField(f.Name, nil, []*uint64{})
+			return data.NewField(f.Name, nil, []*float64{})
 		}
-		return data.NewField(f.Name, nil, []uint64{})
+		return data.NewField(f.Name, nil, []float64{})
 	case arrow.BOOL:
 		if f.Nullable {
 			return data.NewField(f.Name, nil, []*bool{})
@@ -257,7 +261,7 @@ func appendArrowColumnToField(field *data.Field, col arrow.Array) error {
 	case arrow.INT32:
 		return appendTypedColumn[int32](field, col.(*array.Int32))
 	case arrow.INT64:
-		return appendTypedColumn[int64](field, col.(*array.Int64))
+		return appendCastColumn[int64, float64](field, col.(*array.Int64))
 	case arrow.UINT8:
 		return appendTypedColumn[uint8](field, col.(*array.Uint8))
 	case arrow.UINT16:
@@ -265,7 +269,7 @@ func appendArrowColumnToField(field *data.Field, col arrow.Array) error {
 	case arrow.UINT32:
 		return appendTypedColumn[uint32](field, col.(*array.Uint32))
 	case arrow.UINT64:
-		return appendTypedColumn[uint64](field, col.(*array.Uint64))
+		return appendCastColumn[uint64, float64](field, col.(*array.Uint64))
 	case arrow.BOOL:
 		return appendTypedColumn[bool](field, col.(*array.Boolean))
 	default:
@@ -299,6 +303,30 @@ type arrowTypedArray[T any] interface {
 	IsNull(int) bool
 	Value(int) T
 	Len() int
+}
+
+// appendCastColumn appends a typed Arrow column to a field, casting each value to OutT.
+// Used to promote int64/uint64 → float64 for Grafana numeric field compatibility.
+func appendCastColumn[T interface {
+	~int64 | ~uint64
+}, OutT interface {
+	~float64
+}, Array arrowTypedArray[T]](field *data.Field, arr Array) error {
+	for i := 0; i < arr.Len(); i++ {
+		if field.Nullable() {
+			if arr.IsNull(i) {
+				var v *OutT
+				field.Append(v)
+				continue
+			}
+			v := OutT(arr.Value(i))
+			field.Append(&v)
+		} else {
+			v := OutT(arr.Value(i))
+			field.Append(v)
+		}
+	}
+	return nil
 }
 
 // appendTypedColumn appends a typed Arrow column to a field
