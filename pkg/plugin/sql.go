@@ -47,12 +47,15 @@ func stripStringLiteralsAndComments(sql string) string {
 			i += end // keep the newline, drop the comment text
 			continue
 		}
-		// Block comment: /* ... */
+		// Block comment: /* ... */. Replace with a single space so adjacent
+		// tokens stay separated (e.g. `SELECT/*x*/col` becomes `SELECT col`,
+		// not `SELECTcol`) — otherwise keyword detection would miss the SELECT.
 		if c == '/' && i+1 < len(sql) && sql[i+1] == '*' {
 			end := strings.Index(sql[i+2:], "*/")
 			if end < 0 {
 				return out.String() // unterminated block comment
 			}
+			out.WriteByte(' ')
 			i += 2 + end + 2
 			continue
 		}
@@ -93,14 +96,15 @@ func containsUnion(s strippedSQL) bool {
 	return strings.Contains(s.upper, " UNION ")
 }
 
-// hasTimeFilterMacro reports whether the (original) SQL uses one of the time
-// macros. Checked against the original SQL (not stripped) since the macro
-// tokens themselves cannot live inside string literals in any well-formed
-// dashboard query — they are dashboard-emitted, not user-typed.
-func hasTimeFilterMacro(sql string) bool {
-	return strings.Contains(sql, "$__timeFilter") ||
-		strings.Contains(sql, "$__timeFrom") ||
-		strings.Contains(sql, "$__timeGroup")
+// hasTimeFilterMacro reports whether the SQL uses one of the time macros in
+// a position where the macro engine would expand it (i.e. outside string
+// literals and comments). A commented-out macro shouldn't keep splitting
+// enabled — the macro won't expand, so each chunk would re-run the full
+// query without a time filter.
+func hasTimeFilterMacro(s strippedSQL) bool {
+	return strings.Contains(s.stripped, "$__timeFilter") ||
+		strings.Contains(s.stripped, "$__timeFrom") ||
+		strings.Contains(s.stripped, "$__timeGroup")
 }
 
 // aggregationFnRe matches any SQL aggregation function call. Anchored at a
@@ -143,8 +147,11 @@ var windowFnRe = regexp.MustCompile(`(?i)\bOVER\s*\(`)
 // query will still trigger this and disable splitting unnecessarily. The
 // inverse error (allowing a split that produces wrong results) is much worse
 // than the over-conservative one we have, so we accept it.
-func containsAggregationWithoutTimeGroup(sql string, s strippedSQL) bool {
-	if strings.Contains(sql, "$__timeGroup") {
+func containsAggregationWithoutTimeGroup(s strippedSQL) bool {
+	// Use stripped view so a commented-out $__timeGroup doesn't disable the
+	// aggregation guard (the macro wouldn't expand, so the chunked-aggregation
+	// hazard would still be present).
+	if strings.Contains(s.stripped, "$__timeGroup") {
 		return false
 	}
 	if strings.Contains(s.upper, "GROUP BY") {

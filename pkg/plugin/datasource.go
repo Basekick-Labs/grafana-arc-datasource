@@ -347,8 +347,8 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	stripped := newStrippedSQL(qm.SQL)
 
 	switch {
-	case splitting && !hasTimeFilterMacro(qm.SQL):
-		// No time macros → nothing to split along.
+	case splitting && !hasTimeFilterMacro(stripped):
+		// No time macros (or all commented out) → nothing to split along.
 		log.DefaultLogger.Debug("Skipping split for query without time filter", "refId", qm.RefID)
 		splitting = false
 	case splitting && containsLIMIT(stripped):
@@ -359,7 +359,7 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		// Macro expansion in multi-statement queries produces mangled SQL.
 		log.DefaultLogger.Debug("Skipping split for UNION query", "refId", qm.RefID)
 		splitting = false
-	case splitting && containsAggregationWithoutTimeGroup(qm.SQL, stripped):
+	case splitting && containsAggregationWithoutTimeGroup(stripped):
 		// Aggregations without time bucketing span the full range; each chunk
 		// aggregating independently produces wrong results (COUNT duplicated,
 		// DISTINCT inflated, bare COUNT(*) returning N rows instead of 1).

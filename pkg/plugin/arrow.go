@@ -229,7 +229,7 @@ func createEmptyField(f arrow.Field) *data.Field {
 // row count so the per-row writes don't trigger repeated reflective slice
 // reallocations (M21/P2 fix).
 func appendRecordToDataFrame(frame *data.Frame, record arrow.Record) error {
-	if record.NumRows() == 0 {
+	if record.NumRows() == 0 || len(frame.Fields) == 0 {
 		return nil
 	}
 	rows := int(record.NumRows())

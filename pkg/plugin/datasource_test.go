@@ -486,7 +486,7 @@ func TestContainsAggregationWithoutTimeGroup(t *testing.T) {
 		{"SELECT time, value, RANK() OVER(PARTITION BY host ORDER BY value) FROM t WHERE $__timeFilter(time)", true, "window RANK no space"},
 	}
 	for _, c := range cases {
-		result := containsAggregationWithoutTimeGroup(c.sql, newStrippedSQL(c.sql))
+		result := containsAggregationWithoutTimeGroup(newStrippedSQL(c.sql))
 		if result != c.expected {
 			t.Errorf("%s: containsAggregationWithoutTimeGroup(%q): expected %v, got %v", c.desc, c.sql, c.expected, result)
 		}
@@ -707,6 +707,44 @@ func TestApplyMacros_NotExpandedInsideStringLiteral(t *testing.T) {
 	}
 	if !strings.Contains(result, "time >= '2026-02-18T10:00:00Z'") {
 		t.Errorf("expected outer macro to expand: %s", result)
+	}
+}
+
+// TestStripStringLiteralsAndComments_BlockCommentSpacing locks in the gemini
+// review fixup: block comments must be replaced with a single space so adjacent
+// tokens stay separated. Before the fix `SELECT/*x*/col` became `SELECTcol`,
+// which would break the SELECT keyword check.
+func TestStripStringLiteralsAndComments_BlockCommentSpacing(t *testing.T) {
+	got := stripStringLiteralsAndComments("SELECT/*hidden*/col FROM t")
+	if !strings.Contains(got, "SELECT ") || !strings.Contains(got, " col") {
+		t.Errorf("block comment removal must leave a space; got %q", got)
+	}
+	// And it should NOT produce "SELECTcol"
+	if strings.Contains(got, "SELECTcol") {
+		t.Errorf("block comment removal merged adjacent tokens: %q", got)
+	}
+}
+
+// TestCommentedOutTimeFilter_DisablesSplitting locks in the gemini review
+// fixup: a `$__timeFilter` macro inside a comment should NOT count as "has
+// time filter" for the splitting heuristic — the macro engine won't expand
+// it, so each chunk would re-run the full query.
+func TestCommentedOutTimeFilter_DisablesSplitting(t *testing.T) {
+	sql := "SELECT * FROM t -- WHERE $__timeFilter(time)"
+	stripped := newStrippedSQL(sql)
+	if hasTimeFilterMacro(stripped) {
+		t.Errorf("a commented-out $__timeFilter should not count as present: %q", sql)
+	}
+}
+
+// TestCommentedOutTimeGroup_DoesNotDisableAggregationGuard locks in the
+// companion gemini fixup: a commented-out `$__timeGroup` should NOT make the
+// aggregation guard think the query is safe to split.
+func TestCommentedOutTimeGroup_DoesNotDisableAggregationGuard(t *testing.T) {
+	sql := "SELECT host, COUNT(*) FROM t -- $__timeGroup(time, '1h')\nGROUP BY host"
+	stripped := newStrippedSQL(sql)
+	if !containsAggregationWithoutTimeGroup(stripped) {
+		t.Errorf("commented-out $__timeGroup must not disable the aggregation guard: %q", sql)
 	}
 }
 

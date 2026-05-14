@@ -189,6 +189,30 @@ func TestAppendRecordToDataFrame_EmptyRecord(t *testing.T) {
 	}
 }
 
+// TestAppendRecordToDataFrame_ZeroFields locks in the zero-column-schema
+// guard — frame.Fields[0] used to be accessed unconditionally and would have
+// panicked on an Arrow record with no columns (gemini review fixup).
+func TestAppendRecordToDataFrame_ZeroFields(t *testing.T) {
+	// Build a frame with zero fields directly (no schema needed).
+	frame := data.NewFrame("")
+	// Build a record with one column so the for-loop has something — but the
+	// frame has no fields so we should bail early without panicking on
+	// frame.Fields[0].
+	pool := memory.NewGoAllocator()
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "v", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+	}, nil)
+	b := array.NewRecordBuilder(pool, schema)
+	defer b.Release()
+	b.Field(0).(*array.Int64Builder).AppendValues([]int64{1}, nil)
+	rec := b.NewRecord()
+	defer rec.Release()
+	// Must not panic.
+	if err := appendRecordToDataFrame(frame, rec); err != nil {
+		t.Fatalf("expected nil error on zero-field frame, got %v", err)
+	}
+}
+
 // TestAppendRecordToDataFrame_String verifies the string column path (no
 // bulk accessor in Arrow — per-row Value(i)).
 func TestAppendRecordToDataFrame_String(t *testing.T) {
