@@ -952,12 +952,23 @@ func jsonMarshal(v any) ([]byte, error) {
 // the substring " LIMIT " required ASCII space both sides, so splitting was
 // NOT skipped on newline-separated LIMIT clauses → 7 chunks × 100 rows =
 // 700 rows for a LIMIT-100 query.
+//
+// Also covers gemini round-4 finding 3244824396: LIMIT followed by a
+// template variable, parameter placeholder, or subquery must match too —
+// the previous `\d`-only argument missed `LIMIT $limit`, the form Grafana
+// dashboards actually use.
 func TestContainsLIMIT_WhitespaceFlavors(t *testing.T) {
 	for _, sql := range []string{
+		// Whitespace variations
 		"SELECT * FROM t LIMIT 10",
 		"SELECT * FROM t\nLIMIT 10",
 		"SELECT * FROM t\tLIMIT 10",
 		"SELECT * FROM t WHERE x=1\n  LIMIT 10",
+		// Argument variations (gemini 3244824396)
+		"SELECT * FROM t LIMIT $limit",         // Grafana template variable
+		"SELECT * FROM t LIMIT ?",              // DuckDB positional param
+		"SELECT * FROM t LIMIT :n",             // DuckDB named param
+		"SELECT * FROM t LIMIT (SELECT max(n) FROM cap)",
 	} {
 		if !containsLIMIT(newStrippedSQL(sql)) {
 			t.Errorf("expected LIMIT match for: %q", sql)
@@ -967,9 +978,39 @@ func TestContainsLIMIT_WhitespaceFlavors(t *testing.T) {
 		"SELECT * FROM t",
 		"SELECT limited FROM t",
 		"SELECT * FROM t WHERE name = 'NO LIMIT'",
+		"SELECT * FROM t -- LIMIT 10",          // commented out
 	} {
 		if containsLIMIT(newStrippedSQL(sql)) {
 			t.Errorf("unexpected LIMIT match for: %q", sql)
+		}
+	}
+}
+
+// TestContainsAggregationWithoutTimeGroup_GroupByWhitespace locks in gemini
+// round-4 finding 3244824400: the GROUP BY detector must match every
+// whitespace flavor (`GROUP\tBY`, `GROUP\nBY`, `GROUP  BY`) — the previous
+// `strings.Contains(s.upper, "GROUP BY")` form missed every form except a
+// single ASCII space. Same shape as the LIMIT bug.
+func TestContainsAggregationWithoutTimeGroup_GroupByWhitespace(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT host, COUNT(*) FROM t GROUP BY host",
+		"SELECT host, COUNT(*) FROM t GROUP\nBY host",
+		"SELECT host, COUNT(*) FROM t GROUP\tBY host",
+		"SELECT host, COUNT(*) FROM t GROUP  BY host",
+		"SELECT host, COUNT(*) FROM t GROUP   \n  BY host",
+	} {
+		if !containsAggregationWithoutTimeGroup(newStrippedSQL(sql)) {
+			t.Errorf("expected GROUP BY match for: %q", sql)
+		}
+	}
+	// Not a GROUP BY at all — must not match
+	for _, sql := range []string{
+		"SELECT * FROM t WHERE name = 'GROUP BY'",
+		"SELECT 'GROUP\nBY' AS lit FROM t",
+		"SELECT my_group, BYrider FROM t", // identifiers containing GROUP / BY
+	} {
+		if containsAggregationWithoutTimeGroup(newStrippedSQL(sql)) {
+			t.Errorf("unexpected GROUP BY match for: %q", sql)
 		}
 	}
 }

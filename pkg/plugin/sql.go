@@ -82,13 +82,19 @@ func stripStringLiteralsAndComments(sql string) string {
 	return out.String()
 }
 
-// limitRe matches a LIMIT clause anywhere in the (stripped) SQL —
-// whitespace-bounded on both sides so `WHERE\nLIMIT 100`, `WHERE\tLIMIT 100`,
-// and end-of-string `LIMIT 100` all match. Previously the substring check
-// required a literal " LIMIT " with single ASCII spaces, missing newline-
-// and tab-separated forms (R2-CR3 — splitting was NOT skipped, returning
-// N×LIMIT rows for a LIMIT-N query).
-var limitRe = regexp.MustCompile(`(?i)\bLIMIT\s+\d`)
+// limitRe matches a LIMIT clause anywhere in the (stripped) SQL.
+// Whitespace-bounded on both sides so `WHERE\nLIMIT 100`, `WHERE\tLIMIT 100`,
+// and end-of-string `LIMIT 100` all match (R2-CR3).
+//
+// The argument shape must cover every form Grafana dashboards actually use:
+//   - decimal literal: `LIMIT 100`
+//   - Grafana template variable: `LIMIT $limit`
+//   - DuckDB positional / named parameter: `LIMIT ?` or `LIMIT :n`
+//   - subquery / expression: `LIMIT (SELECT max(n) FROM t)`
+// Restricting to `\d` (the previous form) missed all but the first, so
+// splitting was enabled for `LIMIT $limit` queries and returned N×$limit
+// rows for a $limit-bound query (gemini round 4 finding 3244824396).
+var limitRe = regexp.MustCompile(`(?i)\bLIMIT\s+[\d$?:(]`)
 
 // unionRe matches the UNION keyword bounded by whitespace on both sides.
 // Same whitespace-fragility fix as limitRe.
@@ -141,6 +147,12 @@ var aggregationFnRe = regexp.MustCompile(`(?i)\b(SUM|FSUM|COUNT|COUNTIF|AVG|FAVG
 // end-of-SQL), not as a substring inside an identifier.
 var distinctRe = regexp.MustCompile(`(?i)\bDISTINCT\b`)
 
+// groupByRe matches `GROUP BY` with any whitespace between the two keywords —
+// `GROUP\tBY`, `GROUP\nBY`, `GROUP  BY` all match. The previous substring
+// check `"GROUP BY"` missed every form except a single ASCII space (gemini
+// round 4 finding 3244824400 — same shape as the LIMIT whitespace bug).
+var groupByRe = regexp.MustCompile(`(?i)\bGROUP\s+BY\b`)
+
 // windowFnRe matches the SQL window function `OVER (...)` clause with any
 // whitespace between `OVER` and the paren.
 var windowFnRe = regexp.MustCompile(`(?i)\bOVER\s*\(`)
@@ -166,7 +178,7 @@ func containsAggregationWithoutTimeGroup(s strippedSQL) bool {
 	if strings.Contains(s.stripped, "$__timeGroup") {
 		return false
 	}
-	if strings.Contains(s.upper, "GROUP BY") {
+	if groupByRe.MatchString(s.stripped) {
 		return true
 	}
 	if distinctRe.MatchString(s.stripped) {
