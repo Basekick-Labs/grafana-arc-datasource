@@ -71,15 +71,20 @@ func validateURL(raw string) error {
 	return nil
 }
 
-// safeDialContext wraps a net.Dialer so it refuses to connect to private,
-// loopback, link-local, or unspecified addresses. This is the SSRF guard for
-// the user-supplied Arc URL.
+// safeDialContext wraps a net.Dialer so it refuses to connect to disallowed
+// addresses. This is the SSRF guard for the user-supplied Arc URL.
+//
+// allowPrivate controls whether RFC1918/loopback/CGNAT addresses are permitted
+// (intended for corporate-intranet Arc deployments — see
+// allowPrivateForSettings). Link-local (including the cloud-metadata
+// 169.254.169.254), multicast, and unspecified addresses are blocked
+// regardless — they are never a legitimate Arc target.
 //
 // Resolution-then-validate avoids a TOCTOU between DNS rebind and connect: we
 // resolve the host ourselves, drop any disallowed address, then dial the
 // remaining ones explicitly by IP. If every resolved address is blocked the
 // dial returns errBlockedAddr.
-func safeDialContext(allowLoopback bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
+func safeDialContext(allowPrivate bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -95,7 +100,7 @@ func safeDialContext(allowLoopback bool) func(ctx context.Context, network, addr
 		}
 		var lastErr error
 		for _, ip := range ips {
-			if !allowLoopback && isBlockedIP(ip.IP) {
+			if isBlockedIP(ip.IP, allowPrivate) {
 				lastErr = fmt.Errorf("%w: %s resolves to blocked address %s", errBlockedAddr, host, ip.IP)
 				continue
 			}
@@ -113,20 +118,33 @@ func safeDialContext(allowLoopback bool) func(ctx context.Context, network, addr
 }
 
 // isBlockedIP returns true for IP ranges the plugin should refuse to contact
-// from a user-supplied URL: loopback, private RFC1918, link-local (including
-// the cloud-metadata 169.254.169.254), CGNAT, unspecified, multicast.
-func isBlockedIP(ip net.IP) bool {
+// from a user-supplied URL.
+//
+// Always-blocked (never a legitimate Arc target):
+//   - unspecified (0.0.0.0/::)
+//   - link-local (incl. 169.254.169.254 cloud metadata)
+//   - multicast
+//
+// Conditionally-blocked when allowPrivate=false:
+//   - loopback (127.0.0.0/8, ::1)
+//   - private RFC1918 (10/8, 172.16/12, 192.168/16) + IPv6 ULA (fc00::/7)
+//   - CGNAT (100.64.0.0/10)
+func isBlockedIP(ip net.IP, allowPrivate bool) bool {
 	if ip == nil {
 		return true
 	}
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+	// Unconditional blocks — these are never a real Arc deployment.
+	if ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
 		return true
 	}
-	if ip.IsPrivate() {
+	if allowPrivate {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() {
 		return true
 	}
-	// 100.64.0.0/10 — Carrier-grade NAT, not covered by IsPrivate
+	// 100.64.0.0/10 — Carrier-grade NAT, not covered by IsPrivate.
 	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
 		return true
 	}
@@ -153,17 +171,31 @@ func isLoopbackURL(raw string) bool {
 	return false
 }
 
+// allowPrivateForSettings returns the dialer's private-IP policy for these
+// settings. Private (RFC1918) addresses are permitted when either:
+//   - the user explicitly opted in via AllowPrivateIPs (corporate intranet
+//     deployments where Arc is on 10.x/192.168.x), or
+//   - the configured Arc URL is itself loopback (dev workflow against
+//     http://localhost:8000), since blocking loopback there would be useless
+//     and confusing.
+//
+// Metadata addresses (169.254.169.254) and other link-local ranges are still
+// blocked unconditionally — they are never a legitimate Arc target.
+func allowPrivateForSettings(s *ArcInstanceSettings) bool {
+	return s.settings.AllowPrivateIPs || isLoopbackURL(s.settings.URL)
+}
+
 // newHTTPClient builds a per-request http.Client that:
 //   - refuses to connect to private/loopback/metadata addresses,
 //   - validates redirects against the same blocklist,
 //   - applies a request-level timeout.
 //
-// allowLoopback should be true only when the configured Arc URL itself is a
-// loopback address — see isLoopbackURL. This keeps `localhost` dev setups
-// working without opening the SSRF guard on production datasource URLs.
-func newHTTPClient(timeout time.Duration, allowLoopback bool) *http.Client {
+// allowPrivate should be derived from datasource settings via
+// allowPrivateForSettings. Link-local (incl. cloud-metadata) and unspecified
+// addresses are blocked regardless.
+func newHTTPClient(timeout time.Duration, allowPrivate bool) *http.Client {
 	transport := &http.Transport{
-		DialContext:           safeDialContext(allowLoopback),
+		DialContext:           safeDialContext(allowPrivate),
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,

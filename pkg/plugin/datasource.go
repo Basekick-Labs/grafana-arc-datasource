@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -17,11 +18,12 @@ import (
 
 // ArcDataSourceSettings contains Arc connection settings
 type ArcDataSourceSettings struct {
-	URL            string `json:"url"`
-	Database       string `json:"database"`
-	Timeout        int    `json:"timeout"`        // seconds
-	UseArrow       *bool  `json:"useArrow"`       // pointer so unset (fresh install) is distinguishable from explicit false
-	MaxConcurrency int    `json:"maxConcurrency"` // max parallel chunks for query splitting (default 4)
+	URL             string `json:"url"`
+	Database        string `json:"database"`
+	Timeout         int    `json:"timeout"`         // seconds
+	UseArrow        *bool  `json:"useArrow"`        // pointer so unset (fresh install) is distinguishable from explicit false
+	MaxConcurrency  int    `json:"maxConcurrency"`  // max parallel chunks for query splitting (default 4)
+	AllowPrivateIPs bool   `json:"allowPrivateIPs"` // opt-in: permit Arc URL to resolve to RFC1918/private addresses (corporate intranets)
 }
 
 // ArcQuery represents a query to Arc
@@ -120,6 +122,7 @@ func (d *ArcDatasource) queryWithRecover(ctx context.Context, settings *ArcInsta
 			log.DefaultLogger.Error("panic in query handler",
 				"refId", q.RefID,
 				"panic", fmt.Sprintf("%v", r),
+				"stack", string(debug.Stack()),
 			)
 			resp = backend.ErrDataResponse(backend.StatusInternal, "Query failed (internal error; see server logs).")
 		}

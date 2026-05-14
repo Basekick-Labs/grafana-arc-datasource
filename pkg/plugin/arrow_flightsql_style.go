@@ -49,7 +49,7 @@ func QueryArrowFlightSQLStyle(ctx context.Context, settings *ArcInstanceSettings
 
 	client := newHTTPClient(
 		time.Duration(settings.settings.Timeout)*time.Second,
-		isLoopbackURL(settings.settings.URL),
+		allowPrivateForSettings(settings),
 	)
 
 	start := time.Now()

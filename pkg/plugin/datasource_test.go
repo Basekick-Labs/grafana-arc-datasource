@@ -628,6 +628,77 @@ func TestApplyMacros_Interval(t *testing.T) {
 	}
 }
 
+// TestApplyMacros_TimeFilter_MultipleOccurrences locks in the searchFrom
+// advancement after a successful expansion: a second macro in the same SQL
+// must also expand, exactly once, with the same time bounds.
+func TestApplyMacros_TimeFilter_MultipleOccurrences(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	sql := "SELECT * FROM a WHERE $__timeFilter(t1) UNION SELECT * FROM b WHERE $__timeFilter(t2)"
+	result := ApplyMacros(sql, tr)
+
+	if strings.Contains(result, "$__timeFilter") {
+		t.Fatalf("expected both macros expanded, got: %s", result)
+	}
+	if !strings.Contains(result, "t1 >= '2026-02-18T10:00:00Z'") {
+		t.Errorf("expected t1 filter: %s", result)
+	}
+	if !strings.Contains(result, "t2 >= '2026-02-18T10:00:00Z'") {
+		t.Errorf("expected t2 filter: %s", result)
+	}
+	// Count expansions: each $__timeFilter produces exactly two `>= '...'` /
+	// `< '...'` pairs. Two macros → 2 `>=` and 2 `<` occurrences.
+	if got := strings.Count(result, ">= '"); got != 2 {
+		t.Errorf("expected 2 `>=` occurrences (one per macro), got %d: %s", got, result)
+	}
+}
+
+// TestApplyMacros_TimeFilter_RejectsUnsafeColumn locks in the searchFrom
+// advancement on the rejection branch: an invalid macro must be left
+// un-expanded AND must not prevent a following valid macro from expanding.
+func TestApplyMacros_TimeFilter_RejectsUnsafeColumn(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	// First macro has an injection payload — must be rejected and left as-is.
+	// Second macro is valid — must still expand.
+	sql := "WHERE $__timeFilter(t1 OR 1=1) AND x = 5 AND $__timeFilter(t2)"
+	result := ApplyMacros(sql, tr)
+
+	// First (unsafe) macro should be left un-expanded so Arc surfaces an error.
+	if !strings.Contains(result, "$__timeFilter(t1 OR 1=1)") {
+		t.Errorf("unsafe macro should be left un-expanded: %s", result)
+	}
+	// Second (safe) macro must still expand — proves the rejection branch
+	// advances searchFrom correctly rather than spinning or skipping ahead.
+	if !strings.Contains(result, "t2 >= '2026-02-18T10:00:00Z'") {
+		t.Errorf("valid macro after rejection must still expand: %s", result)
+	}
+}
+
+// TestApplyMacros_TimeFilter_NoInfiniteLoopOnUnclosedParen ensures a malformed
+// macro with no closing paren returns the SQL unchanged rather than spinning.
+func TestApplyMacros_TimeFilter_NoInfiniteLoopOnUnclosedParen(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	sql := "SELECT * FROM t WHERE $__timeFilter(time"
+	done := make(chan string, 1)
+	go func() { done <- ApplyMacros(sql, tr) }()
+	select {
+	case result := <-done:
+		if result != sql {
+			t.Errorf("expected unchanged SQL on malformed macro, got: %s", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expandTimeFilter did not return — possible infinite loop")
+	}
+}
+
 func TestApplyMacrosWithSplit_UsesChunkForFilter_OriginalForInterval(t *testing.T) {
 	chunk := backend.TimeRange{
 		From: time.Date(2026, 2, 18, 6, 0, 0, 0, time.UTC),

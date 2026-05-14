@@ -85,12 +85,14 @@ func TestValidateURL(t *testing.T) {
 	}
 }
 
-func TestIsBlockedIP(t *testing.T) {
+// TestIsBlockedIP_Strict locks in the default policy (allowPrivate=false):
+// loopback, RFC1918, link-local, CGNAT, multicast, unspecified are all blocked.
+func TestIsBlockedIP_Strict(t *testing.T) {
 	for _, tc := range []struct {
 		ip      string
 		blocked bool
 	}{
-		// Should be blocked
+		// Should be blocked when allowPrivate=false
 		{"127.0.0.1", true},      // loopback
 		{"::1", true},            // loopback v6
 		{"10.0.0.1", true},       // RFC1918
@@ -116,29 +118,82 @@ func TestIsBlockedIP(t *testing.T) {
 			if ip == nil {
 				t.Fatalf("invalid test IP %q", tc.ip)
 			}
-			got := isBlockedIP(ip)
+			got := isBlockedIP(ip, false)
 			if got != tc.blocked {
-				t.Errorf("isBlockedIP(%s) = %v, want %v", tc.ip, got, tc.blocked)
+				t.Errorf("isBlockedIP(%s, false) = %v, want %v", tc.ip, got, tc.blocked)
 			}
 		})
 	}
 }
 
-func TestSafeDialContext_BlocksPrivate(t *testing.T) {
-	dial := safeDialContext(false)
+// TestIsBlockedIP_Permissive locks in the corporate-intranet policy
+// (allowPrivate=true): RFC1918/loopback/CGNAT are allowed, but link-local
+// (incl. cloud-metadata 169.254.169.254) and multicast are STILL blocked.
+// These last two are the must-never-allow signing-readiness invariants.
+func TestIsBlockedIP_Permissive(t *testing.T) {
+	for _, tc := range []struct {
+		ip      string
+		blocked bool
+	}{
+		// Allowed under permissive mode (corporate intranet)
+		{"127.0.0.1", false},
+		{"10.0.0.1", false},
+		{"172.16.0.1", false},
+		{"192.168.1.1", false},
+		{"100.64.0.1", false},
+		{"fc00::1", false},
+
+		// STILL blocked even when allowPrivate=true — these are not legitimate
+		// Arc targets regardless of network topology.
+		{"169.254.169.254", true}, // cloud metadata — never legitimate
+		{"fe80::1", true},         // link-local v6
+		{"224.0.0.1", true},       // multicast
+		{"0.0.0.0", true},         // unspecified
+
+		// Public addresses obviously still allowed
+		{"8.8.8.8", false},
+	} {
+		t.Run(tc.ip, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			if ip == nil {
+				t.Fatalf("invalid test IP %q", tc.ip)
+			}
+			got := isBlockedIP(ip, true)
+			if got != tc.blocked {
+				t.Errorf("isBlockedIP(%s, true) = %v, want %v", tc.ip, got, tc.blocked)
+			}
+		})
+	}
+}
+
+func TestSafeDialContext_BlocksMetadataEvenWhenPermissive(t *testing.T) {
+	// 169.254.169.254 is link-local — never a legitimate Arc target. Must be
+	// blocked even with allowPrivate=true.
+	dial := safeDialContext(true)
 	_, err := dial(t.Context(), "tcp", "169.254.169.254:80")
 	if err == nil {
-		t.Fatal("expected dial to 169.254.169.254 to be blocked")
+		t.Fatal("expected dial to cloud metadata to be blocked even in permissive mode")
 	}
 	if !errors.Is(err, errBlockedAddr) {
 		t.Fatalf("expected errBlockedAddr, got %v", err)
 	}
 }
 
-func TestSafeDialContext_AllowsLoopbackWhenPermitted(t *testing.T) {
-	// We don't actually connect — just confirm that the loopback policy gate
-	// lets us through to the dialer (which then fails on connect-refused, which
-	// is fine — we're not running a server).
+func TestSafeDialContext_BlocksPrivateInStrictMode(t *testing.T) {
+	dial := safeDialContext(false)
+	// Use a clearly-private address that DNS won't fail to look up.
+	_, err := dial(t.Context(), "tcp", "10.255.255.255:80")
+	if err == nil {
+		t.Fatal("expected dial to 10.x to be blocked in strict mode")
+	}
+	if !errors.Is(err, errBlockedAddr) {
+		t.Fatalf("expected errBlockedAddr, got %v", err)
+	}
+}
+
+func TestSafeDialContext_AllowsPrivateWhenPermitted(t *testing.T) {
+	// We don't actually connect — just confirm the policy gate lets us through
+	// to the system dialer (which then fails on connect-refused, which is fine).
 	dial := safeDialContext(true)
 	_, err := dial(t.Context(), "tcp", "127.0.0.1:1") // port 1 is reserved; connect-refused expected
 	if err != nil && errors.Is(err, errBlockedAddr) {

@@ -9,6 +9,13 @@ export interface ArcDataSourceOptions extends DataSourceJsonData {
   timeout?: number;
   useArrow?: boolean;
   maxConcurrency?: number;
+  /**
+   * Permit the configured Arc URL to resolve to a private/RFC1918 address.
+   * Off by default — the SSRF guard blocks private ranges to protect Grafana
+   * installs where datasource creators are not fully trusted. Enable when
+   * Arc is deployed on an internal corporate network.
+   */
+  allowPrivateIPs?: boolean;
 }
 
 /**

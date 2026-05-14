@@ -49,7 +49,7 @@ func QueryArrow(ctx context.Context, settings *ArcInstanceSettings, sql string, 
 
 	client := newHTTPClient(
 		time.Duration(settings.settings.Timeout)*time.Second,
-		isLoopbackURL(settings.settings.URL),
+		allowPrivateForSettings(settings),
 	)
 
 	start := time.Now()
