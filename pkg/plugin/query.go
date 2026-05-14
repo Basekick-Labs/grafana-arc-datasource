@@ -55,8 +55,9 @@ func formatRequestError(err error) error {
 	return fmt.Errorf("%s: %w", friendly, err)
 }
 
-// QueryJSON executes a query using Arc's JSON endpoint (fallback)
-func QueryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string, timeRange backend.TimeRange) (*data.Frame, error) {
+// queryJSON executes a query using Arc's JSON endpoint (fallback path used
+// when the user has disabled Arrow). Returns a decoded Grafana DataFrame.
+func queryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string) (*data.Frame, error) {
 	// Build request
 	url := fmt.Sprintf("%s/api/v1/query", settings.settings.URL)
 

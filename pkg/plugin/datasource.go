@@ -235,9 +235,9 @@ func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceS
 	sql := ApplyMacrosWithSplit(rawSQL, chunk, originalRange)
 
 	if *settings.settings.UseArrow {
-		return QueryArrowFlightSQLStyle(ctx, settings, sql, chunk)
+		return queryArrow(ctx, settings, sql)
 	}
-	return QueryJSON(ctx, settings, sql, chunk)
+	return queryJSON(ctx, settings, sql)
 }
 
 // mergeFrames appends rows from all chunk frames into a single frame.
@@ -506,9 +506,9 @@ func (d *ArcDatasource) querySingle(ctx context.Context, settings *ArcInstanceSe
 	var err error
 
 	if *settings.settings.UseArrow {
-		frame, err = QueryArrowFlightSQLStyle(ctx, settings, sql, query.TimeRange)
+		frame, err = queryArrow(ctx, settings, sql)
 	} else {
-		frame, err = QueryJSON(ctx, settings, sql, query.TimeRange)
+		frame, err = queryJSON(ctx, settings, sql)
 	}
 
 	if err != nil {
@@ -552,12 +552,9 @@ func (d *ArcDatasource) CheckHealth(ctx context.Context, req *backend.CheckHealt
 		}, nil
 	}
 
-	// Test connection with simple query
-	testSQL := "SHOW DATABASES"
-	_, err = QueryArrow(ctx, settings, testSQL, backend.TimeRange{
-		From: time.Now().Add(-1 * time.Hour),
-		To:   time.Now(),
-	})
+	// Test connection with a simple query against the production decode path,
+	// so a CheckHealth pass actually proves the path real queries use.
+	_, err = queryArrow(ctx, settings, "SHOW DATABASES")
 
 	if err != nil {
 		status = backend.HealthStatusError
