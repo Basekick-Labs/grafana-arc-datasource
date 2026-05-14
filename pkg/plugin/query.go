@@ -7,50 +7,89 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 )
 
-// parseArcError extracts a human-readable error from Arc's JSON error response.
-// Arc returns errors as: {"error": "message"} or plain text.
+// parseArcError extracts a human-readable error from Arc's JSON error
+// response. Arc returns errors as `{"error": "message"}` or plain text. Body
+// is truncated to maxErrorBodyBytes, backing off to the previous rune boundary
+// so the result is always valid UTF-8 even if the body byte-cap fell inside a
+// multi-byte sequence (L8 fix).
 func parseArcError(statusCode int, body []byte) string {
 	var parsed struct {
 		Error string `json:"error"`
 	}
 	if json.Unmarshal(body, &parsed) == nil && parsed.Error != "" {
-		return fmt.Sprintf("Arc error (HTTP %d): %s", statusCode, parsed.Error)
+		return fmt.Sprintf("Arc error (HTTP %d): %s", statusCode, truncateForLog(parsed.Error))
 	}
 	text := strings.TrimSpace(string(body))
-	if len(text) > 500 {
-		text = text[:500] + "..."
-	}
+	text = truncateForLog(text)
 	if text == "" {
 		return fmt.Sprintf("Arc returned HTTP %d with no error message", statusCode)
 	}
 	return fmt.Sprintf("Arc error (HTTP %d): %s", statusCode, text)
 }
 
-// formatRequestError converts Go HTTP client errors into user-friendly messages
-// while preserving the original error chain for programmatic inspection via errors.Is/As.
+const maxErrorBodyBytes = 500
+
+// truncateForLog caps s at maxErrorBodyBytes, backing off to the last
+// complete UTF-8 rune boundary so the returned string is always valid UTF-8.
+func truncateForLog(s string) string {
+	if len(s) <= maxErrorBodyBytes {
+		return s
+	}
+	cut := s[:maxErrorBodyBytes]
+	// Drop any trailing partial rune.
+	for len(cut) > 0 {
+		r, size := utf8.DecodeLastRuneInString(cut)
+		if r != utf8.RuneError || size > 1 {
+			break
+		}
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "..."
+}
+
+// formatRequestError converts Go HTTP client errors into user-friendly
+// messages while preserving the original error chain for programmatic
+// inspection via errors.Is / errors.As. Uses typed error matching where
+// possible (context.DeadlineExceeded, net.OpError, dnsError, net.ErrClosed)
+// instead of substring-matching err.Error() strings, which can change
+// across Go releases (L7).
 func formatRequestError(err error) error {
-	msg := err.Error()
-	var friendly string
+	friendly := "Request to Arc failed"
 	switch {
-	case strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "Client.Timeout"):
-		friendly = "Query timed out — try reducing the time range, increasing the timeout in datasource settings, or enabling query splitting"
-	case strings.Contains(msg, "connection refused"):
-		friendly = "Cannot connect to Arc — connection refused. Check that Arc is running and the URL is correct"
-	case strings.Contains(msg, "no such host"):
-		friendly = "Cannot connect to Arc — hostname not found. Check the URL in datasource settings"
-	case strings.Contains(msg, "EOF"):
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		friendly = "Query timed out or was cancelled — try reducing the time range, increasing the timeout in datasource settings, or enabling query splitting"
+	case errors.Is(err, errBlockedAddr):
+		friendly = "Arc URL resolves to a blocked address (private/loopback). Update the datasource URL or enable Allow Private IPs."
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		friendly = "Arc closed the connection unexpectedly — the query may be too large. Try enabling query splitting or reducing the time range"
 	default:
-		friendly = "Request to Arc failed"
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) {
+			friendly = "Cannot connect to Arc — hostname not found. Check the URL in datasource settings"
+			break
+		}
+		var opErr *net.OpError
+		if errors.As(err, &opErr) {
+			// connection refused / network unreachable / TCP reset all surface as OpError.
+			friendly = "Cannot connect to Arc — " + opErr.Op + " failed. Check that Arc is running and the URL is correct"
+			break
+		}
+		// Last-resort substring check for `http.Client.Timeout`-style errors that
+		// don't satisfy errors.Is(context.DeadlineExceeded) (older SDK versions).
+		if strings.Contains(err.Error(), "Client.Timeout") {
+			friendly = "Query timed out — try reducing the time range, increasing the timeout in datasource settings, or enabling query splitting"
+		}
 	}
 	return fmt.Errorf("%s: %w", friendly, err)
 }
@@ -85,13 +124,8 @@ func queryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string) (
 		req.Header.Set("X-Arc-Database", settings.settings.Database)
 	}
 
-	client := newHTTPClient(
-		time.Duration(settings.settings.Timeout)*time.Second,
-		allowPrivateForSettings(settings),
-	)
-
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := settings.client.Do(req)
 	if err != nil {
 		return nil, formatRequestError(err)
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -12,8 +13,11 @@ import (
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
+	"github.com/grafana/grafana-plugin-sdk-go/backend/datasource"
+	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
+	"golang.org/x/sync/errgroup"
 )
 
 // ArcDataSourceSettings contains Arc connection settings
@@ -37,26 +41,51 @@ type ArcQuery struct {
 	SplitDuration string `json:"splitDuration"`  // "auto" (default), "off", or explicit: "1h", "6h", "12h", "1d", "3d", "7d"
 }
 
-// ArcInstanceSettings holds per-instance settings
+// ArcInstanceSettings is the cached, parsed view of a datasource instance.
+// One is constructed per (settings, secrets) revision by newArcInstance and
+// reused across every QueryData / CheckHealth call until the datasource is
+// edited. The embedded *http.Client is shared so connection pooling and TLS
+// session resumption work — building a fresh client per query (the pre-P3
+// shape) defeated both.
 type ArcInstanceSettings struct {
 	settings ArcDataSourceSettings
 	apiKey   string
+	client   *http.Client
 }
 
-// ArcDatasource implements the Grafana datasource interface
-type ArcDatasource struct{}
+// Dispose is called by the InstanceManager when the cached instance is being
+// replaced. Closes idle HTTP connections so we don't leak sockets across
+// settings updates.
+func (s *ArcInstanceSettings) Dispose() {
+	if s.client != nil {
+		if t, ok := s.client.Transport.(*http.Transport); ok {
+			t.CloseIdleConnections()
+		}
+	}
+}
 
-// NewArcDatasource creates a new datasource
+// ArcDatasource implements the Grafana datasource interface. The im field
+// caches per-instance settings + HTTP client so QueryData does not pay the
+// JSON-unmarshal-and-build-client cost on every refresh.
+type ArcDatasource struct {
+	im instancemgmt.InstanceManager
+}
+
+// NewArcDatasource constructs the datasource with the SDK's InstanceManager
+// wired up to the newArcInstance factory.
 func NewArcDatasource() *ArcDatasource {
-	return &ArcDatasource{}
+	return &ArcDatasource{
+		im: datasource.NewInstanceManager(newArcInstance),
+	}
 }
 
-// getSettings extracts settings from plugin context
-func getSettings(ctx context.Context, pluginCtx backend.PluginContext) (*ArcInstanceSettings, error) {
+// newArcInstance is the SDK InstanceFactoryFunc — invoked once per (settings,
+// secrets) revision. Validates the configuration, applies defaults, and
+// builds the shared HTTP client. The returned value is cached by the
+// InstanceManager and reused until the datasource is edited.
+func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
 	var dsSettings ArcDataSourceSettings
-
-	// Parse settings
-	if err := json.Unmarshal(pluginCtx.DataSourceInstanceSettings.JSONData, &dsSettings); err != nil {
+	if err := json.Unmarshal(instanceSettings.JSONData, &dsSettings); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal settings: %w", err)
 	}
 
@@ -64,7 +93,7 @@ func getSettings(ctx context.Context, pluginCtx backend.PluginContext) (*ArcInst
 		return nil, err
 	}
 
-	apiKey := strings.TrimSpace(pluginCtx.DataSourceInstanceSettings.DecryptedSecureJSONData["apiKey"])
+	apiKey := strings.TrimSpace(instanceSettings.DecryptedSecureJSONData["apiKey"])
 	if apiKey == "" {
 		return nil, errors.New("API key is required")
 	}
@@ -84,32 +113,77 @@ func getSettings(ctx context.Context, pluginCtx backend.PluginContext) (*ArcInst
 	if dsSettings.MaxConcurrency > MaxConcurrencyCap {
 		dsSettings.MaxConcurrency = MaxConcurrencyCap
 	}
-	// UseArrow is *bool so an unset field (fresh install) defaults to true here,
-	// matching the frontend Switch default; an explicit `false` from the UI is respected.
 	if dsSettings.UseArrow == nil {
 		t := true
 		dsSettings.UseArrow = &t
 	}
 
-	return &ArcInstanceSettings{
+	inst := &ArcInstanceSettings{
 		settings: dsSettings,
 		apiKey:   apiKey,
-	}, nil
+	}
+	inst.client = newHTTPClient(
+		time.Duration(dsSettings.Timeout)*time.Second,
+		dsSettings.AllowPrivateIPs || isLoopbackURL(dsSettings.URL),
+	)
+	return inst, nil
 }
 
-// QueryData handles query requests
+// getInstance returns the cached *ArcInstanceSettings for this PluginContext.
+// Settings are parsed and the HTTP client is built exactly once per revision
+// (see newArcInstance). Errors here have either failed validation in the
+// factory or come from a corrupted/replaced settings blob.
+func (d *ArcDatasource) getInstance(ctx context.Context, pluginCtx backend.PluginContext) (*ArcInstanceSettings, error) {
+	raw, err := d.im.Get(ctx, pluginCtx)
+	if err != nil {
+		return nil, err
+	}
+	inst, ok := raw.(*ArcInstanceSettings)
+	if !ok {
+		return nil, fmt.Errorf("instance manager returned unexpected type %T", raw)
+	}
+	return inst, nil
+}
+
+// QueryData handles query requests. RefIds within a single batch run
+// concurrently bounded by the datasource's MaxConcurrency (H4 / P8) — a
+// dashboard with 6 panels no longer pays the sum of their latencies. Each
+// refId is wrapped in a recover so a panic in one query fails only that
+// query, not the whole batch (C1).
 func (d *ArcDatasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
 	response := backend.NewQueryDataResponse()
 
-	settings, err := getSettings(ctx, req.PluginContext)
+	settings, err := d.getInstance(ctx, req.PluginContext)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, q := range req.Queries {
-		response.Responses[q.RefID] = d.queryWithRecover(ctx, settings, q)
+	if len(req.Queries) <= 1 {
+		// Common case: one refId — no goroutine overhead.
+		for _, q := range req.Queries {
+			response.Responses[q.RefID] = d.queryWithRecover(ctx, settings, q)
+		}
+		return response, nil
 	}
 
+	var (
+		mu = sync.Mutex{}
+		g  errgroup.Group
+	)
+	g.SetLimit(settings.settings.MaxConcurrency)
+	for _, q := range req.Queries {
+		q := q
+		g.Go(func() error {
+			res := d.queryWithRecover(ctx, settings, q)
+			mu.Lock()
+			response.Responses[q.RefID] = res
+			mu.Unlock()
+			return nil
+		})
+	}
+	// queryWithRecover never returns a non-nil error — every failure is
+	// captured into the per-refId DataResponse — so g.Wait() is just a join.
+	_ = g.Wait()
 	return response, nil
 }
 
@@ -327,7 +401,12 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		qm.SQL = qm.RawSQL
 	}
 
-	// Per-query database override
+	// Per-query database override: shallow-copy the cached instance so the
+	// override applies only to this query without mutating the shared
+	// settings struct. The copy shares the underlying *http.Client (correct
+	// — connection pooling applies across databases on the same Arc URL) and
+	// the apiKey (the same key authorizes both DBs by design). If
+	// ArcInstanceSettings ever grows a mutex, this pattern needs revisiting.
 	if qm.Database != "" {
 		if err := validateDatabaseName(qm.Database); err != nil {
 			return backend.ErrDataResponse(backend.StatusBadRequest, err.Error())
@@ -388,62 +467,44 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		"to", query.TimeRange.To,
 	)
 
-	// Execute chunks in parallel
-	type chunkResult struct {
-		index int
-		frame *data.Frame
-		err   error
-	}
-
-	results := make([]chunkResult, len(chunks))
-	var wg sync.WaitGroup
-
-	// Limit concurrency to avoid overwhelming Arc under multi-user load.
-	// With 6 panels × N concurrent users, each dashboard can spawn
-	// maxConcurrency × 6 requests. Default 4 balances throughput vs load.
-	semaphore := make(chan struct{}, settings.settings.MaxConcurrency)
+	// Fan out chunks via errgroup.WithContext so the first error cancels
+	// in-flight siblings (P9). SetLimit bounds goroutine creation rather than
+	// relying on a semaphore that blocked inside already-spawned goroutines
+	// (P8). With cancellation propagated through ctx, the per-chunk HTTP
+	// requests see context.Canceled and unwind without finishing.
+	frames := make([]*data.Frame, len(chunks))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(settings.settings.MaxConcurrency)
 
 	for i, chunk := range chunks {
-		wg.Add(1)
-		go func(idx int, ch backend.TimeRange) {
-			defer wg.Done()
+		i, chunk := i, chunk
+		g.Go(func() (err error) {
 			defer func() {
 				if r := recover(); r != nil {
-					results[idx] = chunkResult{
-						index: idx,
-						err:   fmt.Errorf("[chunk %s to %s] panic: %v", ch.From.Format("2006-01-02 15:04"), ch.To.Format("2006-01-02 15:04"), r),
-					}
+					err = fmt.Errorf("[chunk %s to %s] panic: %v",
+						chunk.From.Format("2006-01-02 15:04"),
+						chunk.To.Format("2006-01-02 15:04"), r)
 				}
 			}()
-			select {
-			case semaphore <- struct{}{}:
-			case <-ctx.Done():
-				results[idx] = chunkResult{index: idx, err: ctx.Err()}
-				return
+			frame, runErr := d.executeChunk(gctx, settings, qm.SQL, chunk, query.TimeRange)
+			if runErr != nil {
+				return fmt.Errorf("[chunk %s to %s] %w",
+					chunk.From.Format("2006-01-02 15:04"),
+					chunk.To.Format("2006-01-02 15:04"), runErr)
 			}
-			defer func() { <-semaphore }()
-
-			frame, err := d.executeChunk(ctx, settings, qm.SQL, ch, query.TimeRange)
-			if err != nil {
-				err = fmt.Errorf("[chunk %s to %s] %w",
-					ch.From.Format("2006-01-02 15:04"),
-					ch.To.Format("2006-01-02 15:04"),
-					err)
-			}
-			results[idx] = chunkResult{index: idx, frame: frame, err: err}
-		}(i, chunk)
+			frames[i] = frame
+			return nil
+		})
 	}
 
-	wg.Wait()
+	if err := g.Wait(); err != nil {
+		return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserError(qm.RefID, err))
+	}
 
-	// Collect frames in order, fail on first error
 	orderedFrames := make([]*data.Frame, 0, len(chunks))
-	for _, r := range results {
-		if r.err != nil {
-			return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserError(qm.RefID, r.err))
-		}
-		if r.frame != nil {
-			orderedFrames = append(orderedFrames, r.frame)
+	for _, f := range frames {
+		if f != nil {
+			orderedFrames = append(orderedFrames, f)
 		}
 	}
 
@@ -537,8 +598,7 @@ func (d *ArcDatasource) CheckHealth(ctx context.Context, req *backend.CheckHealt
 	var status = backend.HealthStatusOk
 	var message = "Arc datasource is working"
 
-	// Get settings
-	settings, err := getSettings(ctx, req.PluginContext)
+	settings, err := d.getInstance(ctx, req.PluginContext)
 	if err != nil {
 		return &backend.CheckHealthResult{
 			Status:  backend.HealthStatusError,

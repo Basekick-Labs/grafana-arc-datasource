@@ -75,10 +75,11 @@ func validateURL(raw string) error {
 // addresses. This is the SSRF guard for the user-supplied Arc URL.
 //
 // allowPrivate controls whether RFC1918/loopback/CGNAT addresses are permitted
-// (intended for corporate-intranet Arc deployments — see
-// allowPrivateForSettings). Link-local (including the cloud-metadata
-// 169.254.169.254), multicast, and unspecified addresses are blocked
-// regardless — they are never a legitimate Arc target.
+// (intended for corporate-intranet Arc deployments — derived in newArcInstance
+// from the user's AllowPrivateIPs opt-in plus the loopback-URL exemption).
+// Link-local (including the cloud-metadata 169.254.169.254), multicast, and
+// unspecified addresses are blocked regardless — they are never a legitimate
+// Arc target.
 //
 // Resolution-then-validate avoids a TOCTOU between DNS rebind and connect: we
 // resolve the host ourselves, drop any disallowed address, then dial the
@@ -171,28 +172,16 @@ func isLoopbackURL(raw string) bool {
 	return false
 }
 
-// allowPrivateForSettings returns the dialer's private-IP policy for these
-// settings. Private (RFC1918) addresses are permitted when either:
-//   - the user explicitly opted in via AllowPrivateIPs (corporate intranet
-//     deployments where Arc is on 10.x/192.168.x), or
-//   - the configured Arc URL is itself loopback (dev workflow against
-//     http://localhost:8000), since blocking loopback there would be useless
-//     and confusing.
-//
-// Metadata addresses (169.254.169.254) and other link-local ranges are still
-// blocked unconditionally — they are never a legitimate Arc target.
-func allowPrivateForSettings(s *ArcInstanceSettings) bool {
-	return s.settings.AllowPrivateIPs || isLoopbackURL(s.settings.URL)
-}
-
-// newHTTPClient builds a per-request http.Client that:
+// newHTTPClient builds a long-lived http.Client that:
 //   - refuses to connect to private/loopback/metadata addresses,
 //   - validates redirects against the same blocklist,
 //   - applies a request-level timeout.
 //
-// allowPrivate should be derived from datasource settings via
-// allowPrivateForSettings. Link-local (incl. cloud-metadata) and unspecified
-// addresses are blocked regardless.
+// One client is created per datasource instance (in newArcInstance) and
+// reused across every request — sharing the transport's connection pool and
+// TLS session cache. allowPrivate combines the user's AllowPrivateIPs opt-in
+// with the loopback-URL exemption (so localhost dev still works). Link-local
+// (incl. cloud-metadata) and unspecified addresses are blocked regardless.
 func newHTTPClient(timeout time.Duration, allowPrivate bool) *http.Client {
 	transport := &http.Transport{
 		DialContext:           safeDialContext(allowPrivate),

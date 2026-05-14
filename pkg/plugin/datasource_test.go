@@ -1,9 +1,16 @@
 package plugin
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
@@ -862,6 +869,152 @@ func TestApplyMacrosWithSplit_UsesChunkForFilter_OriginalForInterval(t *testing.
 	// Interval should use original 8d range (> 7d) → "1 hour"
 	if !strings.Contains(result, "1 hour") {
 		t.Errorf("expected '1 hour' interval from 8d original range: %s", result)
+	}
+}
+
+// --- newArcInstance / ArcInstanceSettings (P3/P4) ---
+
+// TestNewArcInstance_BuildsSharedClient locks in P3/P4: the factory parses
+// settings AND builds a shared *http.Client. Both are then cached for reuse
+// by the InstanceManager — the per-call newHTTPClient pattern is gone.
+func TestNewArcInstance_BuildsSharedClient(t *testing.T) {
+	jsonData, _ := jsonMarshal(map[string]any{
+		"url":      "https://arc.example.com",
+		"database": "production",
+	})
+	inst, err := newArcInstance(t.Context(), backend.DataSourceInstanceSettings{
+		JSONData: jsonData,
+		DecryptedSecureJSONData: map[string]string{
+			"apiKey": "abc",
+		},
+	})
+	if err != nil {
+		t.Fatalf("newArcInstance: %v", err)
+	}
+	arc, ok := inst.(*ArcInstanceSettings)
+	if !ok {
+		t.Fatalf("expected *ArcInstanceSettings, got %T", inst)
+	}
+	if arc.client == nil {
+		t.Fatal("instance should carry a shared *http.Client (P3)")
+	}
+	if arc.apiKey != "abc" {
+		t.Errorf("apiKey not propagated: %q", arc.apiKey)
+	}
+	if arc.settings.URL != "https://arc.example.com" {
+		t.Errorf("URL not propagated: %q", arc.settings.URL)
+	}
+	// Dispose should be safe to call and idempotent.
+	arc.Dispose()
+	arc.Dispose()
+}
+
+// TestNewArcInstance_RejectsInvalidURL locks in that validation runs at
+// factory time, so the InstanceManager won't cache a broken instance.
+func TestNewArcInstance_RejectsInvalidURL(t *testing.T) {
+	jsonData, _ := jsonMarshal(map[string]any{"url": "file:///etc/passwd"})
+	_, err := newArcInstance(t.Context(), backend.DataSourceInstanceSettings{
+		JSONData:                jsonData,
+		DecryptedSecureJSONData: map[string]string{"apiKey": "abc"},
+	})
+	if err == nil {
+		t.Fatal("expected newArcInstance to reject file:// URL")
+	}
+}
+
+func TestNewArcInstance_AllowPrivatePolicy(t *testing.T) {
+	// AllowPrivateIPs=true should permit a private-IP-resolving dialer; the
+	// client is built but we don't actually hit the network.
+	jsonData, _ := jsonMarshal(map[string]any{
+		"url":             "http://10.0.0.5:8000",
+		"allowPrivateIPs": true,
+	})
+	inst, err := newArcInstance(t.Context(), backend.DataSourceInstanceSettings{
+		JSONData:                jsonData,
+		DecryptedSecureJSONData: map[string]string{"apiKey": "k"},
+	})
+	if err != nil {
+		t.Fatalf("permissive mode should build: %v", err)
+	}
+	if inst.(*ArcInstanceSettings).client == nil {
+		t.Fatal("expected client in permissive mode")
+	}
+}
+
+func jsonMarshal(v any) ([]byte, error) {
+	return json.Marshal(v)
+}
+
+// --- truncateForLog (L8) ---
+
+// TestTruncateForLog_PreservesUTF8 locks in the UTF-8-safe truncation: a
+// body whose byte-cap falls mid-rune must back off to a complete-rune
+// boundary so the returned string is always valid UTF-8.
+func TestTruncateForLog_PreservesUTF8(t *testing.T) {
+	// Build a string longer than maxErrorBodyBytes whose Nth byte (where N is
+	// the cap) falls inside a multi-byte rune. Using 4-byte runes makes the
+	// boundary easy to hit deterministically.
+	rune4 := "😀" // 4 bytes
+	body := strings.Repeat(rune4, (maxErrorBodyBytes/4)+5)
+	got := truncateForLog(body)
+	if !strings.HasSuffix(got, "...") {
+		t.Errorf("expected truncation suffix, got %q", got)
+	}
+	// The returned string must be valid UTF-8.
+	core := strings.TrimSuffix(got, "...")
+	if !isValidUTF8(core) {
+		t.Errorf("truncated string is not valid UTF-8: %q", core)
+	}
+}
+
+func TestTruncateForLog_ShortPassesThrough(t *testing.T) {
+	got := truncateForLog("short message")
+	if got != "short message" {
+		t.Errorf("short string should pass through unchanged, got %q", got)
+	}
+}
+
+func isValidUTF8(s string) bool {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			return false
+		}
+		i += size
+	}
+	return true
+}
+
+// --- formatRequestError (L7) ---
+
+// TestFormatRequestError_UsesTypedErrors locks in the L7 refactor: error
+// matching is now via errors.Is/As, not substring scans against err.Error().
+func TestFormatRequestError_UsesTypedErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		expectIn string
+	}{
+		{"deadline-exceeded", context.DeadlineExceeded, "timed out"},
+		{"canceled", context.Canceled, "cancelled"},
+		{"blocked-addr", errBlockedAddr, "blocked address"},
+		{"wrapped-deadline", fmt.Errorf("wrap: %w", context.DeadlineExceeded), "timed out"},
+		{"dns-error", &net.DNSError{Err: "no such host", Name: "arc.example.com"}, "hostname not found"},
+		{"op-error", &net.OpError{Op: "dial", Err: errors.New("connection refused")}, "dial failed"},
+		{"eof", io.EOF, "Arc closed the connection"},
+		{"unexpected-eof", io.ErrUnexpectedEOF, "Arc closed the connection"},
+		{"unknown", errors.New("something weird"), "Request to Arc failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatRequestError(tc.err).Error()
+			if !strings.Contains(got, tc.expectIn) {
+				t.Errorf("formatRequestError(%v) = %q, want substring %q", tc.err, got, tc.expectIn)
+			}
+			// And the original error must still be reachable via errors.Is.
+			if !errors.Is(formatRequestError(tc.err), tc.err) {
+				t.Errorf("error chain not preserved for %v", tc.err)
+			}
+		})
 	}
 }
 

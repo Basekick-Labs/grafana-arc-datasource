@@ -40,13 +40,8 @@ func queryArrow(ctx context.Context, settings *ArcInstanceSettings, sql string) 
 		req.Header.Set("X-Arc-Database", settings.settings.Database)
 	}
 
-	client := newHTTPClient(
-		time.Duration(settings.settings.Timeout)*time.Second,
-		allowPrivateForSettings(settings),
-	)
-
 	start := time.Now()
-	resp, err := client.Do(req)
+	resp, err := settings.client.Do(req)
 	httpDuration := time.Since(start)
 	if err != nil {
 		return nil, formatRequestError(err)
