@@ -19,7 +19,7 @@ type ArcDataSourceSettings struct {
 	URL            string `json:"url"`
 	Database       string `json:"database"`
 	Timeout        int    `json:"timeout"`        // seconds
-	UseArrow       bool   `json:"useArrow"`
+	UseArrow       *bool  `json:"useArrow"`       // pointer so unset (fresh install) is distinguishable from explicit false
 	MaxConcurrency int    `json:"maxConcurrency"` // max parallel chunks for query splitting (default 4)
 }
 
@@ -73,9 +73,12 @@ func getSettings(ctx context.Context, pluginCtx backend.PluginContext) (*ArcInst
 	if dsSettings.MaxConcurrency <= 0 {
 		dsSettings.MaxConcurrency = 4
 	}
-	// Note: UseArrow defaults to false in Go struct initialization
-	// The frontend defaults to true in the UI (ConfigEditor.tsx line 145)
-	// This ensures the toggle actually works - if explicitly set to false, respect that choice
+	// UseArrow is *bool so an unset field (fresh install) defaults to true here,
+	// matching the frontend Switch default; an explicit `false` from the UI is respected.
+	if dsSettings.UseArrow == nil {
+		t := true
+		dsSettings.UseArrow = &t
+	}
 
 	return &ArcInstanceSettings{
 		settings: dsSettings,
@@ -206,7 +209,7 @@ func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceS
 	// but keep the original range for $__interval calculation
 	sql := ApplyMacrosWithSplit(rawSQL, chunk, originalRange)
 
-	if settings.settings.UseArrow {
+	if *settings.settings.UseArrow {
 		return QueryArrowFlightSQLStyle(ctx, settings, sql, chunk)
 	}
 	return QueryJSON(ctx, settings, sql, chunk)
@@ -342,10 +345,10 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		}
 	}
 
-	// Auto-add ORDER BY time ASC for time series queries without one
-	if qm.Format == "time_series" {
-		qm.SQL = OptimizeTimeSeriesQuery(qm.SQL)
-	}
+	// Auto-add ORDER BY time ASC is disabled until the substring-match bug is fixed
+	// (rewrites queries containing 'lifetime', 'runtime', 'timestamp' columns and
+	// injects ORDER BY against a column named 'time' that may not exist).
+	// Re-enable after C5 fix lands. See docs/progress/2026-05-14-signing-readiness.md.
 
 	if !splitting {
 		// No splitting — execute as before
@@ -468,14 +471,13 @@ func (d *ArcDatasource) querySingle(ctx context.Context, settings *ArcInstanceSe
 		"refId", qm.RefID,
 		"sql", sql,
 		"format", qm.Format,
-		"useArrow", settings.settings.UseArrow,
+		"useArrow", *settings.settings.UseArrow,
 	)
 
-	// Execute query based on protocol
 	var frame *data.Frame
 	var err error
 
-	if settings.settings.UseArrow {
+	if *settings.settings.UseArrow {
 		frame, err = QueryArrowFlightSQLStyle(ctx, settings, sql, query.TimeRange)
 	} else {
 		frame, err = QueryJSON(ctx, settings, sql, query.TimeRange)

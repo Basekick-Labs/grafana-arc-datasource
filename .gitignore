@@ -121,6 +121,12 @@ public.pem
 # Local development
 .local/
 
+# Claude Code per-repo instructions (kept local)
+.claude/
+
+# Scratch progress notes (frozen artifacts go under docs/ directly)
+docs/progress/
+
 # Build artifacts and development files
 *.backup
 *.bak

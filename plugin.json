@@ -39,9 +39,34 @@
         "url": "https://github.com/basekick-labs/grafana-arc-datasource/blob/main/LICENSE"
       }
     ],
-    "screenshots": [],
+    "screenshots": [
+      {
+        "name": "Dashboard",
+        "path": "img/dashboard.png"
+      },
+      {
+        "name": "Query Editor",
+        "path": "img/query-editor.png"
+      },
+      {
+        "name": "Data Inspector",
+        "path": "img/inspect.png"
+      },
+      {
+        "name": "Template Variables",
+        "path": "img/variables.png"
+      },
+      {
+        "name": "Datasource Configuration",
+        "path": "img/datasource.png"
+      },
+      {
+        "name": "Alerting",
+        "path": "img/alerts.png"
+      }
+    ],
     "version": "1.2.0",
-    "updated": "2026-04-02"
+    "updated": "2026-05-14"
   },
   "dependencies": {
     "grafanaDependency": ">=10.0.0",

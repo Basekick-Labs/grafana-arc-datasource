@@ -45,7 +45,6 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
       refId: 'metricFindQuery',
       sql: sqlQuery,
       format: 'table',
-      rawQuery: true,
     };
 
     return lastValueFrom(
