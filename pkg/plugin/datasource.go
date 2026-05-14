@@ -340,37 +340,31 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	// Check if query splitting is enabled
 	chunkSize, splitting := parseSplitDuration(qm.SplitDuration, query.TimeRange)
 
-	// Skip splitting for queries with LIMIT — LIMIT applies per-chunk and would
-	// return N×chunks rows instead of N rows.
-	if splitting && containsLIMIT(qm.SQL) {
-		log.DefaultLogger.Debug("Skipping split for query with LIMIT", "refId", qm.RefID)
-		splitting = false
-	}
+	// Compute the stripped-and-uppercased view of the SQL once and reuse it
+	// across every splitting heuristic. Without this each heuristic re-ran
+	// stripStringLiterals + ToUpper independently — three full-string passes
+	// per query.
+	stripped := newStrippedSQL(qm.SQL)
 
-	// Skip splitting for queries with aggregation but no $__timeGroup — aggregations
-	// without time bucketing span the full range and produce wrong results when
-	// each chunk aggregates independently (e.g. COUNT per status gets duplicated,
-	// DISTINCT returns duplicates, bare COUNT(*) returns N rows instead of 1).
-	if splitting && containsAggregationWithoutTimeGroup(qm.SQL) {
-		log.DefaultLogger.Debug("Skipping split for aggregation without $__timeGroup", "refId", qm.RefID)
-		splitting = false
-	}
-
-	// Skip splitting for queries without $__timeFilter — the query doesn't use
-	// the time range at all, so splitting would just run it N times.
-	if splitting && !strings.Contains(qm.SQL, "$__timeFilter") && !strings.Contains(qm.SQL, "$__timeFrom") {
+	switch {
+	case splitting && !hasTimeFilterMacro(qm.SQL):
+		// No time macros → nothing to split along.
 		log.DefaultLogger.Debug("Skipping split for query without time filter", "refId", qm.RefID)
 		splitting = false
-	}
-
-	// Skip splitting for UNION queries — macro expansion in multi-statement
-	// queries produces mangled SQL.
-	if splitting {
-		upper := strings.ToUpper(qm.SQL)
-		if strings.Contains(upper, " UNION ") {
-			log.DefaultLogger.Debug("Skipping split for UNION query", "refId", qm.RefID)
-			splitting = false
-		}
+	case splitting && containsLIMIT(stripped):
+		// LIMIT applies per-chunk and would return N×chunks rows.
+		log.DefaultLogger.Debug("Skipping split for query with LIMIT", "refId", qm.RefID)
+		splitting = false
+	case splitting && containsUnion(stripped):
+		// Macro expansion in multi-statement queries produces mangled SQL.
+		log.DefaultLogger.Debug("Skipping split for UNION query", "refId", qm.RefID)
+		splitting = false
+	case splitting && containsAggregationWithoutTimeGroup(qm.SQL, stripped):
+		// Aggregations without time bucketing span the full range; each chunk
+		// aggregating independently produces wrong results (COUNT duplicated,
+		// DISTINCT inflated, bare COUNT(*) returning N rows instead of 1).
+		log.DefaultLogger.Debug("Skipping split for aggregation without $__timeGroup", "refId", qm.RefID)
+		splitting = false
 	}
 
 	// Auto-add ORDER BY time ASC is disabled until the substring-match bug is fixed
@@ -716,95 +710,6 @@ func ensureAscendingTimes(frame *data.Frame, timeIdx int) *data.Frame {
 	}
 
 	return sorted
-}
-
-// stripStringLiterals removes content inside single-quoted string literals
-// so that keyword detection doesn't false-positive on values like 'THE LIMIT 10'.
-// Handles escaped quotes ('') inside literals.
-func stripStringLiterals(sql string) string {
-	var result strings.Builder
-	inQuote := false
-	for i := 0; i < len(sql); i++ {
-		if sql[i] == '\'' {
-			if inQuote && i+1 < len(sql) && sql[i+1] == '\'' {
-				i++ // skip escaped quote ('')
-				continue
-			}
-			inQuote = !inQuote
-			continue
-		}
-		if !inQuote {
-			result.WriteByte(sql[i])
-		}
-	}
-	return result.String()
-}
-
-// containsLIMIT checks if SQL contains a LIMIT clause (case-insensitive).
-// Strips string literals first to avoid false positives on LIMIT inside quoted values.
-func containsLIMIT(sql string) bool {
-	return strings.Contains(strings.ToUpper(stripStringLiterals(sql)), " LIMIT ")
-}
-
-// containsAggregationWithoutTimeGroup returns true if the SQL has aggregation
-// (GROUP BY, DISTINCT, or aggregate functions) but no $__timeGroup macro.
-// Such queries aggregate across the full time range and would produce wrong
-// results if split into chunks (duplicated groups, inflated counts, etc.).
-// Note: this is a best-effort heuristic — it can false-positive on keywords
-// inside string literals or comments, but errs on the safe side (skipping
-// splitting is always correct, just slower).
-func containsAggregationWithoutTimeGroup(sql string) bool {
-	if strings.Contains(sql, "$__timeGroup") {
-		return false
-	}
-	upper := strings.ToUpper(stripStringLiterals(sql))
-	if strings.Contains(upper, "GROUP BY") {
-		return true
-	}
-	// Match "DISTINCT " (with trailing space) or "DISTINCT(" to catch both
-	// SELECT DISTINCT col and functions like APPROX_COUNT_DISTINCT(col).
-	// Avoids false positives on values like 'DISTINCT_VALUE' in string literals.
-	if strings.Contains(upper, "DISTINCT ") || strings.Contains(upper, "DISTINCT(") || strings.HasSuffix(upper, "DISTINCT") {
-		return true
-	}
-	// Standard SQL + DuckDB aggregate functions (complete list from DuckDB docs)
-	for _, fn := range []string{
-		// General aggregates
-		"SUM(", "FSUM(", "COUNT(", "COUNTIF(", "AVG(", "FAVG(",
-		"MIN(", "MAX(", "ANY_VALUE(",
-		"ARG_MIN(", "ARG_MIN_NULL(", "ARG_MAX(", "ARG_MAX_NULL(",
-		"FIRST(", "LAST(", "PRODUCT(",
-		"STRING_AGG(", "LIST(", "ARRAY_AGG(",
-		"BOOL_AND(", "BOOL_OR(",
-		"BIT_AND(", "BIT_OR(", "BIT_XOR(", "BITSTRING_AGG(",
-		"GEOMETRIC_MEAN(", "WEIGHTED_AVG(",
-		// Statistical
-		"MEDIAN(", "MODE(", "MAD(",
-		"STDDEV(", "STDDEV_POP(", "STDDEV_SAMP(",
-		"VARIANCE(", "VAR_POP(", "VAR_SAMP(",
-		"SKEWNESS(", "SKEWNESS_POP(",
-		"KURTOSIS(", "KURTOSIS_POP(",
-		"ENTROPY(", "CORR(",
-		"COVAR_POP(", "COVAR_SAMP(",
-		"QUANTILE(", "QUANTILE_CONT(", "QUANTILE_DISC(",
-		"HISTOGRAM(", "HISTOGRAM_EXACT(", "HISTOGRAM_VALUES(",
-		// Approximate
-		"APPROX_COUNT_DISTINCT(", "APPROX_QUANTILE(", "APPROX_TOP_K(",
-		"RESERVOIR_QUANTILE(",
-		// Regression
-		"REGR_AVGX(", "REGR_AVGY(", "REGR_COUNT(",
-		"REGR_INTERCEPT(", "REGR_R2(", "REGR_SLOPE(",
-		"REGR_SXX(", "REGR_SXY(", "REGR_SYY(",
-	} {
-		if strings.Contains(upper, fn) {
-			return true
-		}
-	}
-	// Window functions — each chunk restarts the window, producing wrong results
-	if strings.Contains(upper, " OVER(") || strings.Contains(upper, " OVER (") {
-		return true
-	}
-	return false
 }
 
 func toTime(val interface{}) (time.Time, bool) {

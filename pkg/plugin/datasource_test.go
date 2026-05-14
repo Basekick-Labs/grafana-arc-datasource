@@ -413,7 +413,7 @@ func TestContainsLIMIT(t *testing.T) {
 		{"SELECT * FROM t WHERE desc = 'NO LIMIT ' ORDER BY id", false}, // LIMIT inside string literal with trailing space
 	}
 	for _, c := range cases {
-		result := containsLIMIT(c.sql)
+		result := containsLIMIT(newStrippedSQL(c.sql))
 		if result != c.expected {
 			t.Errorf("containsLIMIT(%q): expected %v, got %v", c.sql, c.expected, result)
 		}
@@ -486,7 +486,7 @@ func TestContainsAggregationWithoutTimeGroup(t *testing.T) {
 		{"SELECT time, value, RANK() OVER(PARTITION BY host ORDER BY value) FROM t WHERE $__timeFilter(time)", true, "window RANK no space"},
 	}
 	for _, c := range cases {
-		result := containsAggregationWithoutTimeGroup(c.sql)
+		result := containsAggregationWithoutTimeGroup(c.sql, newStrippedSQL(c.sql))
 		if result != c.expected {
 			t.Errorf("%s: containsAggregationWithoutTimeGroup(%q): expected %v, got %v", c.desc, c.sql, c.expected, result)
 		}
@@ -559,13 +559,19 @@ func TestIntervalToSeconds(t *testing.T) {
 		{"10 minutes", 600},
 		{"1 hour", 3600},
 		{"1 day", 86400},
-		{"unknown", 3600}, // default
 	}
 	for _, c := range cases {
-		result := intervalToSeconds(c.input)
-		if result != c.expected {
-			t.Errorf("intervalToSeconds(%q): expected %d, got %d", c.input, c.expected, result)
+		result, ok := intervalToSeconds(c.input)
+		if !ok || result != c.expected {
+			t.Errorf("intervalToSeconds(%q): expected (%d, true), got (%d, %v)", c.input, c.expected, result, ok)
 		}
+	}
+	// Unknown intervals must now fail loudly rather than silently bucket at 1h.
+	if _, ok := intervalToSeconds("1minutes"); ok {
+		t.Errorf("intervalToSeconds(\"1minutes\") should fail; previously silently returned 3600s")
+	}
+	if _, ok := intervalToSeconds("nonsense"); ok {
+		t.Errorf("intervalToSeconds(\"nonsense\") should fail")
 	}
 }
 
@@ -676,6 +682,105 @@ func TestApplyMacros_TimeFilter_RejectsUnsafeColumn(t *testing.T) {
 	// advances searchFrom correctly rather than spinning or skipping ahead.
 	if !strings.Contains(result, "t2 >= '2026-02-18T10:00:00Z'") {
 		t.Errorf("valid macro after rejection must still expand: %s", result)
+	}
+}
+
+// TestApplyMacros_NotExpandedInsideStringLiteral locks in the C4 fix: a macro
+// occurring inside a single-quoted string literal must NOT be expanded.
+// Before this fix `WHERE message = '$__timeFilter(time)'` would have its
+// literal content silently rewritten.
+func TestApplyMacros_NotExpandedInsideStringLiteral(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	sql := "SELECT * FROM logs WHERE msg = 'see $__timeFilter(time) docs' AND $__timeFilter(time)"
+	result := ApplyMacros(sql, tr)
+
+	// The literal content must be untouched.
+	if !strings.Contains(result, "'see $__timeFilter(time) docs'") {
+		t.Errorf("macro inside string literal should NOT be expanded: %s", result)
+	}
+	// The bare macro outside the literal must still expand.
+	if strings.Count(result, "$__timeFilter(") != 1 {
+		t.Errorf("expected exactly one un-expanded $__timeFilter (the one inside the literal), got: %s", result)
+	}
+	if !strings.Contains(result, "time >= '2026-02-18T10:00:00Z'") {
+		t.Errorf("expected outer macro to expand: %s", result)
+	}
+}
+
+// TestApplyMacros_NotExpandedInsideComment locks in the C4 fix for comments.
+func TestApplyMacros_NotExpandedInsideComment(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	sql := "SELECT * FROM t\n-- use $__timeFilter(time) here\nWHERE $__timeFilter(time)"
+	result := ApplyMacros(sql, tr)
+
+	if !strings.Contains(result, "-- use $__timeFilter(time) here") {
+		t.Errorf("macro inside line comment should NOT be expanded: %s", result)
+	}
+}
+
+// TestApplyMacros_TimeFilter_NestedParens locks in the paren-matching fix:
+// $__timeFilter(COALESCE(t1, t2)) used to find the FIRST `)` and produce
+// broken SQL. Now we leave it un-expanded because the column arg isn't a
+// simple identifier (validateColumnArg rejects it).
+func TestApplyMacros_TimeFilter_NestedParens(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	// Nested-paren arg: validator rejects (not a plain identifier), macro
+	// is left as-is. The important thing is the function returns and the
+	// outer macro after it still expands.
+	sql := "WHERE $__timeFilter(COALESCE(t1, t2)) AND x = 1"
+	done := make(chan string, 1)
+	go func() { done <- ApplyMacros(sql, tr) }()
+	select {
+	case result := <-done:
+		// Macro left un-expanded (validator rejected the arg). What MUST not
+		// happen: SQL truncation or duplication. Verify it's still well-formed.
+		if !strings.Contains(result, "$__timeFilter(COALESCE(t1, t2))") {
+			t.Errorf("expected nested-paren macro to be left un-expanded: %s", result)
+		}
+		if !strings.Contains(result, "x = 1") {
+			t.Errorf("trailing SQL should not be truncated: %s", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ApplyMacros did not return — possible infinite loop on nested parens")
+	}
+}
+
+// TestExpandTimeGroup_UnknownInterval locks in M4: unknown intervals are no
+// longer silently bucketed at 1h.
+func TestExpandTimeGroup_UnknownInterval(t *testing.T) {
+	sql := "SELECT $__timeGroup(time, '1minutes') AS time FROM t"
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	result := ApplyMacros(sql, tr)
+	// Macro left un-expanded so Arc surfaces a clear error rather than
+	// silently using the wrong bucket size.
+	if !strings.Contains(result, "$__timeGroup(time, '1minutes')") {
+		t.Errorf("unknown interval should leave macro un-expanded: %s", result)
+	}
+}
+
+// TestExpandTimeGroup_ExtraArgs locks in M3: extra arguments warn loudly
+// and leave the macro un-expanded.
+func TestExpandTimeGroup_ExtraArgs(t *testing.T) {
+	sql := "SELECT $__timeGroup(time, '1h', surprise) AS time FROM t"
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	result := ApplyMacros(sql, tr)
+	if !strings.Contains(result, "$__timeGroup(time, '1h', surprise)") {
+		t.Errorf("extra args should leave macro un-expanded: %s", result)
 	}
 }
 
