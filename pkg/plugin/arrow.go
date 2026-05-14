@@ -47,10 +47,10 @@ func QueryArrow(ctx context.Context, settings *ArcInstanceSettings, sql string, 
 		req.Header.Set("X-Arc-Database", settings.settings.Database)
 	}
 
-	// Execute request
-	client := &http.Client{
-		Timeout: time.Duration(settings.settings.Timeout) * time.Second,
-	}
+	client := newHTTPClient(
+		time.Duration(settings.settings.Timeout)*time.Second,
+		isLoopbackURL(settings.settings.URL),
+	)
 
 	start := time.Now()
 	resp, err := client.Do(req)
@@ -59,13 +59,15 @@ func QueryArrow(ctx context.Context, settings *ArcInstanceSettings, sql string, 
 	}
 	defer resp.Body.Close()
 
+	body := http.MaxBytesReader(nil, resp.Body, MaxResponseBytes)
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, errors.New(parseArcError(resp.StatusCode, body))
+		raw, _ := io.ReadAll(body)
+		return nil, errors.New(parseArcError(resp.StatusCode, raw))
 	}
 
 	// Read Arrow IPC stream
-	arrowData, err := io.ReadAll(resp.Body)
+	arrowData, err := io.ReadAll(body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}

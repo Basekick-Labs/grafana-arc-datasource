@@ -47,10 +47,10 @@ func QueryArrowFlightSQLStyle(ctx context.Context, settings *ArcInstanceSettings
 		req.Header.Set("X-Arc-Database", settings.settings.Database)
 	}
 
-	// Execute request
-	client := &http.Client{
-		Timeout: time.Duration(settings.settings.Timeout) * time.Second,
-	}
+	client := newHTTPClient(
+		time.Duration(settings.settings.Timeout)*time.Second,
+		isLoopbackURL(settings.settings.URL),
+	)
 
 	start := time.Now()
 	resp, err := client.Do(req)
@@ -60,15 +60,16 @@ func QueryArrowFlightSQLStyle(ctx context.Context, settings *ArcInstanceSettings
 	}
 	defer resp.Body.Close()
 
+	body := http.MaxBytesReader(nil, resp.Body, MaxResponseBytes)
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, errors.New(parseArcError(resp.StatusCode, body))
+		raw, _ := io.ReadAll(body)
+		return nil, errors.New(parseArcError(resp.StatusCode, raw))
 	}
 
-	// Stream Arrow IPC directly from response body (no intermediate buffer)
-	// This eliminates the ReadAll overhead and processes data as it arrives
+	// Stream Arrow IPC directly from the (size-capped) response body.
 	parseStart := time.Now()
-	reader, err := ipc.NewReader(resp.Body)
+	reader, err := ipc.NewReader(body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Arrow reader: %w", err)
 	}
@@ -243,35 +244,93 @@ func appendRecordToDataFrame(frame *data.Frame, record arrow.Record) error {
 	return nil
 }
 
-// appendArrowColumnToField appends an Arrow column to a Grafana field
+// appendArrowColumnToField appends an Arrow column to a Grafana field.
+// Each type-cast uses comma-ok so a schema-vs-concrete-type drift (extension
+// types, dictionary-encoded strings, lists) returns a clean error instead of
+// panicking the goroutine.
 func appendArrowColumnToField(field *data.Field, col arrow.Array) error {
+	mismatch := func() error {
+		return fmt.Errorf("arrow column type mismatch: id=%s concrete=%T", col.DataType().String(), col)
+	}
 	switch col.DataType().ID() {
 	case arrow.TIMESTAMP:
-		return appendTimestampColumn(field, col.(*array.Timestamp))
+		arr, ok := col.(*array.Timestamp)
+		if !ok {
+			return mismatch()
+		}
+		return appendTimestampColumn(field, arr)
 	case arrow.STRING:
-		return appendTypedColumn[string](field, col.(*array.String))
+		arr, ok := col.(*array.String)
+		if !ok {
+			return mismatch()
+		}
+		return appendTypedColumn[string](field, arr)
 	case arrow.FLOAT32:
-		return appendTypedColumn[float32](field, col.(*array.Float32))
+		arr, ok := col.(*array.Float32)
+		if !ok {
+			return mismatch()
+		}
+		return appendTypedColumn[float32](field, arr)
 	case arrow.FLOAT64:
-		return appendTypedColumn[float64](field, col.(*array.Float64))
+		arr, ok := col.(*array.Float64)
+		if !ok {
+			return mismatch()
+		}
+		return appendTypedColumn[float64](field, arr)
 	case arrow.INT8:
-		return appendTypedColumn[int8](field, col.(*array.Int8))
+		arr, ok := col.(*array.Int8)
+		if !ok {
+			return mismatch()
+		}
+		return appendTypedColumn[int8](field, arr)
 	case arrow.INT16:
-		return appendTypedColumn[int16](field, col.(*array.Int16))
+		arr, ok := col.(*array.Int16)
+		if !ok {
+			return mismatch()
+		}
+		return appendTypedColumn[int16](field, arr)
 	case arrow.INT32:
-		return appendTypedColumn[int32](field, col.(*array.Int32))
+		arr, ok := col.(*array.Int32)
+		if !ok {
+			return mismatch()
+		}
+		return appendTypedColumn[int32](field, arr)
 	case arrow.INT64:
-		return appendCastColumn[int64, float64](field, col.(*array.Int64))
+		arr, ok := col.(*array.Int64)
+		if !ok {
+			return mismatch()
+		}
+		return appendCastColumn[int64, float64](field, arr)
 	case arrow.UINT8:
-		return appendTypedColumn[uint8](field, col.(*array.Uint8))
+		arr, ok := col.(*array.Uint8)
+		if !ok {
+			return mismatch()
+		}
+		return appendTypedColumn[uint8](field, arr)
 	case arrow.UINT16:
-		return appendTypedColumn[uint16](field, col.(*array.Uint16))
+		arr, ok := col.(*array.Uint16)
+		if !ok {
+			return mismatch()
+		}
+		return appendTypedColumn[uint16](field, arr)
 	case arrow.UINT32:
-		return appendTypedColumn[uint32](field, col.(*array.Uint32))
+		arr, ok := col.(*array.Uint32)
+		if !ok {
+			return mismatch()
+		}
+		return appendTypedColumn[uint32](field, arr)
 	case arrow.UINT64:
-		return appendCastColumn[uint64, float64](field, col.(*array.Uint64))
+		arr, ok := col.(*array.Uint64)
+		if !ok {
+			return mismatch()
+		}
+		return appendCastColumn[uint64, float64](field, arr)
 	case arrow.BOOL:
-		return appendTypedColumn[bool](field, col.(*array.Boolean))
+		arr, ok := col.(*array.Boolean)
+		if !ok {
+			return mismatch()
+		}
+		return appendTypedColumn[bool](field, arr)
 	default:
 		return fmt.Errorf("unsupported Arrow type: %s", col.DataType().String())
 	}

@@ -84,10 +84,10 @@ func QueryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string, t
 		req.Header.Set("X-Arc-Database", settings.settings.Database)
 	}
 
-	// Execute request
-	client := &http.Client{
-		Timeout: time.Duration(settings.settings.Timeout) * time.Second,
-	}
+	client := newHTTPClient(
+		time.Duration(settings.settings.Timeout)*time.Second,
+		isLoopbackURL(settings.settings.URL),
+	)
 
 	start := time.Now()
 	resp, err := client.Do(req)
@@ -96,14 +96,16 @@ func QueryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string, t
 	}
 	defer resp.Body.Close()
 
+	body := http.MaxBytesReader(nil, resp.Body, MaxResponseBytes)
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, errors.New(parseArcError(resp.StatusCode, body))
+		raw, _ := io.ReadAll(body)
+		return nil, errors.New(parseArcError(resp.StatusCode, raw))
 	}
 
 	// Parse JSON response
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode Arc JSON response: %w", err)
 	}
 
@@ -145,7 +147,11 @@ func JSONToDataFrame(result map[string]interface{}) (*data.Frame, error) {
 
 	columnNames := make([]string, len(columnsSlice))
 	for i, col := range columnsSlice {
-		columnNames[i] = col.(string)
+		name, ok := col.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid column name at index %d: expected string, got %T", i, col)
+		}
+		columnNames[i] = name
 	}
 
 	// Extract data from Arc response
@@ -191,7 +197,13 @@ func JSONToDataFrame(result map[string]interface{}) (*data.Frame, error) {
 		var sample interface{}
 
 		for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-			row := dataRows[rowIdx].([]interface{})
+			row, ok := dataRows[rowIdx].([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("invalid row at index %d: expected array, got %T", rowIdx, dataRows[rowIdx])
+			}
+			if colIdx >= len(row) {
+				return nil, fmt.Errorf("row %d has %d columns, expected at least %d", rowIdx, len(row), colIdx+1)
+			}
 			if row[colIdx] != nil {
 				sample = row[colIdx]
 				break
@@ -225,19 +237,28 @@ func JSONToDataFrame(result map[string]interface{}) (*data.Frame, error) {
 		case data.FieldTypeNullableFloat64:
 			values := make([]*float64, numRows)
 			for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-				row := dataRows[rowIdx].([]interface{})
-				if row[colIdx] != nil {
-					val := new(float64)
-					*val = row[colIdx].(float64)
-					values[rowIdx] = val
+				row, ok := dataRows[rowIdx].([]interface{})
+				if !ok || colIdx >= len(row) || row[colIdx] == nil {
+					continue
 				}
+				v, ok := row[colIdx].(float64)
+				if !ok {
+					log.DefaultLogger.Warn("skipping non-float64 cell in numeric column",
+						"col", colName, "row", rowIdx, "type", fmt.Sprintf("%T", row[colIdx]))
+					continue
+				}
+				val := v
+				values[rowIdx] = &val
 			}
 			fields[colIdx] = data.NewField(colName, nil, values)
 
 		case data.FieldTypeNullableTime:
 			values := make([]*time.Time, numRows)
 			for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-				row := dataRows[rowIdx].([]interface{})
+				row, ok := dataRows[rowIdx].([]interface{})
+				if !ok || colIdx >= len(row) {
+					continue
+				}
 				if row[colIdx] != nil {
 					var t time.Time
 					var err error
@@ -302,23 +323,30 @@ func JSONToDataFrame(result map[string]interface{}) (*data.Frame, error) {
 		case data.FieldTypeNullableString:
 			values := make([]*string, numRows)
 			for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-				row := dataRows[rowIdx].([]interface{})
-				if row[colIdx] != nil {
-					str := fmt.Sprintf("%v", row[colIdx])
-					values[rowIdx] = &str
+				row, ok := dataRows[rowIdx].([]interface{})
+				if !ok || colIdx >= len(row) || row[colIdx] == nil {
+					continue
 				}
+				str := fmt.Sprintf("%v", row[colIdx])
+				values[rowIdx] = &str
 			}
 			fields[colIdx] = data.NewField(colName, nil, values)
 
 		case data.FieldTypeNullableBool:
 			values := make([]*bool, numRows)
 			for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-				row := dataRows[rowIdx].([]interface{})
-				if row[colIdx] != nil {
-					val := new(bool)
-					*val = row[colIdx].(bool)
-					values[rowIdx] = val
+				row, ok := dataRows[rowIdx].([]interface{})
+				if !ok || colIdx >= len(row) || row[colIdx] == nil {
+					continue
 				}
+				v, ok := row[colIdx].(bool)
+				if !ok {
+					log.DefaultLogger.Warn("skipping non-bool cell in boolean column",
+						"col", colName, "row", rowIdx, "type", fmt.Sprintf("%T", row[colIdx]))
+					continue
+				}
+				val := v
+				values[rowIdx] = &val
 			}
 			fields[colIdx] = data.NewField(colName, nil, values)
 		}
@@ -377,12 +405,17 @@ func calculateInterval(duration time.Duration) string {
 
 // expandTimeFilter replaces $__timeFilter(column) with column >= 'from' AND column < 'to'.
 // Extracts the column name from the macro argument instead of hardcoding 'time'.
+// Column arguments are validated against columnNameRe — anything else is left
+// un-expanded so Arc surfaces a clear error rather than the macro silently
+// injecting attacker-controlled SQL.
 func expandTimeFilter(sql string, from, to time.Time) string {
+	searchFrom := 0
 	for {
-		idx := strings.Index(sql, "$__timeFilter(")
-		if idx == -1 {
+		rel := strings.Index(sql[searchFrom:], "$__timeFilter(")
+		if rel == -1 {
 			return sql
 		}
+		idx := searchFrom + rel
 
 		end := strings.Index(sql[idx:], ")")
 		if end == -1 {
@@ -395,6 +428,11 @@ func expandTimeFilter(sql string, from, to time.Time) string {
 			log.DefaultLogger.Warn("$__timeFilter macro has empty column argument, defaulting to 'time'")
 			column = "time"
 		}
+		if err := validateColumnArg(column); err != nil {
+			log.DefaultLogger.Warn("$__timeFilter rejected unsafe column argument", "column", column, "error", err.Error())
+			searchFrom = end + 1
+			continue
+		}
 
 		replacement := fmt.Sprintf("%s >= '%s' AND %s < '%s'",
 			column,
@@ -403,6 +441,7 @@ func expandTimeFilter(sql string, from, to time.Time) string {
 			to.Format(time.RFC3339),
 		)
 		sql = sql[:idx] + replacement + sql[end+1:]
+		searchFrom = idx + len(replacement)
 	}
 }
 
@@ -485,30 +524,38 @@ func intervalToSeconds(interval string) int {
 // expandTimeGroup replaces $__timeGroup(column, interval) with epoch-based bucketing SQL.
 // DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
 // causing GROUP BY to produce per-second rows. Epoch math avoids this.
+// Column argument is validated against columnNameRe; invalid macros are left
+// un-expanded so Arc surfaces a clear error.
 func expandTimeGroup(sql string) string {
+	searchFrom := 0
 	for {
-		idx := strings.Index(sql, "$__timeGroup(")
-		if idx == -1 {
+		rel := strings.Index(sql[searchFrom:], "$__timeGroup(")
+		if rel == -1 {
 			return sql
 		}
+		idx := searchFrom + rel
 
-		// Find the closing paren
 		end := strings.Index(sql[idx:], ")")
 		if end == -1 {
 			return sql
 		}
 		end += idx
 
-		// Extract arguments: $__timeGroup(column, 'interval')
 		inner := sql[idx+len("$__timeGroup(") : end]
 		parts := strings.SplitN(inner, ",", 2)
 		if len(parts) != 2 {
 			log.DefaultLogger.Warn("$__timeGroup requires two arguments: $__timeGroup(column, interval)",
 				"found", inner)
-			return sql
+			searchFrom = end + 1
+			continue
 		}
 
 		column := strings.TrimSpace(parts[0])
+		if err := validateColumnArg(column); err != nil {
+			log.DefaultLogger.Warn("$__timeGroup rejected unsafe column argument", "column", column, "error", err.Error())
+			searchFrom = end + 1
+			continue
+		}
 		interval := strings.Trim(strings.TrimSpace(parts[1]), "'\"")
 		secs := intervalToSeconds(interval)
 
@@ -518,6 +565,7 @@ func expandTimeGroup(sql string) string {
 		// DuckDB's / operator returns DOUBLE; // returns BIGINT.
 		replacement := fmt.Sprintf("to_timestamp((epoch_ns(%s) // 1000000000 // %d) * %d)", column, secs, secs)
 		sql = sql[:idx] + replacement + sql[end+1:]
+		searchFrom = idx + len(replacement)
 	}
 }
 

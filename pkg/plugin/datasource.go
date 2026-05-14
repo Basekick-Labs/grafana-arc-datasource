@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -57,21 +58,29 @@ func getSettings(ctx context.Context, pluginCtx backend.PluginContext) (*ArcInst
 		return nil, fmt.Errorf("failed to unmarshal settings: %w", err)
 	}
 
-	// Get API key from secure settings
-	apiKey := pluginCtx.DataSourceInstanceSettings.DecryptedSecureJSONData["apiKey"]
-	if apiKey == "" {
-		return nil, fmt.Errorf("API key is required")
+	if err := validateURL(dsSettings.URL); err != nil {
+		return nil, err
 	}
 
-	// Default values
+	apiKey := strings.TrimSpace(pluginCtx.DataSourceInstanceSettings.DecryptedSecureJSONData["apiKey"])
+	if apiKey == "" {
+		return nil, errors.New("API key is required")
+	}
+
 	if dsSettings.Timeout == 0 {
 		dsSettings.Timeout = 30
 	}
 	if dsSettings.Database == "" {
 		dsSettings.Database = "default"
 	}
+	if err := validateDatabaseName(dsSettings.Database); err != nil {
+		return nil, err
+	}
 	if dsSettings.MaxConcurrency <= 0 {
 		dsSettings.MaxConcurrency = 4
+	}
+	if dsSettings.MaxConcurrency > MaxConcurrencyCap {
+		dsSettings.MaxConcurrency = MaxConcurrencyCap
 	}
 	// UseArrow is *bool so an unset field (fresh install) defaults to true here,
 	// matching the frontend Switch default; an explicit `false` from the UI is respected.
@@ -90,19 +99,32 @@ func getSettings(ctx context.Context, pluginCtx backend.PluginContext) (*ArcInst
 func (d *ArcDatasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
 	response := backend.NewQueryDataResponse()
 
-	// Get settings
 	settings, err := getSettings(ctx, req.PluginContext)
 	if err != nil {
 		return nil, err
 	}
 
-	// Process each query
 	for _, q := range req.Queries {
-		res := d.query(ctx, settings, q)
-		response.Responses[q.RefID] = res
+		response.Responses[q.RefID] = d.queryWithRecover(ctx, settings, q)
 	}
 
 	return response, nil
+}
+
+// queryWithRecover wraps d.query in a recover so a panic in one refId fails
+// only that refId rather than the entire batch. The full panic value plus
+// stack is logged; the user-facing error is sanitized.
+func (d *ArcDatasource) queryWithRecover(ctx context.Context, settings *ArcInstanceSettings, q backend.DataQuery) (resp backend.DataResponse) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.DefaultLogger.Error("panic in query handler",
+				"refId", q.RefID,
+				"panic", fmt.Sprintf("%v", r),
+			)
+			resp = backend.ErrDataResponse(backend.StatusInternal, "Query failed (internal error; see server logs).")
+		}
+	}()
+	return d.query(ctx, settings, q)
 }
 
 // autoSplitDuration picks a split chunk size based on the query time range.
@@ -304,6 +326,9 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 
 	// Per-query database override
 	if qm.Database != "" {
+		if err := validateDatabaseName(qm.Database); err != nil {
+			return backend.ErrDataResponse(backend.StatusBadRequest, err.Error())
+		}
 		overridden := *settings
 		overridden.settings.Database = qm.Database
 		settings = &overridden
@@ -418,7 +443,7 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	orderedFrames := make([]*data.Frame, 0, len(chunks))
 	for _, r := range results {
 		if r.err != nil {
-			return backend.ErrDataResponse(backend.StatusInternal, r.err.Error())
+			return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserError(qm.RefID, r.err))
 		}
 		if r.frame != nil {
 			orderedFrames = append(orderedFrames, r.frame)
@@ -484,7 +509,7 @@ func (d *ArcDatasource) querySingle(ctx context.Context, settings *ArcInstanceSe
 	}
 
 	if err != nil {
-		return backend.ErrDataResponse(backend.StatusInternal, err.Error())
+		return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserError(qm.RefID, err))
 	}
 
 	// Time the frame preparation (conversion)
@@ -533,8 +558,7 @@ func (d *ArcDatasource) CheckHealth(ctx context.Context, req *backend.CheckHealt
 
 	if err != nil {
 		status = backend.HealthStatusError
-		message = fmt.Sprintf("Failed to connect to Arc: %v", err)
-		log.DefaultLogger.Error("Health check failed", "error", err)
+		message = "Failed to connect to Arc: " + sanitizeUserError("health", err)
 	} else {
 		log.DefaultLogger.Info("Health check passed",
 			"url", settings.settings.URL,
