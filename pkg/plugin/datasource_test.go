@@ -947,6 +947,131 @@ func jsonMarshal(v any) ([]byte, error) {
 
 // --- truncateForLog (L8) ---
 
+// TestContainsLIMIT_WhitespaceFlavors locks in R2-CR3: the LIMIT detector
+// must match `\nLIMIT 10`, `\tLIMIT 10`, and trailing-end LIMIT. Previously
+// the substring " LIMIT " required ASCII space both sides, so splitting was
+// NOT skipped on newline-separated LIMIT clauses → 7 chunks × 100 rows =
+// 700 rows for a LIMIT-100 query.
+func TestContainsLIMIT_WhitespaceFlavors(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT * FROM t LIMIT 10",
+		"SELECT * FROM t\nLIMIT 10",
+		"SELECT * FROM t\tLIMIT 10",
+		"SELECT * FROM t WHERE x=1\n  LIMIT 10",
+	} {
+		if !containsLIMIT(newStrippedSQL(sql)) {
+			t.Errorf("expected LIMIT match for: %q", sql)
+		}
+	}
+	for _, sql := range []string{
+		"SELECT * FROM t",
+		"SELECT limited FROM t",
+		"SELECT * FROM t WHERE name = 'NO LIMIT'",
+	} {
+		if containsLIMIT(newStrippedSQL(sql)) {
+			t.Errorf("unexpected LIMIT match for: %q", sql)
+		}
+	}
+}
+
+// TestContainsUnion_WhitespaceFlavors mirrors R2-CR3 for UNION.
+func TestContainsUnion_WhitespaceFlavors(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT 1 UNION SELECT 2",
+		"SELECT 1\nUNION SELECT 2",
+		"SELECT 1\tUNION ALL SELECT 2",
+	} {
+		if !containsUnion(newStrippedSQL(sql)) {
+			t.Errorf("expected UNION match for: %q", sql)
+		}
+	}
+	for _, sql := range []string{
+		"SELECT communion FROM t",
+		"SELECT * FROM t WHERE name = 'UNION'",
+	} {
+		if containsUnion(newStrippedSQL(sql)) {
+			t.Errorf("unexpected UNION match for: %q", sql)
+		}
+	}
+}
+
+// TestApplyMacros_AllZeroArgMacrosLiteralSafe locks in R2-CR5: every macro
+// MUST be skipped when inside a string literal — not just $__timeFilter.
+// The previous fix only routed $__timeFilter through the literal-aware
+// walker; $__timeFrom(), $__timeTo(), and $__interval still used
+// strings.ReplaceAll which mangled literal content.
+func TestApplyMacros_AllZeroArgMacrosLiteralSafe(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	cases := []struct {
+		name string
+		sql  string
+		// substring that must remain INTACT in the output (proves the macro
+		// inside the literal was NOT expanded)
+		preserved string
+	}{
+		{"timeFrom in literal", "WHERE msg = 'see $__timeFrom() docs'", "'see $__timeFrom() docs'"},
+		{"timeTo in literal", "WHERE msg = 'see $__timeTo() docs'", "'see $__timeTo() docs'"},
+		{"interval in literal", "WHERE msg = 'bucket $__interval here'", "'bucket $__interval here'"},
+		{"timeFilter in literal", "WHERE msg = 'has $__timeFilter(time)'", "'has $__timeFilter(time)'"},
+		{"timeGroup in literal", "WHERE msg = 'has $__timeGroup(time, ''1h'')'", "'has $__timeGroup(time, ''1h'')'"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			result := ApplyMacros(c.sql, tr)
+			if !strings.Contains(result, c.preserved) {
+				t.Errorf("macro inside literal was expanded — expected to find %q in: %s", c.preserved, result)
+			}
+		})
+	}
+}
+
+// TestApplyMacros_ZeroArgMacrosOutsideLiteralStillExpand confirms the
+// literal-aware walker still does its job for macros outside literals.
+func TestApplyMacros_ZeroArgMacrosOutsideLiteralStillExpand(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	sql := "SELECT * WHERE start = $__timeFrom() AND end = $__timeTo() GROUP BY $__interval"
+	result := ApplyMacros(sql, tr)
+	for _, macro := range []string{"$__timeFrom(", "$__timeTo(", "$__interval"} {
+		if strings.Contains(result, macro) {
+			t.Errorf("macro %s was NOT expanded outside a literal: %s", macro, result)
+		}
+	}
+	if !strings.Contains(result, "'2026-02-18T10:00:00Z'") {
+		t.Errorf("expected expanded $__timeFrom(): %s", result)
+	}
+	if !strings.Contains(result, "'2026-02-18T11:00:00Z'") {
+		t.Errorf("expected expanded $__timeTo(): %s", result)
+	}
+}
+
+// TestMergeFrames_TypeMismatchSkipped locks in R2-HI2: a chunk whose field
+// types disagree with the base must be skipped, not silently appended with
+// reflective Set (which would panic, taking down the whole batch).
+func TestMergeFrames_TypeMismatchSkipped(t *testing.T) {
+	floatVal := 1.5
+	stringVal := "x"
+	base := data.NewFrame("base",
+		data.NewField("v", nil, []*float64{&floatVal}),
+	)
+	mismatched := data.NewFrame("bad",
+		data.NewField("v", nil, []*string{&stringVal}),
+	)
+	merged := mergeFrames([]*data.Frame{base, mismatched})
+	if merged == nil {
+		t.Fatal("merged should not be nil")
+	}
+	// Must NOT panic; mismatched chunk silently skipped (logged as warning).
+	if merged.Rows() != 1 {
+		t.Errorf("expected 1 row (mismatched chunk skipped), got %d", merged.Rows())
+	}
+}
+
 // TestTruncateForLog_PreservesUTF8 locks in the UTF-8-safe truncation: a
 // body whose byte-cap falls mid-rune must back off to a complete-rune
 // boundary so the returned string is always valid UTF-8.

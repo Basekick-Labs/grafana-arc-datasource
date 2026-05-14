@@ -1,14 +1,12 @@
 package plugin
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -97,65 +95,26 @@ func formatRequestError(err error) error {
 // queryJSON executes a query using Arc's JSON endpoint (fallback path used
 // when the user has disabled Arrow). Returns a decoded Grafana DataFrame.
 func queryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string) (*data.Frame, error) {
-	// Build request
-	url := fmt.Sprintf("%s/api/v1/query", settings.settings.URL)
-
-	reqBody := map[string]interface{}{
-		"sql": sql,
-	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	// Create HTTP request
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", settings.apiKey))
-
-	// Set database if specified
-	if settings.settings.Database != "" {
-		req.Header.Set("X-Arc-Database", settings.settings.Database)
-	}
-
 	start := time.Now()
-	resp, err := settings.client.Do(req)
+	body, err := settings.doRequest(ctx, "/api/v1/query", map[string]any{"sql": sql})
 	if err != nil {
-		return nil, formatRequestError(err)
+		return nil, err
 	}
-	defer resp.Body.Close()
+	defer body.Close()
 
-	body := http.MaxBytesReader(nil, resp.Body, MaxResponseBytes)
-
-	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(body)
-		return nil, errors.New(parseArcError(resp.StatusCode, raw))
-	}
-
-	// Parse JSON response
 	var result map[string]interface{}
 	if err := json.NewDecoder(body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode Arc JSON response: %w", err)
 	}
 
 	duration := time.Since(start)
-	log.DefaultLogger.Debug("JSON query completed",
-		"duration_ms", duration.Milliseconds(),
-	)
+	log.DefaultLogger.Debug("JSON query completed", "duration_ms", duration.Milliseconds())
 
-	// Convert to DataFrame
 	frame, err := JSONToDataFrame(result)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert response to DataFrame: %w", err)
 	}
 
-	// Add metadata
 	frame.Meta = &data.FrameMeta{
 		ExecutedQueryString: sql,
 		Custom: map[string]interface{}{
@@ -505,6 +464,73 @@ func replaceMacroOccurrences(sql, macro string, rewrite func(arg string) (string
 	return out.String()
 }
 
+// replaceLiteralAwareTokens replaces every occurrence of `token` (a fixed
+// string with no argument list, e.g. "$__interval" or "$__timeFrom()") with
+// `replacement` — skipping occurrences inside string literals and SQL
+// comments. This is the zero-arg sibling of `replaceMacroOccurrences` and
+// fixes R2-CR5: the previous `strings.ReplaceAll` rewrote macros inside
+// string literals (`WHERE msg = 'see $__timeFrom()'` mangled the literal).
+func replaceLiteralAwareTokens(sql, token, replacement string) string {
+	if !strings.Contains(sql, token) {
+		return sql
+	}
+	var out strings.Builder
+	out.Grow(len(sql))
+	i := 0
+	for i < len(sql) {
+		// Skip '...' string literals (preserve verbatim, including any tokens inside).
+		if sql[i] == '\'' {
+			out.WriteByte(sql[i])
+			i++
+			for i < len(sql) {
+				out.WriteByte(sql[i])
+				if sql[i] == '\'' {
+					if i+1 < len(sql) && sql[i+1] == '\'' {
+						out.WriteByte(sql[i+1])
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		// Skip -- line comments.
+		if sql[i] == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			end := strings.IndexByte(sql[i:], '\n')
+			if end < 0 {
+				out.WriteString(sql[i:])
+				return out.String()
+			}
+			out.WriteString(sql[i : i+end])
+			i += end
+			continue
+		}
+		// Skip /* block comments */.
+		if sql[i] == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+			end := strings.Index(sql[i+2:], "*/")
+			if end < 0 {
+				out.WriteString(sql[i:])
+				return out.String()
+			}
+			out.WriteString(sql[i : i+2+end+2])
+			i += 2 + end + 2
+			continue
+		}
+		// Token match?
+		if i+len(token) <= len(sql) && sql[i:i+len(token)] == token {
+			out.WriteString(replacement)
+			i += len(token)
+			continue
+		}
+		out.WriteByte(sql[i])
+		i++
+	}
+	return out.String()
+}
+
 // findMatchingParen scans forward from `openIdx` (which must point at '(')
 // and returns the index of the matching ')', respecting nested parens and
 // string literals inside the arg. Returns -1 if no match is found.
@@ -571,42 +597,30 @@ func expandTimeFilter(sql string, from, to time.Time) string {
 
 // ApplyMacros replaces Grafana macros in SQL query
 func ApplyMacros(sql string, timeRange backend.TimeRange) string {
-	// $__timeFilter(column) -> column >= 'start' AND column < 'end'
-	sql = expandTimeFilter(sql, timeRange.From, timeRange.To)
-
-	// $__timeFrom() -> start time
-	sql = strings.ReplaceAll(sql, "$__timeFrom()", fmt.Sprintf("'%s'", timeRange.From.Format(time.RFC3339)))
-
-	// $__timeTo() -> end time
-	sql = strings.ReplaceAll(sql, "$__timeTo()", fmt.Sprintf("'%s'", timeRange.To.Format(time.RFC3339)))
-
-	// $__interval -> calculate interval based on time range
-	sql = strings.ReplaceAll(sql, "$__interval", calculateInterval(timeRange.To.Sub(timeRange.From)))
-
-	// $__timeGroup(column, interval) -> epoch-based bucketing
-	// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
-	// causing GROUP BY to produce per-second rows instead of proper hourly buckets.
-	// Epoch math avoids this entirely.
-	sql = expandTimeGroup(sql)
-
-	return sql
+	return applyMacrosWith(sql, timeRange.From, timeRange.To, timeRange.To.Sub(timeRange.From))
 }
 
-// ApplyMacrosWithSplit replaces macros using the chunk's time range for filtering
-// but the original full range for $__interval calculation (so bucket sizes stay consistent)
+// ApplyMacrosWithSplit replaces macros using the chunk's time range for
+// `$__timeFilter`/`$__timeFrom`/`$__timeTo`, but the ORIGINAL range for
+// `$__interval` so bucket sizes stay consistent across chunks.
 func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange backend.TimeRange) string {
-	// $__timeFilter uses chunk boundaries
-	sql = expandTimeFilter(sql, chunk.From, chunk.To)
+	return applyMacrosWith(sql, chunk.From, chunk.To, originalRange.To.Sub(originalRange.From))
+}
 
-	// $__timeFrom/$__timeTo use chunk boundaries
-	sql = strings.ReplaceAll(sql, "$__timeFrom()", fmt.Sprintf("'%s'", chunk.From.Format(time.RFC3339)))
-	sql = strings.ReplaceAll(sql, "$__timeTo()", fmt.Sprintf("'%s'", chunk.To.Format(time.RFC3339)))
-
-	// $__interval uses the ORIGINAL range so bucket sizes are consistent across all chunks
-	sql = strings.ReplaceAll(sql, "$__interval", calculateInterval(originalRange.To.Sub(originalRange.From)))
-
+// applyMacrosWith routes EVERY macro through literal-and-comment-aware
+// walkers (R2-CR5): the previous implementation used `strings.ReplaceAll`
+// for `$__timeFrom()`, `$__timeTo()`, and `$__interval`, which rewrote macro
+// text inside string literals (`WHERE msg = 'see $__timeFrom()'` mangled the
+// literal). All five Grafana macros now share the same safety.
+func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuration time.Duration) string {
+	sql = expandTimeFilter(sql, filterFrom, filterTo)
+	sql = replaceLiteralAwareTokens(sql, "$__timeFrom()", fmt.Sprintf("'%s'", filterFrom.Format(time.RFC3339)))
+	sql = replaceLiteralAwareTokens(sql, "$__timeTo()", fmt.Sprintf("'%s'", filterTo.Format(time.RFC3339)))
+	sql = replaceLiteralAwareTokens(sql, "$__interval", calculateInterval(intervalDuration))
+	// $__timeGroup(column, interval) -> epoch-based bucketing
+	// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
+	// causing GROUP BY to produce per-second rows. Epoch math avoids this.
 	sql = expandTimeGroup(sql)
-
 	return sql
 }
 

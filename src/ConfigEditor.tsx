@@ -64,6 +64,16 @@ export function ConfigEditor(props: Props) {
     });
   };
 
+  const onAllowDatabaseOverrideChange = (event: ChangeEvent<HTMLInputElement>) => {
+    onOptionsChange({
+      ...options,
+      jsonData: {
+        ...jsonData,
+        allowDatabaseOverride: event.target.checked,
+      },
+    });
+  };
+
   // Max Concurrency change handler
   const onMaxConcurrencyChange = (event: ChangeEvent<HTMLInputElement>) => {
     const val = parseInt(event.target.value, 10);
@@ -191,6 +201,17 @@ export function ConfigEditor(props: Props) {
         <Switch
           value={jsonData.allowPrivateIPs ?? false}
           onChange={onAllowPrivateIPsChange}
+        />
+      </InlineField>
+
+      <InlineField
+        label="Allow Database Override"
+        labelWidth={20}
+        tooltip="Permit per-query 'database' field to override this datasource's default database. Off by default — without this, a dashboard editor could switch databases on a datasource configured for a single tenant. Enable only if the API key's authorization scope matches dashboard-editor permissions."
+      >
+        <Switch
+          value={jsonData.allowDatabaseOverride ?? false}
+          onChange={onAllowDatabaseOverrideChange}
         />
       </InlineField>
 

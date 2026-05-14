@@ -82,18 +82,30 @@ func stripStringLiteralsAndComments(sql string) string {
 	return out.String()
 }
 
-// containsLIMIT reports whether the (stripped, uppercase) SQL has a LIMIT
-// clause. Note this can match a LIMIT inside a subquery — conservative on
-// purpose: skipping splitting is always correct, just slower.
+// limitRe matches a LIMIT clause anywhere in the (stripped) SQL —
+// whitespace-bounded on both sides so `WHERE\nLIMIT 100`, `WHERE\tLIMIT 100`,
+// and end-of-string `LIMIT 100` all match. Previously the substring check
+// required a literal " LIMIT " with single ASCII spaces, missing newline-
+// and tab-separated forms (R2-CR3 — splitting was NOT skipped, returning
+// N×LIMIT rows for a LIMIT-N query).
+var limitRe = regexp.MustCompile(`(?i)\bLIMIT\s+\d`)
+
+// unionRe matches the UNION keyword bounded by whitespace on both sides.
+// Same whitespace-fragility fix as limitRe.
+var unionRe = regexp.MustCompile(`(?i)\bUNION\b`)
+
+// containsLIMIT reports whether the SQL has a LIMIT clause. Note this can
+// match a LIMIT inside a subquery — conservative on purpose: skipping
+// splitting is always correct, just slower.
 func containsLIMIT(s strippedSQL) bool {
-	return strings.Contains(s.upper, " LIMIT ")
+	return limitRe.MatchString(s.stripped)
 }
 
 // containsUnion reports whether the SQL contains a UNION operator. Macro
 // expansion in multi-statement queries produces mangled SQL when split, so
 // we conservatively skip splitting on UNION.
 func containsUnion(s strippedSQL) bool {
-	return strings.Contains(s.upper, " UNION ")
+	return unionRe.MatchString(s.stripped)
 }
 
 // hasTimeFilterMacro reports whether the SQL uses one of the time macros in

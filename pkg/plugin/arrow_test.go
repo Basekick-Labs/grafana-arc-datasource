@@ -238,6 +238,48 @@ func TestAppendRecordToDataFrame_String(t *testing.T) {
 	}
 }
 
+// TestAppendRecordToDataFrame_NonNullableSchemaWithNullsIsSafe locks in
+// R2-CR2: a non-nullable Arrow column declaration that actually contains
+// null entries must NOT surface stale buffer memory. Before the fix, the
+// writer's non-nullable branch skipped the IsNull check entirely and emitted
+// undefined bytes at null positions.
+func TestAppendRecordToDataFrame_NonNullableSchemaWithNullsIsSafe(t *testing.T) {
+	pool := memory.NewGoAllocator()
+
+	// Schema declares non-nullable (Arc does this for some aggregates) but the
+	// builder will inject a null via the validity bitmap.
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "v", Type: arrow.PrimitiveTypes.Float64, Nullable: false},
+	}, nil)
+
+	b := array.NewRecordBuilder(pool, schema)
+	defer b.Release()
+	b.Field(0).(*array.Float64Builder).AppendValues([]float64{1.0, 0.0, 3.0}, []bool{true, false, true})
+	rec := b.NewRecord()
+	defer rec.Release()
+
+	frame := newFrameFromArrowSchema(schema)
+	if err := appendRecordToDataFrame(frame, rec); err != nil {
+		t.Fatalf("appendRecordToDataFrame: %v", err)
+	}
+	// Field must be created as nullable (*float64) regardless of the schema's
+	// non-nullable claim — see createEmptyField comment.
+	if frame.Fields[0].Type() != data.FieldTypeNullableFloat64 {
+		t.Fatalf("expected nullable float64 field, got %s", frame.Fields[0].Type())
+	}
+	// Row 1 must be nil (the source said null) — NOT whatever happened to be
+	// in the Arrow buffer at offset 1.
+	if v := frame.Fields[0].At(1).(*float64); v != nil {
+		t.Errorf("row 1 should be nil (source is null), got %v", *v)
+	}
+	if v := frame.Fields[0].At(0).(*float64); v == nil || *v != 1.0 {
+		t.Errorf("row 0 should be 1.0, got %v", v)
+	}
+	if v := frame.Fields[0].At(2).(*float64); v == nil || *v != 3.0 {
+		t.Errorf("row 2 should be 3.0, got %v", v)
+	}
+}
+
 // TestNewFrameFromArrowSchema_AllTypes locks in the schema-to-field type
 // mapping, including the int64/uint64 → float64 promotion.
 func TestNewFrameFromArrowSchema_AllTypes(t *testing.T) {

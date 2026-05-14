@@ -71,13 +71,14 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     return "'" + value.replace(/'/g, "''") + "'";
   }
 
-  interpolateVariable = (value: string | string[] | number, variable: VariableWithMultiSupport) => {
+  interpolateVariable = (value: string | string[] | number, _variable: VariableWithMultiSupport) => {
     if (typeof value === 'string') {
-      if (variable?.multi || variable?.includeAll) {
-        return this.quoteLiteral(value);
-      } else {
-        return String(value).replace(/'/g, "''");
-      }
+      // R2-HI5: always quote single-value strings. Previously this branch
+      // doubled embedded `'` but returned the value without surrounding
+      // quotes — `WHERE host = $foo` with `?var-foo=1 OR 1=1--` produced a
+      // URL-driven SQL injection with the API key's full scope. Matches the
+      // Postgres datasource which quotes unconditionally.
+      return this.quoteLiteral(value);
     }
 
     if (typeof value === 'number') {

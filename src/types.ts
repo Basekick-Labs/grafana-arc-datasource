@@ -16,6 +16,14 @@ export interface ArcDataSourceOptions extends DataSourceJsonData {
    * Arc is deployed on an internal corporate network.
    */
   allowPrivateIPs?: boolean;
+  /**
+   * Permit per-query `database` field to override the datasource default.
+   * Off by default — without this, a dashboard editor could switch databases
+   * on a datasource the admin configured for a single tenant (confused-deputy
+   * if the Arc API key has cross-database scope). Enable only when the API
+   * key's authorization scope matches the dashboard-editor's authorization.
+   */
+  allowDatabaseOverride?: boolean;
 }
 
 /**

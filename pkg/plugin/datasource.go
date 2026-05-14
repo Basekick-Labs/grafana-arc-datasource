@@ -1,10 +1,12 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"runtime/debug"
 	"sort"
@@ -18,16 +20,18 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 // ArcDataSourceSettings contains Arc connection settings
 type ArcDataSourceSettings struct {
-	URL             string `json:"url"`
-	Database        string `json:"database"`
-	Timeout         int    `json:"timeout"`         // seconds
-	UseArrow        *bool  `json:"useArrow"`        // pointer so unset (fresh install) is distinguishable from explicit false
-	MaxConcurrency  int    `json:"maxConcurrency"`  // max parallel chunks for query splitting (default 4)
-	AllowPrivateIPs bool   `json:"allowPrivateIPs"` // opt-in: permit Arc URL to resolve to RFC1918/private addresses (corporate intranets)
+	URL                   string `json:"url"`
+	Database              string `json:"database"`
+	Timeout               int    `json:"timeout"`               // seconds
+	UseArrow              *bool  `json:"useArrow"`              // pointer so unset (fresh install) is distinguishable from explicit false
+	MaxConcurrency        int    `json:"maxConcurrency"`        // max parallel chunks for query splitting (default 4)
+	AllowPrivateIPs       bool   `json:"allowPrivateIPs"`       // opt-in: permit Arc URL to resolve to RFC1918/private addresses (corporate intranets)
+	AllowDatabaseOverride bool   `json:"allowDatabaseOverride"` // opt-in: permit per-query `database` field to override the datasource default (R2-HI6 confused-deputy guard)
 }
 
 // ArcQuery represents a query to Arc
@@ -47,10 +51,18 @@ type ArcQuery struct {
 // edited. The embedded *http.Client is shared so connection pooling and TLS
 // session resumption work — building a fresh client per query (the pre-P3
 // shape) defeated both.
+//
+// `sem` is a shared weighted semaphore that bounds total in-flight Arc HTTP
+// requests across BOTH the refId fan-out (QueryData) and the chunk fan-out
+// (inside query()) — see R2-CR1. Previously each level had its own
+// errgroup.SetLimit(MaxConcurrency), so a 6-panel × 4-chunk dashboard ran
+// 24 in-flight requests, not 4. The semaphore is acquired before the HTTP
+// dial and released after the response is fully read.
 type ArcInstanceSettings struct {
 	settings ArcDataSourceSettings
 	apiKey   string
 	client   *http.Client
+	sem      *semaphore.Weighted
 }
 
 // Dispose is called by the InstanceManager when the cached instance is being
@@ -62,6 +74,86 @@ func (s *ArcInstanceSettings) Dispose() {
 			t.CloseIdleConnections()
 		}
 	}
+}
+
+// semReleasingReader wraps an io.ReadCloser so the body Close() releases the
+// instance's shared concurrency semaphore. Used by doRequest so callers can
+// stream-decode the body (Arrow IPC, JSON) while keeping the concurrency
+// slot held for the full duration of the response read.
+type semReleasingReader struct {
+	io.ReadCloser
+	release func()
+	once    sync.Once
+}
+
+func (r *semReleasingReader) Close() error {
+	err := r.ReadCloser.Close()
+	r.once.Do(r.release)
+	return err
+}
+
+// doRequest POSTs a JSON body to the given Arc API path and returns the
+// response body wrapped in a size-cap reader and a concurrency-slot
+// release-on-close. Callers MUST Close() the returned ReadCloser exactly
+// once — on close the shared semaphore slot is released so other in-flight
+// queries can proceed.
+//
+// The semaphore (R2-CR1) is acquired BEFORE the HTTP dial so both the
+// refId fan-out and the chunk fan-out queue through the same per-instance
+// MaxConcurrency limit — eliminating the multiplicative blow-up where
+// 4×4=16 in-flight requests masqueraded as MaxConcurrency=4.
+//
+// Collapses the previous ~50-line duplication between queryArrow and
+// queryJSON (R2-HI10).
+func (s *ArcInstanceSettings) doRequest(ctx context.Context, path string, body any) (io.ReadCloser, error) {
+	jsonData, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	url := s.settings.URL + path
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	if s.settings.Database != "" {
+		req.Header.Set("X-Arc-Database", s.settings.Database)
+	}
+
+	if err := s.sem.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	released := false
+	defer func() {
+		if !released {
+			s.sem.Release(1)
+		}
+	}()
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, formatRequestError(err)
+	}
+
+	capped := http.MaxBytesReader(nil, resp.Body, MaxResponseBytes)
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(capped)
+		_ = resp.Body.Close()
+		return nil, errors.New(parseArcError(resp.StatusCode, raw))
+	}
+
+	// Transfer ownership of the semaphore slot to the returned reader —
+	// release happens when the caller closes the body.
+	released = true
+	return &semReleasingReader{
+		ReadCloser: struct {
+			io.Reader
+			io.Closer
+		}{Reader: capped, Closer: resp.Body},
+		release: func() { s.sem.Release(1) },
+	}, nil
 }
 
 // ArcDatasource implements the Grafana datasource interface. The im field
@@ -121,6 +213,7 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	inst := &ArcInstanceSettings{
 		settings: dsSettings,
 		apiKey:   apiKey,
+		sem:      semaphore.NewWeighted(int64(dsSettings.MaxConcurrency)),
 	}
 	inst.client = newHTTPClient(
 		time.Duration(dsSettings.Timeout)*time.Second,
@@ -146,10 +239,15 @@ func (d *ArcDatasource) getInstance(ctx context.Context, pluginCtx backend.Plugi
 }
 
 // QueryData handles query requests. RefIds within a single batch run
-// concurrently bounded by the datasource's MaxConcurrency (H4 / P8) — a
-// dashboard with 6 panels no longer pays the sum of their latencies. Each
-// refId is wrapped in a recover so a panic in one query fails only that
-// query, not the whole batch (C1).
+// concurrently; total in-flight HTTP requests are bounded by the shared
+// semaphore on ArcInstanceSettings (R2-CR1 — refId × chunk fan-outs no
+// longer multiply). Each refId is wrapped in a recover so a panic in one
+// query fails only that query, not the whole batch (C1).
+//
+// The errgroup is wired with ctx (R2-HI4 / gemini 3244629509): when Grafana
+// cancels the parent QueryDataRequest, the dispatch loop notices via
+// gctx.Done() and stops spawning new refId goroutines rather than queueing
+// MaxConcurrency more HTTP round-trips behind the SetLimit gate.
 func (d *ArcDatasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
 	response := backend.NewQueryDataResponse()
 
@@ -159,22 +257,25 @@ func (d *ArcDatasource) QueryData(ctx context.Context, req *backend.QueryDataReq
 	}
 
 	if len(req.Queries) <= 1 {
-		// Common case: one refId — no goroutine overhead.
 		for _, q := range req.Queries {
 			response.Responses[q.RefID] = d.queryWithRecover(ctx, settings, q)
 		}
 		return response, nil
 	}
 
-	var (
-		mu = sync.Mutex{}
-		g  errgroup.Group
-	)
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(settings.settings.MaxConcurrency)
 	for _, q := range req.Queries {
+		select {
+		case <-gctx.Done():
+			// Parent cancelled — stop dispatching, fall through to Wait so
+			// already-running refIds get to write their responses.
+		default:
+		}
 		q := q
 		g.Go(func() error {
-			res := d.queryWithRecover(ctx, settings, q)
+			res := d.queryWithRecover(gctx, settings, q)
 			mu.Lock()
 			response.Responses[q.RefID] = res
 			mu.Unlock()
@@ -314,8 +415,28 @@ func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceS
 	return queryJSON(ctx, settings, sql)
 }
 
+// frameSchemaCompatible returns true when `f` can be safely appended into
+// `merged`: same field count AND same field type per slot. The previous
+// check only compared counts, so a JSON-inference flip (chunk A typed col 2
+// as float64, chunk B typed it as string) silently passed the gate and
+// panicked inside the SDK's reflective Set (R2-HI2). The mismatch is now
+// reported via log and the chunk is skipped.
+func frameSchemaCompatible(merged, f *data.Frame) bool {
+	if f == nil || len(f.Fields) != len(merged.Fields) {
+		return false
+	}
+	for i, dst := range merged.Fields {
+		if f.Fields[i].Type() != dst.Type() {
+			return false
+		}
+	}
+	return true
+}
+
 // mergeFrames appends rows from all chunk frames into a single frame.
-// Skips frames with incompatible schemas (different field count) to avoid panics.
+// Skips frames with incompatible schemas (different field count OR different
+// field types per slot — R2-HI2) and logs the skip so the operator can see
+// the result is partial.
 // Pre-allocates capacity to avoid O(n²) re-allocation from row-by-row appends.
 func mergeFrames(frames []*data.Frame) *data.Frame {
 	if len(frames) == 0 {
@@ -339,12 +460,15 @@ func mergeFrames(frames []*data.Frame) *data.Frame {
 		return frames[0]
 	}
 
-	expectedFields := len(merged.Fields)
+	skipped := 0
 
-	// Count total rows to add so we can pre-allocate
+	// Count total rows to add so we can pre-allocate.
 	additionalRows := 0
 	for _, f := range frames[startIdx:] {
-		if f == nil || len(f.Fields) != expectedFields {
+		if !frameSchemaCompatible(merged, f) {
+			if f != nil {
+				skipped++
+			}
 			continue
 		}
 		rowLen, err := f.RowLen()
@@ -354,20 +478,25 @@ func mergeFrames(frames []*data.Frame) *data.Frame {
 		additionalRows += rowLen
 	}
 
+	if skipped > 0 {
+		log.DefaultLogger.Warn("mergeFrames skipped chunks with incompatible schema",
+			"skipped", skipped, "kept", len(frames)-skipped)
+	}
+
 	if additionalRows == 0 {
 		return merged
 	}
 
-	// Pre-extend all fields to avoid repeated re-allocation
+	// Pre-extend all fields to avoid repeated re-allocation.
 	baseRows := merged.Rows()
 	for _, field := range merged.Fields {
 		field.Extend(additionalRows)
 	}
 
-	// Copy data using Set (single allocation, no per-row realloc)
+	// Copy data using Set (single allocation, no per-row realloc).
 	writeIdx := baseRows
 	for _, f := range frames[startIdx:] {
-		if f == nil || len(f.Fields) != expectedFields {
+		if !frameSchemaCompatible(merged, f) {
 			continue
 		}
 		rowLen, err := f.RowLen()
@@ -375,7 +504,7 @@ func mergeFrames(frames []*data.Frame) *data.Frame {
 			continue
 		}
 		for i := 0; i < rowLen; i++ {
-			for fieldIdx := 0; fieldIdx < expectedFields; fieldIdx++ {
+			for fieldIdx := 0; fieldIdx < len(merged.Fields); fieldIdx++ {
 				merged.Fields[fieldIdx].Set(writeIdx, f.Fields[fieldIdx].CopyAt(i))
 			}
 			writeIdx++
@@ -388,28 +517,37 @@ func mergeFrames(frames []*data.Frame) *data.Frame {
 func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings, query backend.DataQuery) backend.DataResponse {
 	var response backend.DataResponse
 
-	// Parse query model
 	var qm ArcQuery
 	if err := json.Unmarshal(query.JSON, &qm); err != nil {
-		return backend.ErrDataResponse(backend.StatusBadRequest, fmt.Sprintf("failed to unmarshal query: %v", err))
+		// Sanitize: raw json error can include byte offsets and snippets of
+		// the user-supplied JSON (R2-HI3).
+		return backend.ErrDataResponse(backend.StatusBadRequest, sanitizeUserError(query.RefID, err))
 	}
 
 	qm.RefID = query.RefID
 
-	// Migrate rawSql from Postgres/MySQL/MSSQL/ClickHouse datasources
+	// Migrate rawSql from Postgres/MySQL/MSSQL/ClickHouse datasources.
 	if qm.SQL == "" && qm.RawSQL != "" {
 		qm.SQL = qm.RawSQL
 	}
 
-	// Per-query database override: shallow-copy the cached instance so the
-	// override applies only to this query without mutating the shared
-	// settings struct. The copy shares the underlying *http.Client (correct
-	// — connection pooling applies across databases on the same Arc URL) and
-	// the apiKey (the same key authorizes both DBs by design). If
-	// ArcInstanceSettings ever grows a mutex, this pattern needs revisiting.
-	if qm.Database != "" {
+	// Per-query database override (R2-HI6 — confused-deputy guard):
+	// permitted only when the admin has opted in via AllowDatabaseOverride.
+	// Otherwise a dashboard editor could switch databases on a datasource
+	// the admin configured for a single tenant. The shallow-copy preserves
+	// the cached *http.Client and apiKey while scoping the change to this
+	// one query.
+	if qm.Database != "" && qm.Database != settings.settings.Database {
+		if !settings.settings.AllowDatabaseOverride {
+			log.DefaultLogger.Warn("per-query database override rejected — not enabled in datasource settings",
+				"refId", qm.RefID, "requested", qm.Database, "configured", settings.settings.Database)
+			return backend.ErrDataResponse(backend.StatusBadRequest,
+				"per-query database override is not enabled — toggle 'Allow Database Override' in datasource settings")
+		}
 		if err := validateDatabaseName(qm.Database); err != nil {
-			return backend.ErrDataResponse(backend.StatusBadRequest, err.Error())
+			// Sanitize via the user-error helper rather than echoing the raw
+			// validator error (which embeds %q of the offending name) (R2-HI3).
+			return backend.ErrDataResponse(backend.StatusBadRequest, sanitizeUserError(qm.RefID, err))
 		}
 		overridden := *settings
 		overridden.settings.Database = qm.Database
@@ -481,6 +619,17 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		g.Go(func() (err error) {
 			defer func() {
 				if r := recover(); r != nil {
+					// Mirror queryWithRecover: log the full stack trace
+					// server-side so an operator has a diagnostic trail; the
+					// returned error stays brief and goes through sanitizer
+					// before reaching the user (R2-HI1).
+					log.DefaultLogger.Error("panic in chunk goroutine",
+						"refId", qm.RefID,
+						"chunk_from", chunk.From.Format("2006-01-02 15:04"),
+						"chunk_to", chunk.To.Format("2006-01-02 15:04"),
+						"panic", fmt.Sprintf("%v", r),
+						"stack", string(debug.Stack()),
+					)
 					err = fmt.Errorf("[chunk %s to %s] panic: %v",
 						chunk.From.Format("2006-01-02 15:04"),
 						chunk.To.Format("2006-01-02 15:04"), r)
