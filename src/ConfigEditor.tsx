@@ -1,124 +1,88 @@
 import React, { ChangeEvent } from 'react';
-import { InlineField, Input, SecretInput, Switch } from '@grafana/ui';
-import { DataSourcePluginOptionsEditorProps } from '@grafana/data';
+import { InlineField, Input, SecretInput, Switch, useStyles2 } from '@grafana/ui';
+import { DataSourcePluginOptionsEditorProps, GrafanaTheme2 } from '@grafana/data';
+import { css } from '@emotion/css';
 import { ArcDataSourceOptions, ArcSecureJsonData } from './types';
 
 interface Props extends DataSourcePluginOptionsEditorProps<ArcDataSourceOptions, ArcSecureJsonData> {}
 
+// Label width sized for the longest label ("Allow Database Override").
+// Previously labelWidth={20} chopped that string, the label wrapped onto two
+// lines, and the toggle slid out of horizontal alignment with the rows above.
+const LABEL_WIDTH = 26;
+const INPUT_WIDTH = 40;
+
 export function ConfigEditor(props: Props) {
   const { onOptionsChange, options } = props;
   const { jsonData, secureJsonFields, secureJsonData } = options;
+  const styles = useStyles2(getStyles);
 
-  // URL change handler
   const onURLChange = (event: ChangeEvent<HTMLInputElement>) => {
-    onOptionsChange({
-      ...options,
-      jsonData: {
-        ...jsonData,
-        url: event.target.value,
-      },
-    });
+    onOptionsChange({ ...options, jsonData: { ...jsonData, url: event.target.value } });
   };
 
-  // Database change handler
   const onDatabaseChange = (event: ChangeEvent<HTMLInputElement>) => {
-    onOptionsChange({
-      ...options,
-      jsonData: {
-        ...jsonData,
-        database: event.target.value,
-      },
-    });
+    onOptionsChange({ ...options, jsonData: { ...jsonData, database: event.target.value } });
   };
 
-  // Timeout change handler
-  const onTimeoutChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const timeout = parseInt(event.target.value, 10);
-    onOptionsChange({
-      ...options,
-      jsonData: {
-        ...jsonData,
-        timeout: isNaN(timeout) ? 30 : timeout,
-      },
-    });
-  };
+  // Numeric handlers split into onChange / onBlur so the user can clear
+  // an input and type a new value without `parseInt('') → NaN` snapping
+  // the field back to the default mid-keystroke.
+  //
+  // onChange: store whatever parses cleanly OR `undefined` if the input
+  //   is empty/invalid. The Input displays the user's raw text via the
+  //   placeholder fallback so typing flows naturally.
+  // onBlur: clamp to the field's minimum + apply the default if the
+  //   user left the input empty or below 1. Persists the final value.
+  const handleNumericChange =
+    (key: 'timeout' | 'maxConcurrency' | 'maxResponseMB') =>
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const parsed = parseInt(event.target.value, 10);
+      const next = isNaN(parsed) ? undefined : parsed;
+      onOptionsChange({ ...options, jsonData: { ...jsonData, [key]: next } });
+    };
 
-  // Use Arrow toggle handler
+  const handleNumericBlur =
+    (key: 'timeout' | 'maxConcurrency' | 'maxResponseMB', fallback: number) =>
+    () => {
+      const current = jsonData[key];
+      if (current === undefined || current === null || current < 1) {
+        onOptionsChange({ ...options, jsonData: { ...jsonData, [key]: fallback } });
+      }
+    };
+
+  const onTimeoutChange = handleNumericChange('timeout');
+  const onTimeoutBlur = handleNumericBlur('timeout', 30);
+  const onMaxConcurrencyChange = handleNumericChange('maxConcurrency');
+  const onMaxConcurrencyBlur = handleNumericBlur('maxConcurrency', 4);
+  const onMaxResponseMBChange = handleNumericChange('maxResponseMB');
+  const onMaxResponseMBBlur = handleNumericBlur('maxResponseMB', 1024);
+
   const onUseArrowChange = (event: ChangeEvent<HTMLInputElement>) => {
-    onOptionsChange({
-      ...options,
-      jsonData: {
-        ...jsonData,
-        useArrow: event.target.checked,
-      },
-    });
+    onOptionsChange({ ...options, jsonData: { ...jsonData, useArrow: event.target.checked } });
   };
 
   const onAllowPrivateIPsChange = (event: ChangeEvent<HTMLInputElement>) => {
-    onOptionsChange({
-      ...options,
-      jsonData: {
-        ...jsonData,
-        allowPrivateIPs: event.target.checked,
-      },
-    });
+    onOptionsChange({ ...options, jsonData: { ...jsonData, allowPrivateIPs: event.target.checked } });
   };
 
   const onAllowDatabaseOverrideChange = (event: ChangeEvent<HTMLInputElement>) => {
-    onOptionsChange({
-      ...options,
-      jsonData: {
-        ...jsonData,
-        allowDatabaseOverride: event.target.checked,
-      },
-    });
+    onOptionsChange({ ...options, jsonData: { ...jsonData, allowDatabaseOverride: event.target.checked } });
   };
 
-  // Max Concurrency change handler
-  const onMaxConcurrencyChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const val = parseInt(event.target.value, 10);
-    onOptionsChange({
-      ...options,
-      jsonData: {
-        ...jsonData,
-        maxConcurrency: isNaN(val) || val < 1 ? 4 : val,
-      },
-    });
-  };
-
-  const onMaxResponseMBChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const val = parseInt(event.target.value, 10);
-    onOptionsChange({
-      ...options,
-      jsonData: {
-        ...jsonData,
-        maxResponseMB: isNaN(val) || val < 1 ? 1024 : val,
-      },
-    });
-  };
-
-  // API Key change handler
   const onAPIKeyChange = (event: ChangeEvent<HTMLInputElement>) => {
-    onOptionsChange({
-      ...options,
-      secureJsonData: {
-        apiKey: event.target.value,
-      },
-    });
+    // Spread existing secureJsonData rather than overwrite. Currently
+    // `apiKey` is the only secure field, but if another lands later the
+    // overwrite form would silently drop it on every keystroke in the API
+    // key input. `onResetAPIKey` below already uses this pattern.
+    onOptionsChange({ ...options, secureJsonData: { ...secureJsonData, apiKey: event.target.value } });
   };
 
-  // API Key reset handler
   const onResetAPIKey = () => {
     onOptionsChange({
       ...options,
-      secureJsonFields: {
-        ...secureJsonFields,
-        apiKey: false,
-      },
-      secureJsonData: {
-        ...secureJsonData,
-        apiKey: '',
-      },
+      secureJsonFields: { ...secureJsonFields, apiKey: false },
+      secureJsonData: { ...secureJsonData, apiKey: '' },
     });
   };
 
@@ -126,22 +90,18 @@ export function ConfigEditor(props: Props) {
     <div className="gf-form-group">
       <h3 className="page-heading">Arc Connection</h3>
 
-      <InlineField label="URL" labelWidth={20} tooltip="Arc API base URL (e.g., http://localhost:8000)">
+      <InlineField label="URL" labelWidth={LABEL_WIDTH} tooltip="Arc API base URL (e.g., http://localhost:8000)">
         <Input
-          width={40}
+          width={INPUT_WIDTH}
           value={jsonData.url || ''}
           placeholder="http://localhost:8000"
           onChange={onURLChange}
         />
       </InlineField>
 
-      <InlineField
-        label="API Key"
-        labelWidth={20}
-        tooltip="Arc authentication token with read permissions"
-      >
+      <InlineField label="API Key" labelWidth={LABEL_WIDTH} tooltip="Arc authentication token with read permissions">
         <SecretInput
-          width={40}
+          width={INPUT_WIDTH}
           isConfigured={secureJsonFields?.apiKey || false}
           value={secureJsonData?.apiKey || ''}
           placeholder="Your Arc API key"
@@ -152,11 +112,11 @@ export function ConfigEditor(props: Props) {
 
       <InlineField
         label="Database"
-        labelWidth={20}
+        labelWidth={LABEL_WIDTH}
         tooltip="Default database/schema name (optional, defaults to 'default')"
       >
         <Input
-          width={40}
+          width={INPUT_WIDTH}
           value={jsonData.database || 'default'}
           placeholder="default"
           onChange={onDatabaseChange}
@@ -165,92 +125,90 @@ export function ConfigEditor(props: Props) {
 
       <h3 className="page-heading">Advanced Settings</h3>
 
-      <InlineField
-        label="Timeout"
-        labelWidth={20}
-        tooltip="Query timeout in seconds"
-      >
+      <InlineField label="Timeout" labelWidth={LABEL_WIDTH} tooltip="Query timeout in seconds">
         <Input
-          width={40}
+          width={INPUT_WIDTH}
           type="number"
-          value={jsonData.timeout || 30}
+          value={jsonData.timeout ?? ''}
           placeholder="30"
           onChange={onTimeoutChange}
+          onBlur={onTimeoutBlur}
         />
       </InlineField>
 
       <InlineField
         label="Max Concurrency"
-        labelWidth={20}
+        labelWidth={LABEL_WIDTH}
         tooltip="Maximum parallel chunks for query splitting. Each Grafana panel can spawn up to this many concurrent Arc requests. Lower values reduce Arc load in multi-user deployments."
       >
         <Input
-          width={40}
+          width={INPUT_WIDTH}
           type="number"
-          value={jsonData.maxConcurrency || 4}
+          value={jsonData.maxConcurrency ?? ''}
           placeholder="4"
           onChange={onMaxConcurrencyChange}
+          onBlur={onMaxConcurrencyBlur}
         />
       </InlineField>
 
       <InlineField
         label="Max Response MB"
-        labelWidth={20}
+        labelWidth={LABEL_WIDTH}
         tooltip="Maximum response body size in MiB. Default 1024 (1 GiB). Raise for very large analytical queries — Arc emits 'Arrow IPC stream truncated' errors when the cap is hit mid-stream. Lower bounds defense against runaway queries OOMing the plugin."
       >
         <Input
-          width={40}
+          width={INPUT_WIDTH}
           type="number"
-          value={jsonData.maxResponseMB || 1024}
+          value={jsonData.maxResponseMB ?? ''}
           placeholder="1024"
           onChange={onMaxResponseMBChange}
+          onBlur={onMaxResponseMBBlur}
         />
       </InlineField>
 
       <InlineField
         label="Use Arrow Protocol"
-        labelWidth={20}
-        tooltip="Enable Apache Arrow for faster data transfer (recommended)"
+        labelWidth={LABEL_WIDTH}
+        tooltip="Apache Arrow is a columnar binary format. 3–5x faster than JSON on the wire and on the plugin's decode hot path. Keep enabled unless debugging."
       >
-        <Switch
-          value={jsonData.useArrow ?? true}
-          onChange={onUseArrowChange}
-        />
+        <div className={styles.switchCell}>
+          <Switch value={jsonData.useArrow ?? true} onChange={onUseArrowChange} />
+        </div>
       </InlineField>
 
       <InlineField
         label="Allow Private IPs"
-        labelWidth={20}
+        labelWidth={LABEL_WIDTH}
         tooltip="Permit the Arc URL to resolve to private/RFC1918 addresses (e.g. 10.x, 192.168.x). Off by default — enable when Arc is deployed on an internal corporate network. Loopback (localhost) is always permitted when configured directly."
       >
-        <Switch
-          value={jsonData.allowPrivateIPs ?? false}
-          onChange={onAllowPrivateIPsChange}
-        />
+        <div className={styles.switchCell}>
+          <Switch value={jsonData.allowPrivateIPs ?? false} onChange={onAllowPrivateIPsChange} />
+        </div>
       </InlineField>
 
       <InlineField
         label="Allow Database Override"
-        labelWidth={20}
+        labelWidth={LABEL_WIDTH}
         tooltip="Permit per-query 'database' field to override this datasource's default database. Off by default — without this, a dashboard editor could switch databases on a datasource configured for a single tenant. Enable only if the API key's authorization scope matches dashboard-editor permissions."
       >
-        <Switch
-          value={jsonData.allowDatabaseOverride ?? false}
-          onChange={onAllowDatabaseOverrideChange}
-        />
-      </InlineField>
-
-      <div className="gf-form-group">
-        <div className="gf-form">
-          <label className="gf-form-label width-20"></label>
-          <div className="gf-form-label">
-            <small style={{ color: '#999' }}>
-              Arrow protocol provides 3-5x better performance compared to JSON.
-              Keep enabled unless debugging.
-            </small>
-          </div>
+        <div className={styles.switchCell}>
+          <Switch value={jsonData.allowDatabaseOverride ?? false} onChange={onAllowDatabaseOverrideChange} />
         </div>
-      </div>
+      </InlineField>
     </div>
   );
 }
+
+// `InlineField` hardcodes `align-items: flex-start`, leaving the Switch
+// sitting at the top edge of the row instead of vertically centered against
+// the label. The label is `theme.spacing(4)` tall (line-height padding); the
+// Switch is half that. The wrapper centers the Switch within the cell.
+// Matches the useStyles2 pattern in QueryEditor / VariableQueryEditor and
+// adapts to theme changes (light/dark mode) automatically.
+const getStyles = (theme: GrafanaTheme2) => ({
+  switchCell: css({
+    display: 'flex',
+    alignItems: 'center',
+    height: theme.spacing(4),
+  }),
+});
