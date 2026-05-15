@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,19 +13,42 @@ import (
 	"github.com/magefile/mage/sh"
 )
 
-// PluginName matches plugin.json#executable. The Grafana plugin SDK loader
-// expects backend binaries at `dist/<PluginName>_<os>_<arch>` (flat, with the
-// executable-name prefix). Anything else is silently rejected with the error
-// `Could not start plugin backend: fork/exec dist/...: no such file or
-// directory` — see R2-CR6 in docs/progress/2026-05-14-signing-readiness.md.
-const PluginName = "gpx_arc"
+// pluginName resolves the backend executable name from plugin.json's
+// `executable` field — single source of truth. The Grafana plugin SDK
+// loader expects backend binaries at `dist/<executable>_<os>_<arch>`
+// (flat, with the executable-name prefix). Anything else is silently
+// rejected with `Could not start plugin backend: fork/exec dist/...:
+// no such file or directory` — see R2-CR6 in
+// docs/progress/2026-05-14-signing-readiness.md.
+//
+// Reading dynamically avoids the drift hazard from a hardcoded const
+// whose plugin.json counterpart could be edited independently. Falls
+// back to "gpx_arc" only if plugin.json is missing/malformed so a
+// stripped-down checkout (or an early bootstrap) still produces a
+// recognizable filename.
+func pluginName() string {
+	const fallback = "gpx_arc"
+	data, err := os.ReadFile("plugin.json")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warn: could not read plugin.json (%v); using fallback executable name %q\n", err, fallback)
+		return fallback
+	}
+	var meta struct {
+		Executable string `json:"executable"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil || meta.Executable == "" {
+		fmt.Fprintf(os.Stderr, "warn: could not parse plugin.json#executable; using fallback %q\n", fallback)
+		return fallback
+	}
+	return meta.Executable
+}
 
 // Default target runs when `mage` is invoked with no arguments.
 var Default = Build
 
 // Build builds the backend plugin for the current platform.
 //
-// The output goes to `dist/<PluginName>_<os>_<arch>` (matching Grafana SDK
+// The output goes to `dist/<plugin.json#executable>_<os>_<arch>` (matching Grafana SDK
 // loader expectations). Does NOT call Clean — the frontend bundle in `dist/`
 // from a previous `npm run build` is preserved. If you want a fully fresh
 // rebuild, run `mage clean` explicitly first.
@@ -36,7 +60,7 @@ func Build() error {
 // BuildAll builds backend binaries for every platform Grafana ships on. Same
 // no-Clean behavior as Build (preserves the frontend bundle).
 //
-// Outputs to `dist/<PluginName>_<os>_<arch>` (and `.exe` on Windows) per
+// Outputs to `dist/<plugin.json#executable>_<os>_<arch>` (and `.exe` on Windows) per
 // Grafana SDK loader expectations (R2-CR6).
 func BuildAll() error {
 	platforms := []struct {
@@ -62,7 +86,7 @@ func BuildAll() error {
 // buildPlatform builds the backend binary for one OS/arch combination and
 // places it where the Grafana SDK loader expects to find it.
 func buildPlatform(goos, goarch string) error {
-	binary := fmt.Sprintf("%s_%s_%s", PluginName, goos, goarch)
+	binary := fmt.Sprintf("%s_%s_%s", pluginName(), goos, goarch)
 	if goos == "windows" {
 		binary += ".exe"
 	}
@@ -102,8 +126,8 @@ func buildPlatform(goos, goarch string) error {
 func Clean() error {
 	fmt.Println("Cleaning build artifacts...")
 	_ = sh.Rm("dist")
-	_ = sh.Rm(PluginName)
-	_ = sh.Rm(PluginName + ".exe")
+	_ = sh.Rm(pluginName())
+	_ = sh.Rm(pluginName() + ".exe")
 	return nil
 }
 
@@ -112,7 +136,7 @@ func Clean() error {
 // want to force a backend rebuild without re-running `npm run build`.
 func CleanBackend() error {
 	fmt.Println("Cleaning backend binaries from dist/...")
-	matches, err := filepath.Glob(filepath.Join("dist", PluginName+"_*"))
+	matches, err := filepath.Glob(filepath.Join("dist", pluginName()+"_*"))
 	if err != nil {
 		return err
 	}
@@ -121,15 +145,17 @@ func CleanBackend() error {
 			return err
 		}
 	}
-	_ = sh.Rm(PluginName)
-	_ = sh.Rm(PluginName + ".exe")
+	_ = sh.Rm(pluginName())
+	_ = sh.Rm(pluginName() + ".exe")
 	return nil
 }
 
-// Test runs the Go test suite.
+// Test runs the Go test suite across the whole module (./...) so any
+// future packages — internal/, cmd/, top-level helpers — are covered
+// without a Magefile edit. Matches `Fmt`'s scope.
 func Test() error {
 	fmt.Println("Running tests...")
-	return sh.RunV("go", "test", "-v", "./pkg/...")
+	return sh.RunV("go", "test", "-v", "./...")
 }
 
 // Fmt formats Go code.
@@ -138,10 +164,11 @@ func Fmt() error {
 	return sh.RunV("go", "fmt", "./...")
 }
 
-// Vet runs go vet against the plugin code.
+// Vet runs go vet across the whole module (./...). Same rationale as
+// Test — catches issues in any package, not just pkg/.
 func Vet() error {
 	fmt.Println("Running go vet...")
-	return sh.RunV("go", "vet", "./pkg/...")
+	return sh.RunV("go", "vet", "./...")
 }
 
 // Dev orchestrates a full development build: frontend bundle first (which
@@ -149,19 +176,20 @@ func Vet() error {
 // canonical iteration command — `mage dev` produces a complete dist/ tree
 // ready for symlinking into a Grafana plugins dir.
 //
-// Equivalent to `npm run build && mage build` in the correct order. The
-// order matters because webpack's `output.clean: true` wipes dist/ on every
-// frontend build; backend MUST run after.
+// The order matters because webpack's `output.clean: true` wipes dist/ on
+// every frontend build; backend MUST run after. `mg.SerialDeps` enforces
+// strict ordering AND lets Mage memoize each step so repeated `Dev`
+// invocations don't re-run completed targets.
 func Dev() error {
-	mg.SerialDeps(npmBuild)
-	return Build()
+	mg.SerialDeps(npmBuild, Build)
+	return nil
 }
 
 // DevAll orchestrates the release-shape build: frontend first, then every
-// platform's backend binary. Equivalent to `npm run build && mage buildAll`.
+// platform's backend binary. Same SerialDeps pattern as Dev.
 func DevAll() error {
-	mg.SerialDeps(npmBuild)
-	return BuildAll()
+	mg.SerialDeps(npmBuild, BuildAll)
+	return nil
 }
 
 // npmBuild runs the production webpack build. Webpack's `output.clean: true`
