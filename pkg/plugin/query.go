@@ -1,124 +1,127 @@
 package plugin
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
+	"net"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 )
 
-// parseArcError extracts a human-readable error from Arc's JSON error response.
-// Arc returns errors as: {"error": "message"} or plain text.
+// parseArcError extracts a human-readable error from Arc's JSON error
+// response. Arc returns errors as `{"error": "message"}` or plain text. Body
+// is truncated to maxErrorBodyBytes, backing off to the previous rune boundary
+// so the result is always valid UTF-8 even if the body byte-cap fell inside a
+// multi-byte sequence (L8 fix).
 func parseArcError(statusCode int, body []byte) string {
 	var parsed struct {
 		Error string `json:"error"`
 	}
 	if json.Unmarshal(body, &parsed) == nil && parsed.Error != "" {
-		return fmt.Sprintf("Arc error (HTTP %d): %s", statusCode, parsed.Error)
+		return fmt.Sprintf("Arc error (HTTP %d): %s", statusCode, truncateForLog(parsed.Error))
 	}
 	text := strings.TrimSpace(string(body))
-	if len(text) > 500 {
-		text = text[:500] + "..."
-	}
+	text = truncateForLog(text)
 	if text == "" {
 		return fmt.Sprintf("Arc returned HTTP %d with no error message", statusCode)
 	}
 	return fmt.Sprintf("Arc error (HTTP %d): %s", statusCode, text)
 }
 
-// formatRequestError converts Go HTTP client errors into user-friendly messages
-// while preserving the original error chain for programmatic inspection via errors.Is/As.
+const maxErrorBodyBytes = 500
+
+// truncateForLog caps s at maxErrorBodyBytes, backing off to the last
+// complete UTF-8 rune boundary so the returned string is always valid UTF-8.
+func truncateForLog(s string) string {
+	if len(s) <= maxErrorBodyBytes {
+		return s
+	}
+	cut := s[:maxErrorBodyBytes]
+	// Drop any trailing partial rune.
+	for len(cut) > 0 {
+		r, size := utf8.DecodeLastRuneInString(cut)
+		if r != utf8.RuneError || size > 1 {
+			break
+		}
+		cut = cut[:len(cut)-1]
+	}
+	return cut + "..."
+}
+
+// formatRequestError converts Go HTTP client errors into user-friendly
+// messages while preserving the original error chain for programmatic
+// inspection via errors.Is / errors.As. Uses typed error matching where
+// possible (context.DeadlineExceeded, net.OpError, dnsError, net.ErrClosed)
+// instead of substring-matching err.Error() strings, which can change
+// across Go releases (L7).
 func formatRequestError(err error) error {
-	msg := err.Error()
-	var friendly string
+	friendly := "Request to Arc failed"
 	switch {
-	case strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "Client.Timeout"):
+	case errors.Is(err, context.Canceled):
+		// User-initiated cancellation (Grafana panel edit, dashboard close,
+		// click-cancel). Grafana surfaces "Query canceled" already; a verbose
+		// "try reducing the time range" message confuses users who weren't
+		// timing out. Keep the error chain (so errors.Is still detects it)
+		// but use a neutral phrase.
+		friendly = "Query canceled"
+	case errors.Is(err, context.DeadlineExceeded):
 		friendly = "Query timed out — try reducing the time range, increasing the timeout in datasource settings, or enabling query splitting"
-	case strings.Contains(msg, "connection refused"):
-		friendly = "Cannot connect to Arc — connection refused. Check that Arc is running and the URL is correct"
-	case strings.Contains(msg, "no such host"):
-		friendly = "Cannot connect to Arc — hostname not found. Check the URL in datasource settings"
-	case strings.Contains(msg, "EOF"):
+	case errors.Is(err, errBlockedAddr):
+		friendly = "Arc URL resolves to a blocked address (private/loopback). Update the datasource URL or enable Allow Private IPs."
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
 		friendly = "Arc closed the connection unexpectedly — the query may be too large. Try enabling query splitting or reducing the time range"
 	default:
-		friendly = "Request to Arc failed"
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) {
+			friendly = "Cannot connect to Arc — hostname not found. Check the URL in datasource settings"
+			break
+		}
+		var opErr *net.OpError
+		if errors.As(err, &opErr) {
+			// connection refused / network unreachable / TCP reset all surface as OpError.
+			friendly = "Cannot connect to Arc — " + opErr.Op + " failed. Check that Arc is running and the URL is correct"
+			break
+		}
+		// Last-resort substring check for `http.Client.Timeout`-style errors that
+		// don't satisfy errors.Is(context.DeadlineExceeded) (older SDK versions).
+		if strings.Contains(err.Error(), "Client.Timeout") {
+			friendly = "Query timed out — try reducing the time range, increasing the timeout in datasource settings, or enabling query splitting"
+		}
 	}
 	return fmt.Errorf("%s: %w", friendly, err)
 }
 
-// QueryJSON executes a query using Arc's JSON endpoint (fallback)
-func QueryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string, timeRange backend.TimeRange) (*data.Frame, error) {
-	// Build request
-	url := fmt.Sprintf("%s/api/v1/query", settings.settings.URL)
-
-	reqBody := map[string]interface{}{
-		"sql": sql,
-	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	// Create HTTP request
-	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Set headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", settings.apiKey))
-
-	// Set database if specified
-	if settings.settings.Database != "" {
-		req.Header.Set("X-Arc-Database", settings.settings.Database)
-	}
-
-	// Execute request
-	client := &http.Client{
-		Timeout: time.Duration(settings.settings.Timeout) * time.Second,
-	}
-
+// queryJSON executes a query using Arc's JSON endpoint (fallback path used
+// when the user has disabled Arrow). Returns a decoded Grafana DataFrame.
+func queryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string) (*data.Frame, error) {
 	start := time.Now()
-	resp, err := client.Do(req)
+	body, err := settings.doRequest(ctx, "/api/v1/query", map[string]any{"sql": sql})
 	if err != nil {
-		return nil, formatRequestError(err)
+		return nil, err
 	}
-	defer resp.Body.Close()
+	defer body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, errors.New(parseArcError(resp.StatusCode, body))
-	}
-
-	// Parse JSON response
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode Arc JSON response: %w", err)
 	}
 
 	duration := time.Since(start)
-	log.DefaultLogger.Debug("JSON query completed",
-		"duration_ms", duration.Milliseconds(),
-	)
+	log.DefaultLogger.Debug("JSON query completed", "duration_ms", duration.Milliseconds())
 
-	// Convert to DataFrame
 	frame, err := JSONToDataFrame(result)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert response to DataFrame: %w", err)
 	}
 
-	// Add metadata
 	frame.Meta = &data.FrameMeta{
 		ExecutedQueryString: sql,
 		Custom: map[string]interface{}{
@@ -145,7 +148,11 @@ func JSONToDataFrame(result map[string]interface{}) (*data.Frame, error) {
 
 	columnNames := make([]string, len(columnsSlice))
 	for i, col := range columnsSlice {
-		columnNames[i] = col.(string)
+		name, ok := col.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid column name at index %d: expected string, got %T", i, col)
+		}
+		columnNames[i] = name
 	}
 
 	// Extract data from Arc response
@@ -191,7 +198,13 @@ func JSONToDataFrame(result map[string]interface{}) (*data.Frame, error) {
 		var sample interface{}
 
 		for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-			row := dataRows[rowIdx].([]interface{})
+			row, ok := dataRows[rowIdx].([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("invalid row at index %d: expected array, got %T", rowIdx, dataRows[rowIdx])
+			}
+			if colIdx >= len(row) {
+				return nil, fmt.Errorf("row %d has %d columns, expected at least %d", rowIdx, len(row), colIdx+1)
+			}
 			if row[colIdx] != nil {
 				sample = row[colIdx]
 				break
@@ -224,101 +237,100 @@ func JSONToDataFrame(result map[string]interface{}) (*data.Frame, error) {
 		switch fieldType {
 		case data.FieldTypeNullableFloat64:
 			values := make([]*float64, numRows)
+			var typeMismatches int
 			for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-				row := dataRows[rowIdx].([]interface{})
-				if row[colIdx] != nil {
-					val := new(float64)
-					*val = row[colIdx].(float64)
-					values[rowIdx] = val
+				row, ok := dataRows[rowIdx].([]interface{})
+				if !ok || colIdx >= len(row) || row[colIdx] == nil {
+					continue
 				}
+				v, ok := row[colIdx].(float64)
+				if !ok {
+					typeMismatches++
+					continue
+				}
+				val := v
+				values[rowIdx] = &val
+			}
+			if typeMismatches > 0 {
+				log.DefaultLogger.Warn("numeric column had non-float64 rows",
+					"col", colName, "mismatches", typeMismatches, "total", numRows)
 			}
 			fields[colIdx] = data.NewField(colName, nil, values)
 
 		case data.FieldTypeNullableTime:
-			values := make([]*time.Time, numRows)
-			for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-				row := dataRows[rowIdx].([]interface{})
-				if row[colIdx] != nil {
-					var t time.Time
-					var err error
-
-					// Handle different timestamp formats from Arc
-					switch v := row[colIdx].(type) {
-					case string:
-						// Try RFC3339 first
-						t, err = time.Parse(time.RFC3339, v)
-						if err != nil {
-							// Try Arc's format with microseconds
-							t, err = time.Parse("2006-01-02T15:04:05.000000", v)
-						}
-						if err != nil {
-							// Try without timezone
-							t, err = time.Parse("2006-01-02T15:04:05", v)
-						}
-					case float64:
-						// Unix timestamp in seconds or milliseconds
-						if v > 1e12 {
-							// Milliseconds
-							t = time.Unix(0, int64(v)*int64(time.Millisecond))
-						} else {
-							// Seconds
-							t = time.Unix(int64(v), 0)
-						}
-						err = nil
-					case int64:
-						// Unix timestamp
-						if v > 1e12 {
-							// Milliseconds
-							t = time.Unix(0, v*int64(time.Millisecond))
-						} else {
-							// Seconds
-							t = time.Unix(v, 0)
-						}
-						err = nil
-					default:
-						log.DefaultLogger.Warn("Unknown timestamp type",
-							"type", fmt.Sprintf("%T", v),
-							"value", v,
-							"row", rowIdx,
-							"col", colName,
-						)
-					}
-
-					if err == nil {
-						timeCopy := t
-						values[rowIdx] = &timeCopy
-					} else {
-						log.DefaultLogger.Warn("Failed to parse timestamp",
-							"error", err,
-							"value", row[colIdx],
-							"row", rowIdx,
-							"col", colName,
-						)
+			// Detect the string format once on the first sample so we don't
+			// retry up to three time.Parse layouts per row on big result sets.
+			detectedLayout := ""
+			if sampleStr, ok := sample.(string); ok {
+				for _, layout := range timestampLayouts {
+					if _, err := time.Parse(layout, sampleStr); err == nil {
+						detectedLayout = layout
+						break
 					}
 				}
+			}
+			values := make([]*time.Time, numRows)
+			var parseFailures int
+			for rowIdx := 0; rowIdx < numRows; rowIdx++ {
+				row, ok := dataRows[rowIdx].([]interface{})
+				if !ok || colIdx >= len(row) || row[colIdx] == nil {
+					continue
+				}
+				t, ok := parseJSONTimestamp(row[colIdx], detectedLayout)
+				if !ok {
+					parseFailures++
+					continue
+				}
+				timeCopy := t
+				values[rowIdx] = &timeCopy
+			}
+			if parseFailures > 0 {
+				// Summary log (one line per column) instead of one-line-per-row
+				// spam. A 100k-row response with a corrupted column previously
+				// emitted 100k warn lines.
+				log.DefaultLogger.Warn("timestamp column had unparseable rows",
+					"col", colName, "failures", parseFailures, "total", numRows)
 			}
 			fields[colIdx] = data.NewField(colName, nil, values)
 
 		case data.FieldTypeNullableString:
 			values := make([]*string, numRows)
 			for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-				row := dataRows[rowIdx].([]interface{})
-				if row[colIdx] != nil {
-					str := fmt.Sprintf("%v", row[colIdx])
-					values[rowIdx] = &str
+				row, ok := dataRows[rowIdx].([]interface{})
+				if !ok || colIdx >= len(row) || row[colIdx] == nil {
+					continue
 				}
+				// Type-assert before falling back to Sprintf — the inferred
+				// column type is string, so the common case avoids reflection.
+				if s, ok := row[colIdx].(string); ok {
+					strCopy := s
+					values[rowIdx] = &strCopy
+					continue
+				}
+				str := fmt.Sprintf("%v", row[colIdx])
+				values[rowIdx] = &str
 			}
 			fields[colIdx] = data.NewField(colName, nil, values)
 
 		case data.FieldTypeNullableBool:
 			values := make([]*bool, numRows)
+			var typeMismatches int
 			for rowIdx := 0; rowIdx < numRows; rowIdx++ {
-				row := dataRows[rowIdx].([]interface{})
-				if row[colIdx] != nil {
-					val := new(bool)
-					*val = row[colIdx].(bool)
-					values[rowIdx] = val
+				row, ok := dataRows[rowIdx].([]interface{})
+				if !ok || colIdx >= len(row) || row[colIdx] == nil {
+					continue
 				}
+				v, ok := row[colIdx].(bool)
+				if !ok {
+					typeMismatches++
+					continue
+				}
+				val := v
+				values[rowIdx] = &val
+			}
+			if typeMismatches > 0 {
+				log.DefaultLogger.Warn("boolean column had non-bool rows",
+					"col", colName, "mismatches", typeMismatches, "total", numRows)
 			}
 			fields[colIdx] = data.NewField(colName, nil, values)
 		}
@@ -375,150 +387,363 @@ func calculateInterval(duration time.Duration) string {
 	}
 }
 
+// replaceMacroOccurrences walks `sql` once and rewrites every occurrence of
+// `macro` that lives outside string literals and comments. For each in-scope
+// occurrence the inner argument (between the macro's opening paren and the
+// matching closing paren, respecting nested parens) is passed to `rewrite`.
+// If rewrite returns ok=false the original macro text is preserved verbatim.
+//
+// The single-pass approach (O(N) over `sql`, with `strings.Builder` output)
+// replaces the previous repeated slice-splice loop that was O(N·L) per
+// macro. The literal-and-comment awareness also fixes the C4 issue where
+// `WHERE message = 'count of $__timeFilter(time)'` would have its literal
+// content rewritten.
+func replaceMacroOccurrences(sql, macro string, rewrite func(arg string) (string, bool)) string {
+	var out strings.Builder
+	out.Grow(len(sql))
+	i := 0
+	for i < len(sql) {
+		// Skip over '...' string literals (preserve verbatim).
+		if sql[i] == '\'' {
+			out.WriteByte(sql[i])
+			i++
+			for i < len(sql) {
+				out.WriteByte(sql[i])
+				if sql[i] == '\'' {
+					// Escaped quote ''
+					if i+1 < len(sql) && sql[i+1] == '\'' {
+						out.WriteByte(sql[i+1])
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		// Skip over -- line comments.
+		if sql[i] == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			end := strings.IndexByte(sql[i:], '\n')
+			if end < 0 {
+				out.WriteString(sql[i:])
+				return out.String()
+			}
+			out.WriteString(sql[i : i+end])
+			i += end
+			continue
+		}
+		// Skip over /* block comments */.
+		if sql[i] == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+			end := strings.Index(sql[i+2:], "*/")
+			if end < 0 {
+				out.WriteString(sql[i:])
+				return out.String()
+			}
+			out.WriteString(sql[i : i+2+end+2])
+			i += 2 + end + 2
+			continue
+		}
+		// Macro at this position?
+		if i+len(macro) <= len(sql) && sql[i:i+len(macro)] == macro {
+			closeIdx := findMatchingParen(sql, i+len(macro)-1)
+			if closeIdx < 0 {
+				// Unmatched paren — leave the rest of the SQL untouched.
+				out.WriteString(sql[i:])
+				return out.String()
+			}
+			arg := sql[i+len(macro) : closeIdx]
+			if rewritten, ok := rewrite(arg); ok {
+				out.WriteString(rewritten)
+			} else {
+				// Caller declined the rewrite — preserve the original macro
+				// text so Arc surfaces a clear error rather than producing
+				// silently-mangled SQL.
+				out.WriteString(sql[i : closeIdx+1])
+			}
+			i = closeIdx + 1
+			continue
+		}
+		out.WriteByte(sql[i])
+		i++
+	}
+	return out.String()
+}
+
+// replaceLiteralAwareTokens replaces every occurrence of `token` (a fixed
+// string with no argument list, e.g. "$__interval" or "$__timeFrom()") with
+// `replacement` — skipping occurrences inside string literals and SQL
+// comments. This is the zero-arg sibling of `replaceMacroOccurrences` and
+// fixes R2-CR5: the previous `strings.ReplaceAll` rewrote macros inside
+// string literals (`WHERE msg = 'see $__timeFrom()'` mangled the literal).
+func replaceLiteralAwareTokens(sql, token, replacement string) string {
+	if !strings.Contains(sql, token) {
+		return sql
+	}
+	var out strings.Builder
+	out.Grow(len(sql))
+	i := 0
+	for i < len(sql) {
+		// Skip '...' string literals (preserve verbatim, including any tokens inside).
+		if sql[i] == '\'' {
+			out.WriteByte(sql[i])
+			i++
+			for i < len(sql) {
+				out.WriteByte(sql[i])
+				if sql[i] == '\'' {
+					if i+1 < len(sql) && sql[i+1] == '\'' {
+						out.WriteByte(sql[i+1])
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		// Skip -- line comments.
+		if sql[i] == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			end := strings.IndexByte(sql[i:], '\n')
+			if end < 0 {
+				out.WriteString(sql[i:])
+				return out.String()
+			}
+			out.WriteString(sql[i : i+end])
+			i += end
+			continue
+		}
+		// Skip /* block comments */.
+		if sql[i] == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+			end := strings.Index(sql[i+2:], "*/")
+			if end < 0 {
+				out.WriteString(sql[i:])
+				return out.String()
+			}
+			out.WriteString(sql[i : i+2+end+2])
+			i += 2 + end + 2
+			continue
+		}
+		// Token match?
+		if i+len(token) <= len(sql) && sql[i:i+len(token)] == token {
+			out.WriteString(replacement)
+			i += len(token)
+			continue
+		}
+		out.WriteByte(sql[i])
+		i++
+	}
+	return out.String()
+}
+
+// findMatchingParen scans forward from `openIdx` (which must point at '(')
+// and returns the index of the matching ')', respecting nested parens and
+// string literals inside the arg. Returns -1 if no match is found.
+func findMatchingParen(sql string, openIdx int) int {
+	if openIdx >= len(sql) || sql[openIdx] != '(' {
+		return -1
+	}
+	depth := 1
+	i := openIdx + 1
+	for i < len(sql) {
+		c := sql[i]
+		switch c {
+		case '\'':
+			// Skip string literal.
+			i++
+			for i < len(sql) {
+				if sql[i] == '\'' {
+					if i+1 < len(sql) && sql[i+1] == '\'' {
+						i += 2
+						continue
+					}
+					i++
+					break
+				}
+				i++
+			}
+		case '(':
+			depth++
+			i++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+			i++
+		default:
+			i++
+		}
+	}
+	return -1
+}
+
 // expandTimeFilter replaces $__timeFilter(column) with column >= 'from' AND column < 'to'.
-// Extracts the column name from the macro argument instead of hardcoding 'time'.
+// Column arguments are validated against columnNameRe — anything else is left
+// un-expanded so Arc surfaces a clear error rather than the macro silently
+// injecting attacker-controlled SQL. Macros inside string literals or comments
+// are not expanded.
 func expandTimeFilter(sql string, from, to time.Time) string {
-	for {
-		idx := strings.Index(sql, "$__timeFilter(")
-		if idx == -1 {
-			return sql
-		}
-
-		end := strings.Index(sql[idx:], ")")
-		if end == -1 {
-			return sql
-		}
-		end += idx
-
-		column := strings.TrimSpace(sql[idx+len("$__timeFilter(") : end])
+	fromStr := from.Format(time.RFC3339)
+	toStr := to.Format(time.RFC3339)
+	return replaceMacroOccurrences(sql, "$__timeFilter(", func(arg string) (string, bool) {
+		column := strings.TrimSpace(arg)
 		if column == "" {
 			log.DefaultLogger.Warn("$__timeFilter macro has empty column argument, defaulting to 'time'")
 			column = "time"
 		}
-
-		replacement := fmt.Sprintf("%s >= '%s' AND %s < '%s'",
-			column,
-			from.Format(time.RFC3339),
-			column,
-			to.Format(time.RFC3339),
-		)
-		sql = sql[:idx] + replacement + sql[end+1:]
-	}
+		if err := validateColumnArg(column); err != nil {
+			log.DefaultLogger.Warn("$__timeFilter rejected unsafe column argument", "column", column, "error", err.Error())
+			return "", false
+		}
+		return fmt.Sprintf("%s >= '%s' AND %s < '%s'", column, fromStr, column, toStr), true
+	})
 }
 
 // ApplyMacros replaces Grafana macros in SQL query
 func ApplyMacros(sql string, timeRange backend.TimeRange) string {
-	// $__timeFilter(column) -> column >= 'start' AND column < 'end'
-	sql = expandTimeFilter(sql, timeRange.From, timeRange.To)
+	return applyMacrosWith(sql, timeRange.From, timeRange.To, timeRange.To.Sub(timeRange.From))
+}
 
-	// $__timeFrom() -> start time
-	sql = strings.ReplaceAll(sql, "$__timeFrom()", fmt.Sprintf("'%s'", timeRange.From.Format(time.RFC3339)))
+// ApplyMacrosWithSplit replaces macros using the chunk's time range for
+// `$__timeFilter`/`$__timeFrom`/`$__timeTo`, but the ORIGINAL range for
+// `$__interval` so bucket sizes stay consistent across chunks.
+func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange backend.TimeRange) string {
+	return applyMacrosWith(sql, chunk.From, chunk.To, originalRange.To.Sub(originalRange.From))
+}
 
-	// $__timeTo() -> end time
-	sql = strings.ReplaceAll(sql, "$__timeTo()", fmt.Sprintf("'%s'", timeRange.To.Format(time.RFC3339)))
-
-	// $__interval -> calculate interval based on time range
-	sql = strings.ReplaceAll(sql, "$__interval", calculateInterval(timeRange.To.Sub(timeRange.From)))
-
+// applyMacrosWith routes EVERY macro through literal-and-comment-aware
+// walkers (R2-CR5): the previous implementation used `strings.ReplaceAll`
+// for `$__timeFrom()`, `$__timeTo()`, and `$__interval`, which rewrote macro
+// text inside string literals (`WHERE msg = 'see $__timeFrom()'` mangled the
+// literal). All five Grafana macros now share the same safety.
+func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuration time.Duration) string {
+	sql = expandTimeFilter(sql, filterFrom, filterTo)
+	sql = replaceLiteralAwareTokens(sql, "$__timeFrom()", fmt.Sprintf("'%s'", filterFrom.Format(time.RFC3339)))
+	sql = replaceLiteralAwareTokens(sql, "$__timeTo()", fmt.Sprintf("'%s'", filterTo.Format(time.RFC3339)))
+	sql = replaceLiteralAwareTokens(sql, "$__interval", calculateInterval(intervalDuration))
 	// $__timeGroup(column, interval) -> epoch-based bucketing
 	// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
-	// causing GROUP BY to produce per-second rows instead of proper hourly buckets.
-	// Epoch math avoids this entirely.
+	// causing GROUP BY to produce per-second rows. Epoch math avoids this.
 	sql = expandTimeGroup(sql)
-
 	return sql
 }
 
-// ApplyMacrosWithSplit replaces macros using the chunk's time range for filtering
-// but the original full range for $__interval calculation (so bucket sizes stay consistent)
-func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange backend.TimeRange) string {
-	// $__timeFilter uses chunk boundaries
-	sql = expandTimeFilter(sql, chunk.From, chunk.To)
-
-	// $__timeFrom/$__timeTo use chunk boundaries
-	sql = strings.ReplaceAll(sql, "$__timeFrom()", fmt.Sprintf("'%s'", chunk.From.Format(time.RFC3339)))
-	sql = strings.ReplaceAll(sql, "$__timeTo()", fmt.Sprintf("'%s'", chunk.To.Format(time.RFC3339)))
-
-	// $__interval uses the ORIGINAL range so bucket sizes are consistent across all chunks
-	sql = strings.ReplaceAll(sql, "$__interval", calculateInterval(originalRange.To.Sub(originalRange.From)))
-
-	sql = expandTimeGroup(sql)
-
-	return sql
+// timestampLayouts is the ordered list of Go time layouts the JSON decoder
+// will try when inferring a timestamp column's string format. The first
+// matching layout for the first non-null sample is cached and used for
+// every subsequent row — eliminating up to 3 time.Parse attempts per row.
+var timestampLayouts = []string{
+	time.RFC3339,
+	"2006-01-02T15:04:05.000000", // Arc-emitted microsecond precision
+	"2006-01-02T15:04:05",        // No timezone
 }
 
-// intervalToSeconds converts an interval string to seconds.
-func intervalToSeconds(interval string) int {
-	interval = strings.TrimSpace(interval)
-	switch interval {
-	case "1s", "1 second":
-		return 1
-	case "5s", "5 seconds":
-		return 5
-	case "10s", "10 seconds":
-		return 10
-	case "30s", "30 seconds":
-		return 30
-	case "1m", "1 minute":
-		return 60
-	case "5m", "5 minutes":
-		return 300
-	case "10m", "10 minutes":
-		return 600
-	case "15m", "15 minutes":
-		return 900
-	case "30m", "30 minutes":
-		return 1800
-	case "1h", "1 hour":
-		return 3600
-	case "6h", "6 hours":
-		return 21600
-	case "12h", "12 hours":
-		return 43200
-	case "1d", "1 day":
-		return 86400
+// parseJSONTimestamp converts a JSON-decoded value to time.Time using the
+// detectedLayout for strings (or trying every layout if detection failed for
+// this column). Numeric values are interpreted as seconds when small and
+// milliseconds when large — the 1e12 threshold sits at year 2001 in seconds
+// and would be year 33000 in milliseconds.
+func parseJSONTimestamp(v interface{}, detectedLayout string) (time.Time, bool) {
+	switch x := v.(type) {
+	case string:
+		if detectedLayout != "" {
+			if t, err := time.Parse(detectedLayout, x); err == nil {
+				return t, true
+			}
+		}
+		// Fallback path when detection didn't latch (mixed-format column).
+		for _, layout := range timestampLayouts {
+			if t, err := time.Parse(layout, x); err == nil {
+				return t, true
+			}
+		}
+		return time.Time{}, false
+	case float64:
+		if x > 1e12 {
+			return time.Unix(0, int64(x)*int64(time.Millisecond)), true
+		}
+		return time.Unix(int64(x), 0), true
+	case int64:
+		if x > 1e12 {
+			return time.Unix(0, x*int64(time.Millisecond)), true
+		}
+		return time.Unix(x, 0), true
 	default:
-		return 3600
+		return time.Time{}, false
 	}
+}
+
+// intervalSecondsTable maps DuckDB-compatible interval strings to seconds.
+// Package-level so the lookup is O(1) per macro call instead of a 13-arm
+// switch. Both short and long forms are accepted ("1m" and "1 minute").
+var intervalSecondsTable = map[string]int{
+	"1s": 1, "1 second": 1,
+	"5s": 5, "5 seconds": 5,
+	"10s": 10, "10 seconds": 10,
+	"30s": 30, "30 seconds": 30,
+	"1m": 60, "1 minute": 60,
+	"5m": 300, "5 minutes": 300,
+	"10m": 600, "10 minutes": 600,
+	"15m": 900, "15 minutes": 900,
+	"30m": 1800, "30 minutes": 1800,
+	"1h": 3600, "1 hour": 3600,
+	"6h": 21600, "6 hours": 21600,
+	"12h": 43200, "12 hours": 43200,
+	"1d": 86400, "1 day": 86400,
+}
+
+// intervalToSeconds converts a DuckDB interval string to seconds. Returns
+// (seconds, true) on a hit and (0, false) on an unknown interval — caller
+// is responsible for deciding fallback behavior. Before this signature the
+// function silently defaulted unknown input to 3600s, masking typos like
+// '1minutes' as a one-hour bucket.
+func intervalToSeconds(interval string) (int, bool) {
+	if secs, ok := intervalSecondsTable[strings.TrimSpace(interval)]; ok {
+		return secs, true
+	}
+	return 0, false
 }
 
 // expandTimeGroup replaces $__timeGroup(column, interval) with epoch-based bucketing SQL.
 // DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
 // causing GROUP BY to produce per-second rows. Epoch math avoids this.
+// Column argument is validated against columnNameRe; unknown intervals and
+// arg-count mismatches are rejected (macro left un-expanded so Arc surfaces a
+// clear error) rather than silently defaulting.
 func expandTimeGroup(sql string) string {
-	for {
-		idx := strings.Index(sql, "$__timeGroup(")
-		if idx == -1 {
-			return sql
+	return replaceMacroOccurrences(sql, "$__timeGroup(", func(arg string) (string, bool) {
+		parts := strings.Split(arg, ",")
+		if len(parts) < 2 {
+			log.DefaultLogger.Warn("$__timeGroup requires two arguments: $__timeGroup(column, interval)", "found", arg)
+			return "", false
 		}
-
-		// Find the closing paren
-		end := strings.Index(sql[idx:], ")")
-		if end == -1 {
-			return sql
+		if len(parts) > 2 {
+			// Extra args silently ignored before; now warn loudly.
+			log.DefaultLogger.Warn("$__timeGroup ignored extra arguments — expected $__timeGroup(column, interval)",
+				"found", arg, "extra_count", len(parts)-2)
+			return "", false
 		}
-		end += idx
-
-		// Extract arguments: $__timeGroup(column, 'interval')
-		inner := sql[idx+len("$__timeGroup(") : end]
-		parts := strings.SplitN(inner, ",", 2)
-		if len(parts) != 2 {
-			log.DefaultLogger.Warn("$__timeGroup requires two arguments: $__timeGroup(column, interval)",
-				"found", inner)
-			return sql
-		}
-
 		column := strings.TrimSpace(parts[0])
+		if err := validateColumnArg(column); err != nil {
+			log.DefaultLogger.Warn("$__timeGroup rejected unsafe column argument", "column", column, "error", err.Error())
+			return "", false
+		}
 		interval := strings.Trim(strings.TrimSpace(parts[1]), "'\"")
-		secs := intervalToSeconds(interval)
-
+		secs, ok := intervalToSeconds(interval)
+		if !ok {
+			log.DefaultLogger.Warn("$__timeGroup rejected unknown interval — expected '1s', '10s', '1m', '5m', '1h', '1d', etc.",
+				"interval", interval)
+			return "", false
+		}
 		// Use epoch_ns() (BIGINT) with // (integer division) instead of epoch() (DOUBLE)
 		// to avoid floating-point precision loss that causes timestamps near hour
 		// boundaries (e.g. 05:59:59.999) to round up to the next bucket (06:00:00).
 		// DuckDB's / operator returns DOUBLE; // returns BIGINT.
-		replacement := fmt.Sprintf("to_timestamp((epoch_ns(%s) // 1000000000 // %d) * %d)", column, secs, secs)
-		sql = sql[:idx] + replacement + sql[end+1:]
-	}
+		return fmt.Sprintf("to_timestamp((epoch_ns(%s) // 1000000000 // %d) * %d)", column, secs, secs), true
+	})
 }
 
 // OptimizeTimeSeriesQuery adds ORDER BY time ASC if missing for better performance

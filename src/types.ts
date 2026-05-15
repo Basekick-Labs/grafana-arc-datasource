@@ -9,6 +9,28 @@ export interface ArcDataSourceOptions extends DataSourceJsonData {
   timeout?: number;
   useArrow?: boolean;
   maxConcurrency?: number;
+  /**
+   * Per-response body size cap in MiB. Default 1024 MiB. Defense-in-depth
+   * against runaway queries that would OOM the plugin process. Raise this
+   * for very large analytical queries (Arc emits "Arrow IPC stream
+   * truncated after headers committed" when the cap is hit mid-stream).
+   */
+  maxResponseMB?: number;
+  /**
+   * Permit the configured Arc URL to resolve to a private/RFC1918 address.
+   * Off by default — the SSRF guard blocks private ranges to protect Grafana
+   * installs where datasource creators are not fully trusted. Enable when
+   * Arc is deployed on an internal corporate network.
+   */
+  allowPrivateIPs?: boolean;
+  /**
+   * Permit per-query `database` field to override the datasource default.
+   * Off by default — without this, a dashboard editor could switch databases
+   * on a datasource the admin configured for a single tenant (confused-deputy
+   * if the Arc API key has cross-database scope). Enable only when the API
+   * key's authorization scope matches the dashboard-editor's authorization.
+   */
+  allowDatabaseOverride?: boolean;
 }
 
 /**

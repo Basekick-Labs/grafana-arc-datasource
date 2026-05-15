@@ -36,11 +36,11 @@ High-performance Grafana datasource plugin for Arc time-series database using Ap
 
 ## Performance
 
-Real-world performance metrics:
-- **Data processing**: <1ms for time-series conversion
-- **Query execution**: Depends on Arc server (typically 100-500ms)
-- **Streaming deserialization**: Zero-copy Arrow IPC parsing
-- **Optimized sorting**: O(n log n) time-series sorting
+Real-world performance characteristics:
+- **Data processing**: typically sub-millisecond per chunk for time-series conversion
+- **Query execution**: dominated by Arc server (typically 100-500ms)
+- **Columnar transfer**: Arrow IPC streamed from Arc, decoded into Grafana DataFrames
+- **Optimized sorting**: O(n log n) time-series sorting when post-sort is needed
 
 ## Installation
 
@@ -293,14 +293,13 @@ The datasource uses Arc's Arrow endpoint for optimal performance:
 
 1. **Query Submission**: SQL query sent to Arc with time range
 2. **Columnar Response**: Arc returns Apache Arrow IPC stream
-3. **Zero-Copy Decode**: Go Arrow library deserializes directly
+3. **Streaming Decode**: Go Arrow library reads the IPC stream record-by-record
 4. **DataFrame Conversion**: Arrow Table → Grafana DataFrame
 5. **Rendering**: Grafana visualizes data
 
 Benefits:
 - No JSON serialization/deserialization overhead
-- Columnar format perfect for time-series
-- Compression at protocol level
+- Columnar format well-suited for time-series
 - Type-safe data transfer
 
 ## Troubleshooting

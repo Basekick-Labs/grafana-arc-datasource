@@ -54,6 +54,26 @@ export function ConfigEditor(props: Props) {
     });
   };
 
+  const onAllowPrivateIPsChange = (event: ChangeEvent<HTMLInputElement>) => {
+    onOptionsChange({
+      ...options,
+      jsonData: {
+        ...jsonData,
+        allowPrivateIPs: event.target.checked,
+      },
+    });
+  };
+
+  const onAllowDatabaseOverrideChange = (event: ChangeEvent<HTMLInputElement>) => {
+    onOptionsChange({
+      ...options,
+      jsonData: {
+        ...jsonData,
+        allowDatabaseOverride: event.target.checked,
+      },
+    });
+  };
+
   // Max Concurrency change handler
   const onMaxConcurrencyChange = (event: ChangeEvent<HTMLInputElement>) => {
     const val = parseInt(event.target.value, 10);
@@ -62,6 +82,17 @@ export function ConfigEditor(props: Props) {
       jsonData: {
         ...jsonData,
         maxConcurrency: isNaN(val) || val < 1 ? 4 : val,
+      },
+    });
+  };
+
+  const onMaxResponseMBChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const val = parseInt(event.target.value, 10);
+    onOptionsChange({
+      ...options,
+      jsonData: {
+        ...jsonData,
+        maxResponseMB: isNaN(val) || val < 1 ? 1024 : val,
       },
     });
   };
@@ -163,6 +194,20 @@ export function ConfigEditor(props: Props) {
       </InlineField>
 
       <InlineField
+        label="Max Response MB"
+        labelWidth={20}
+        tooltip="Maximum response body size in MiB. Default 1024 (1 GiB). Raise for very large analytical queries — Arc emits 'Arrow IPC stream truncated' errors when the cap is hit mid-stream. Lower bounds defense against runaway queries OOMing the plugin."
+      >
+        <Input
+          width={40}
+          type="number"
+          value={jsonData.maxResponseMB || 1024}
+          placeholder="1024"
+          onChange={onMaxResponseMBChange}
+        />
+      </InlineField>
+
+      <InlineField
         label="Use Arrow Protocol"
         labelWidth={20}
         tooltip="Enable Apache Arrow for faster data transfer (recommended)"
@@ -170,6 +215,28 @@ export function ConfigEditor(props: Props) {
         <Switch
           value={jsonData.useArrow ?? true}
           onChange={onUseArrowChange}
+        />
+      </InlineField>
+
+      <InlineField
+        label="Allow Private IPs"
+        labelWidth={20}
+        tooltip="Permit the Arc URL to resolve to private/RFC1918 addresses (e.g. 10.x, 192.168.x). Off by default — enable when Arc is deployed on an internal corporate network. Loopback (localhost) is always permitted when configured directly."
+      >
+        <Switch
+          value={jsonData.allowPrivateIPs ?? false}
+          onChange={onAllowPrivateIPsChange}
+        />
+      </InlineField>
+
+      <InlineField
+        label="Allow Database Override"
+        labelWidth={20}
+        tooltip="Permit per-query 'database' field to override this datasource's default database. Off by default — without this, a dashboard editor could switch databases on a datasource configured for a single tenant. Enable only if the API key's authorization scope matches dashboard-editor permissions."
+      >
+        <Switch
+          value={jsonData.allowDatabaseOverride ?? false}
+          onChange={onAllowDatabaseOverrideChange}
         />
       </InlineField>
 
