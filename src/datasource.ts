@@ -1,4 +1,5 @@
 import {
+  DataQueryRequest,
   DataQueryResponse,
   MetricFindValue,
   DataSourceInstanceSettings,
@@ -46,13 +47,13 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
       format: 'table',
     };
 
-    // Build the DataQueryRequest by spreading the LegacyMetricFindQueryOptions
-    // (which carries `range`, `scopedVars`, etc.) and replacing `targets`.
-    // The `as never` cast is the standard escape hatch other Grafana
-    // datasources (Postgres, MySQL) use for this exact pattern — the
-    // upstream LegacyMetricFindQueryOptions is structurally compatible with
-    // a DataQueryRequest minus targets, but the type system can't prove it.
-    const request = { ...(options ?? {}), targets: [target] } as never;
+    // Build a DataQueryRequest by spreading the variable-query options
+    // (range, scopedVars, etc. carried over from Grafana) and adding our
+    // single target. LegacyMetricFindQueryOptions is structurally compatible
+    // with DataQueryRequest minus the `targets` field; the cast names the
+    // target type explicitly so future maintainers see what shape is being
+    // produced (was `as never`, which preserved no type info).
+    const request = { ...(options ?? {}), targets: [target] } as unknown as DataQueryRequest<ArcQuery>;
     return lastValueFrom(super.query(request)).then(this.toMetricFindValue);
   }
 

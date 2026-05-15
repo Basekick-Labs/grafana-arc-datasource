@@ -16,13 +16,18 @@ export function VariableQueryEditor({ query, onChange }: VariableQueryProps) {
   const styles = useStyles2(getStyles);
   const [state, setState] = useState(query);
 
-  // Sync local state when the parent passes a new `query` prop (e.g. a
-  // different variable is selected in the dropdown above this editor).
-  // Without this, useState(query) only captures the initial value and
-  // the editor stays stuck on the old variable's SQL. (R1 H6)
+  // Sync local state when the SQL content of the parent's `query` prop
+  // changes (e.g. a different variable is selected in the dropdown above
+  // this editor, or the dashboard JSON is edited externally). The
+  // dependency is `query.query` specifically — NOT the `query` object —
+  // because the parent re-renders on every dashboard refresh and may
+  // pass a fresh object reference with the same content, which would
+  // overwrite the user's in-progress unsaved typing. (R1 H6, gemini
+  // round-3 follow-up.)
   useEffect(() => {
     setState(query);
-  }, [query]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query.query]);
 
   const saveQuery = () => {
     onChange(state, state.query);
