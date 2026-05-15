@@ -47,16 +47,38 @@ func stripStringLiteralsAndComments(sql string) string {
 			i += end // keep the newline, drop the comment text
 			continue
 		}
-		// Block comment: /* ... */. Replace with a single space so adjacent
-		// tokens stay separated (e.g. `SELECT/*x*/col` becomes `SELECT col`,
-		// not `SELECTcol`) — otherwise keyword detection would miss the SELECT.
+		// Block comment: /* ... */ with NESTED-comment support. DuckDB and
+		// Postgres both accept `/* outer /* inner */ outer */`. Tracking only
+		// the first `*/` (the previous shape) terminated the outer comment
+		// prematurely, leaving the rest of `outer */` in the stripped output
+		// where it could confuse downstream keyword detection (gemini
+		// 3244943528). Replaced the whole block with a single space so
+		// adjacent tokens stay separated (`SELECT/*x*/col` → `SELECT col`).
 		if c == '/' && i+1 < len(sql) && sql[i+1] == '*' {
-			end := strings.Index(sql[i+2:], "*/")
-			if end < 0 {
-				return out.String() // unterminated block comment
+			depth := 1
+			j := i + 2
+			for j < len(sql)-1 {
+				if sql[j] == '/' && sql[j+1] == '*' {
+					depth++
+					j += 2
+					continue
+				}
+				if sql[j] == '*' && sql[j+1] == '/' {
+					depth--
+					j += 2
+					if depth == 0 {
+						break
+					}
+					continue
+				}
+				j++
+			}
+			if depth != 0 {
+				// Unterminated block comment — drop the rest.
+				return out.String()
 			}
 			out.WriteByte(' ')
-			i += 2 + end + 2
+			i = j
 			continue
 		}
 		// Single-quoted literal
@@ -119,9 +141,14 @@ func containsUnion(s strippedSQL) bool {
 // literals and comments). A commented-out macro shouldn't keep splitting
 // enabled — the macro won't expand, so each chunk would re-run the full
 // query without a time filter.
+//
+// `$__timeTo` (e.g. `WHERE time < $__timeTo()`) is less common than the
+// other forms but still a valid signal that the query uses the chunk's end
+// time and is therefore safe to split (gemini 3244935459).
 func hasTimeFilterMacro(s strippedSQL) bool {
 	return strings.Contains(s.stripped, "$__timeFilter") ||
 		strings.Contains(s.stripped, "$__timeFrom") ||
+		strings.Contains(s.stripped, "$__timeTo") ||
 		strings.Contains(s.stripped, "$__timeGroup")
 }
 
@@ -153,9 +180,16 @@ var distinctRe = regexp.MustCompile(`(?i)\bDISTINCT\b`)
 // round 4 finding 3244824400 — same shape as the LIMIT whitespace bug).
 var groupByRe = regexp.MustCompile(`(?i)\bGROUP\s+BY\b`)
 
-// windowFnRe matches the SQL window function `OVER (...)` clause with any
-// whitespace between `OVER` and the paren.
-var windowFnRe = regexp.MustCompile(`(?i)\bOVER\s*\(`)
+// windowFnRe matches the SQL window function `OVER` clause in both forms:
+//   - inline window: `OVER (PARTITION BY ...)` or `OVER(PARTITION BY ...)`
+//   - named window reference: `OVER my_window` (DuckDB/Postgres `WINDOW` clause)
+//
+// The previous `\bOVER\s*\(` form only matched the inline shape, so named-
+// window queries bypassed the aggregation guard and got chunk-split incorrectly
+// (gemini 3244943532). Two alternatives now:
+//   - `OVER\s*\(`     — zero-or-more whitespace before paren (existing)
+//   - `OVER\s+[A-Za-z_]` — at least one whitespace + identifier start
+var windowFnRe = regexp.MustCompile(`(?i)\bOVER(\s*\(|\s+[A-Za-z_])`)
 
 // containsAggregationWithoutTimeGroup returns true when the SQL aggregates
 // (GROUP BY, DISTINCT, an aggregate function, or a window function) but has

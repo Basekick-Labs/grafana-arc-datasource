@@ -941,6 +941,61 @@ func TestNewArcInstance_AllowPrivatePolicy(t *testing.T) {
 	}
 }
 
+// TestNewArcInstance_MaxResponseMBDefault locks in R2-CR7: when the user
+// doesn't set MaxResponseMB, the instance falls back to DefaultMaxResponseMB
+// (1024 MiB — generous enough for analytical queries). The original
+// hardcoded 256 MiB cap was reported truncating real workloads.
+func TestNewArcInstance_MaxResponseMBDefault(t *testing.T) {
+	jsonData, _ := jsonMarshal(map[string]any{"url": "https://arc.example.com"})
+	inst, err := newArcInstance(t.Context(), backend.DataSourceInstanceSettings{
+		JSONData:                jsonData,
+		DecryptedSecureJSONData: map[string]string{"apiKey": "k"},
+	})
+	if err != nil {
+		t.Fatalf("newArcInstance: %v", err)
+	}
+	arc := inst.(*ArcInstanceSettings)
+	wantBytes := int64(DefaultMaxResponseMB) * 1024 * 1024
+	if arc.maxResponseBytes != wantBytes {
+		t.Errorf("default maxResponseBytes = %d, want %d (DefaultMaxResponseMB=%d MiB)",
+			arc.maxResponseBytes, wantBytes, DefaultMaxResponseMB)
+	}
+}
+
+// TestNewArcInstance_MaxResponseMBExplicit confirms a user-supplied value is
+// honored within the cap.
+func TestNewArcInstance_MaxResponseMBExplicit(t *testing.T) {
+	jsonData, _ := jsonMarshal(map[string]any{
+		"url":           "https://arc.example.com",
+		"maxResponseMB": 2048,
+	})
+	inst, _ := newArcInstance(t.Context(), backend.DataSourceInstanceSettings{
+		JSONData:                jsonData,
+		DecryptedSecureJSONData: map[string]string{"apiKey": "k"},
+	})
+	arc := inst.(*ArcInstanceSettings)
+	if arc.maxResponseBytes != 2048*1024*1024 {
+		t.Errorf("explicit MaxResponseMB=2048 not honored: got %d bytes", arc.maxResponseBytes)
+	}
+}
+
+// TestNewArcInstance_MaxResponseMBCap confirms a runaway value gets clamped.
+func TestNewArcInstance_MaxResponseMBCap(t *testing.T) {
+	jsonData, _ := jsonMarshal(map[string]any{
+		"url":           "https://arc.example.com",
+		"maxResponseMB": 999999, // way past MaxResponseMBCap
+	})
+	inst, _ := newArcInstance(t.Context(), backend.DataSourceInstanceSettings{
+		JSONData:                jsonData,
+		DecryptedSecureJSONData: map[string]string{"apiKey": "k"},
+	})
+	arc := inst.(*ArcInstanceSettings)
+	wantCap := int64(MaxResponseMBCap) * 1024 * 1024
+	if arc.maxResponseBytes != wantCap {
+		t.Errorf("runaway MaxResponseMB should clamp to %d bytes, got %d", wantCap, arc.maxResponseBytes)
+	}
+}
+
 func jsonMarshal(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
@@ -983,6 +1038,54 @@ func TestContainsLIMIT_WhitespaceFlavors(t *testing.T) {
 		if containsLIMIT(newStrippedSQL(sql)) {
 			t.Errorf("unexpected LIMIT match for: %q", sql)
 		}
+	}
+}
+
+// TestHasTimeFilterMacro_IncludesTimeTo locks in gemini 3244935459: a query
+// using `$__timeTo()` alone (e.g. `WHERE time < $__timeTo()`) must be
+// recognized as eligible for splitting since the macro engine expands it
+// to the chunk's end time.
+func TestHasTimeFilterMacro_IncludesTimeTo(t *testing.T) {
+	for _, sql := range []string{
+		"WHERE time < $__timeTo()",
+		"WHERE time >= $__timeFrom() AND time < $__timeTo()",
+	} {
+		if !hasTimeFilterMacro(newStrippedSQL(sql)) {
+			t.Errorf("expected hasTimeFilterMacro=true for: %q", sql)
+		}
+	}
+}
+
+// TestWindowFnRe_MatchesNamedWindow locks in gemini 3244943532: the
+// aggregation guard must recognize named window references
+// (`OVER my_window`) too, not just inline `OVER (...)`.
+func TestWindowFnRe_MatchesNamedWindow(t *testing.T) {
+	for _, sql := range []string{
+		"SELECT host, RANK() OVER w FROM t WINDOW w AS (PARTITION BY host)",
+		"SELECT host, ROW_NUMBER() OVER (PARTITION BY host) FROM t",     // inline w/ space
+		"SELECT host, RANK() OVER(PARTITION BY host ORDER BY v) FROM t", // inline no space
+	} {
+		if !windowFnRe.MatchString(sql) {
+			t.Errorf("expected windowFnRe match for: %q", sql)
+		}
+	}
+}
+
+// TestStripStringLiterals_NestedBlockComments locks in gemini 3244943528:
+// DuckDB and Postgres support nested block comments. The previous form
+// terminated the outer comment at the first `*/`, leaving the rest of the
+// outer comment visible to keyword detection.
+func TestStripStringLiterals_NestedBlockComments(t *testing.T) {
+	got := stripStringLiteralsAndComments("SELECT /* outer /* inner */ outer */ x FROM t")
+	// Nothing of the comment should remain in the stripped output (replaced
+	// by a single space). The keyword `outer` inside the comment must NOT
+	// appear in the output.
+	if strings.Contains(got, "outer") {
+		t.Errorf("nested block-comment content leaked into stripped output: %q", got)
+	}
+	// SELECT and FROM keywords must still be visible.
+	if !strings.Contains(got, "SELECT") || !strings.Contains(got, "FROM") {
+		t.Errorf("expected SELECT and FROM intact: %q", got)
 	}
 }
 

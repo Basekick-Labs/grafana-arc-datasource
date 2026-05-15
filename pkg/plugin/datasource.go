@@ -30,6 +30,7 @@ type ArcDataSourceSettings struct {
 	Timeout               int    `json:"timeout"`               // seconds
 	UseArrow              *bool  `json:"useArrow"`              // pointer so unset (fresh install) is distinguishable from explicit false
 	MaxConcurrency        int    `json:"maxConcurrency"`        // max parallel chunks for query splitting (default 4)
+	MaxResponseMB         int    `json:"maxResponseMB"`         // per-response body size cap in MiB (default 1024 — large analytical queries cross 256 MiB easily, R2-CR7)
 	AllowPrivateIPs       bool   `json:"allowPrivateIPs"`       // opt-in: permit Arc URL to resolve to RFC1918/private addresses (corporate intranets)
 	AllowDatabaseOverride bool   `json:"allowDatabaseOverride"` // opt-in: permit per-query `database` field to override the datasource default (R2-HI6 confused-deputy guard)
 }
@@ -59,10 +60,11 @@ type ArcQuery struct {
 // 24 in-flight requests, not 4. The semaphore is acquired before the HTTP
 // dial and released after the response is fully read.
 type ArcInstanceSettings struct {
-	settings ArcDataSourceSettings
-	apiKey   string
-	client   *http.Client
-	sem      *semaphore.Weighted
+	settings         ArcDataSourceSettings
+	apiKey           string
+	client           *http.Client
+	sem              *semaphore.Weighted
+	maxResponseBytes int64 // resolved from MaxResponseMB at construction time
 }
 
 // Dispose is called by the InstanceManager when the cached instance is being
@@ -137,9 +139,12 @@ func (s *ArcInstanceSettings) doRequest(ctx context.Context, path string, body a
 		return nil, formatRequestError(err)
 	}
 
-	capped := http.MaxBytesReader(nil, resp.Body, MaxResponseBytes)
+	capped := http.MaxBytesReader(nil, resp.Body, s.maxResponseBytes)
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(capped)
+		// Error bodies are small; don't read up to MaxResponseBytes (256 MiB+)
+		// just to parse a JSON error message. 16 KiB covers any realistic
+		// Arc error payload (gemini 3244935449).
+		raw, _ := io.ReadAll(io.LimitReader(capped, 16*1024))
 		_ = resp.Body.Close()
 		return nil, errors.New(parseArcError(resp.StatusCode, raw))
 	}
@@ -205,19 +210,39 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	if dsSettings.MaxConcurrency > MaxConcurrencyCap {
 		dsSettings.MaxConcurrency = MaxConcurrencyCap
 	}
+	// Per-response size cap (R2-CR7). 256 MiB (the original hardcoded value)
+	// was too low for 6M+ row analytical queries — Arc reports "Arrow IPC
+	// stream truncated after headers committed" because the plugin closes the
+	// connection when the response exceeds the cap. Default to 1024 MiB
+	// (fits ~30M rows with a few float64 columns), capped at MaxResponseMBCap
+	// to prevent a runaway accidental config from OOMing the plugin.
+	if dsSettings.MaxResponseMB <= 0 {
+		dsSettings.MaxResponseMB = DefaultMaxResponseMB
+	}
+	if dsSettings.MaxResponseMB > MaxResponseMBCap {
+		dsSettings.MaxResponseMB = MaxResponseMBCap
+	}
 	if dsSettings.UseArrow == nil {
 		t := true
 		dsSettings.UseArrow = &t
 	}
 
 	inst := &ArcInstanceSettings{
-		settings: dsSettings,
-		apiKey:   apiKey,
-		sem:      semaphore.NewWeighted(int64(dsSettings.MaxConcurrency)),
+		settings:         dsSettings,
+		apiKey:           apiKey,
+		sem:              semaphore.NewWeighted(int64(dsSettings.MaxConcurrency)),
+		maxResponseBytes: int64(dsSettings.MaxResponseMB) * 1024 * 1024,
+	}
+	// SSRF dial policy is two-axis (gemini 3244943519): a loopback URL only
+	// unlocks loopback IPs (so a 302 redirect to `10.0.0.5` is still
+	// blocked), and `AllowPrivateIPs` opens both loopback and RFC1918/CGNAT.
+	policy := dialPolicy{
+		allowLoopback: isLoopbackURL(dsSettings.URL),
+		allowPrivate:  dsSettings.AllowPrivateIPs,
 	}
 	inst.client = newHTTPClient(
 		time.Duration(dsSettings.Timeout)*time.Second,
-		dsSettings.AllowPrivateIPs || isLoopbackURL(dsSettings.URL),
+		policy,
 	)
 	return inst, nil
 }

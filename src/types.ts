@@ -10,6 +10,13 @@ export interface ArcDataSourceOptions extends DataSourceJsonData {
   useArrow?: boolean;
   maxConcurrency?: number;
   /**
+   * Per-response body size cap in MiB. Default 1024 MiB. Defense-in-depth
+   * against runaway queries that would OOM the plugin process. Raise this
+   * for very large analytical queries (Arc emits "Arrow IPC stream
+   * truncated after headers committed" when the cap is hit mid-stream).
+   */
+  maxResponseMB?: number;
+  /**
    * Permit the configured Arc URL to resolve to a private/RFC1918 address.
    * Off by default — the SSRF guard blocks private ranges to protect Grafana
    * installs where datasource creators are not fully trusted. Enable when

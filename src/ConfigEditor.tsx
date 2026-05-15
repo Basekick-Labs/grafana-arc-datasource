@@ -86,6 +86,17 @@ export function ConfigEditor(props: Props) {
     });
   };
 
+  const onMaxResponseMBChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const val = parseInt(event.target.value, 10);
+    onOptionsChange({
+      ...options,
+      jsonData: {
+        ...jsonData,
+        maxResponseMB: isNaN(val) || val < 1 ? 1024 : val,
+      },
+    });
+  };
+
   // API Key change handler
   const onAPIKeyChange = (event: ChangeEvent<HTMLInputElement>) => {
     onOptionsChange({
@@ -179,6 +190,20 @@ export function ConfigEditor(props: Props) {
           value={jsonData.maxConcurrency || 4}
           placeholder="4"
           onChange={onMaxConcurrencyChange}
+        />
+      </InlineField>
+
+      <InlineField
+        label="Max Response MB"
+        labelWidth={20}
+        tooltip="Maximum response body size in MiB. Default 1024 (1 GiB). Raise for very large analytical queries — Arc emits 'Arrow IPC stream truncated' errors when the cap is hit mid-stream. Lower bounds defense against runaway queries OOMing the plugin."
+      >
+        <Input
+          width={40}
+          type="number"
+          value={jsonData.maxResponseMB || 1024}
+          placeholder="1024"
+          onChange={onMaxResponseMBChange}
         />
       </InlineField>
 

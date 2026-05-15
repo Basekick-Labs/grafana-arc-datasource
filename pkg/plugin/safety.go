@@ -14,11 +14,18 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 )
 
-// MaxResponseBytes caps the size of a single Arc response body the plugin will
-// read into memory. Set high enough for legitimate analytical queries (256 MiB)
-// while preventing an unbounded SELECT * from OOMing the plugin process.
-// A response that exceeds the cap fails fast with a clear error.
-const MaxResponseBytes = 256 * 1024 * 1024
+// DefaultMaxResponseMB is the default per-response body size cap when the
+// user hasn't set `MaxResponseMB` in datasource settings. 1024 MiB fits
+// roughly 30M rows with several float64 columns — well clear of the
+// 6–10M-row analytical queries Arc serves in normal use (R2-CR7). The
+// original hardcoded 256 MiB was reported truncating real workloads.
+const DefaultMaxResponseMB = 1024
+
+// MaxResponseMBCap is the upper bound a user can set via `MaxResponseMB`.
+// Higher values risk OOMing the plugin process on a runaway query; this is
+// a defense in depth bound — set it as high as feels safe for the host's
+// memory profile.
+const MaxResponseMBCap = 8192
 
 // MaxConcurrencyCap is the upper bound on user-configurable parallel chunk fanout.
 // Higher values risk file-descriptor pressure and TLS-handshake storms against Arc.
@@ -71,12 +78,26 @@ func validateURL(raw string) error {
 	return nil
 }
 
+// dialPolicy carries the two independent permissions the SSRF dialer respects:
+// loopback-only (for `http://localhost:8000` dev setups) and full private
+// access (the user-opt-in `AllowPrivateIPs` flag for corporate-intranet Arc
+// deployments). They were previously collapsed into a single `allowPrivate`
+// bool, which meant a loopback-configured URL also opened RFC1918 redirects —
+// gemini round 5 finding 3244943519.
+type dialPolicy struct {
+	allowLoopback bool // configured URL is loopback → only loopback IPs allowed
+	allowPrivate  bool // admin opted in to RFC1918/CGNAT (intranet deployment)
+}
+
 // safeDialContext wraps a net.Dialer so it refuses to connect to disallowed
 // addresses. This is the SSRF guard for the user-supplied Arc URL.
 //
-// allowPrivate controls whether RFC1918/loopback/CGNAT addresses are permitted
-// (intended for corporate-intranet Arc deployments — derived in newArcInstance
-// from the user's AllowPrivateIPs opt-in plus the loopback-URL exemption).
+// `policy` carries the two independent permissions: `allowLoopback` (loopback
+// destinations only — derived from `isLoopbackURL(URL)` so dev setups against
+// `http://localhost:8000` keep working) and `allowPrivate` (admin opt-in via
+// AllowPrivateIPs for corporate intranets — permits both loopback AND RFC1918
+// / CGNAT / ULA).
+//
 // Link-local (including the cloud-metadata 169.254.169.254), multicast, and
 // unspecified addresses are blocked regardless — they are never a legitimate
 // Arc target.
@@ -85,7 +106,7 @@ func validateURL(raw string) error {
 // resolve the host ourselves, drop any disallowed address, then dial the
 // remaining ones explicitly by IP. If every resolved address is blocked the
 // dial returns errBlockedAddr.
-func safeDialContext(allowPrivate bool) func(ctx context.Context, network, addr string) (net.Conn, error) {
+func safeDialContext(policy dialPolicy) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
@@ -101,7 +122,7 @@ func safeDialContext(allowPrivate bool) func(ctx context.Context, network, addr 
 		}
 		var lastErr error
 		for _, ip := range ips {
-			if isBlockedIP(ip.IP, allowPrivate) {
+			if isBlockedIP(ip.IP, policy) {
 				lastErr = fmt.Errorf("%w: %s resolves to blocked address %s", errBlockedAddr, host, ip.IP)
 				continue
 			}
@@ -126,11 +147,16 @@ func safeDialContext(allowPrivate bool) func(ctx context.Context, network, addr 
 //   - link-local (incl. 169.254.169.254 cloud metadata)
 //   - multicast
 //
-// Conditionally-blocked when allowPrivate=false:
-//   - loopback (127.0.0.0/8, ::1)
-//   - private RFC1918 (10/8, 172.16/12, 192.168/16) + IPv6 ULA (fc00::/7)
-//   - CGNAT (100.64.0.0/10)
-func isBlockedIP(ip net.IP, allowPrivate bool) bool {
+// Conditionally allowed (per dialPolicy):
+//   - loopback (127.0.0.0/8, ::1) — when `policy.allowLoopback` OR `policy.allowPrivate`
+//   - private RFC1918 (10/8, 172.16/12, 192.168/16) + IPv6 ULA (fc00::/7) +
+//     CGNAT (100.64.0.0/10) — only when `policy.allowPrivate`
+//
+// The two flags are independent: `allowLoopback=true, allowPrivate=false`
+// (dev URL is loopback, admin didn't opt in to private) lets the dialer
+// reach `127.0.0.1` but still blocks redirects to `10.0.0.5`. Previously
+// these were collapsed into one bool and a loopback URL opened RFC1918 too.
+func isBlockedIP(ip net.IP, policy dialPolicy) bool {
 	if ip == nil {
 		return true
 	}
@@ -139,10 +165,15 @@ func isBlockedIP(ip net.IP, allowPrivate bool) bool {
 		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
 		return true
 	}
-	if allowPrivate {
+	if ip.IsLoopback() {
+		// Loopback is allowed by either flag.
+		return !(policy.allowLoopback || policy.allowPrivate)
+	}
+	// Non-loopback private ranges: only allowed by allowPrivate.
+	if policy.allowPrivate {
 		return false
 	}
-	if ip.IsLoopback() || ip.IsPrivate() {
+	if ip.IsPrivate() {
 		return true
 	}
 	// 100.64.0.0/10 — Carrier-grade NAT, not covered by IsPrivate.
@@ -179,12 +210,19 @@ func isLoopbackURL(raw string) bool {
 //
 // One client is created per datasource instance (in newArcInstance) and
 // reused across every request — sharing the transport's connection pool and
-// TLS session cache. allowPrivate combines the user's AllowPrivateIPs opt-in
-// with the loopback-URL exemption (so localhost dev still works). Link-local
-// (incl. cloud-metadata) and unspecified addresses are blocked regardless.
-func newHTTPClient(timeout time.Duration, allowPrivate bool) *http.Client {
+// TLS session cache. The policy carries TWO independent flags:
+//   - allowLoopback: configured URL is loopback (`localhost`/`127.0.0.1`)
+//     → loopback IPs are permitted on dial; RFC1918 stays blocked.
+//   - allowPrivate: admin opted in via AllowPrivateIPs (corporate intranet)
+//     → loopback AND RFC1918/CGNAT/ULA are all permitted.
+//
+// Link-local (incl. cloud-metadata) and unspecified addresses are blocked
+// regardless. Previously these two were collapsed into one bool, which meant
+// a loopback URL would also open RFC1918 redirects (gemini round 5 finding
+// 3244943519).
+func newHTTPClient(timeout time.Duration, policy dialPolicy) *http.Client {
 	transport := &http.Transport{
-		DialContext:           safeDialContext(allowPrivate),
+		DialContext:           safeDialContext(policy),
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -216,17 +254,23 @@ func newHTTPClient(timeout time.Duration, allowPrivate bool) *http.Client {
 func sanitizeUserError(refID string, err error) string {
 	log.DefaultLogger.Error("Arc query failed", "refId", refID, "error", err.Error())
 	msg := err.Error()
+	// Typed-error matching first (preferred). String contains is a fallback
+	// for paths that don't have a typed sentinel yet.
+	var maxBytesErr *http.MaxBytesError
 	switch {
 	case errors.Is(err, errBlockedAddr):
-		return "Arc URL resolves to a blocked address (private/loopback). Update the datasource URL."
+		return "Arc URL resolves to a blocked address (private/loopback). Update the datasource URL or enable 'Allow Private IPs'."
+	case errors.As(err, &maxBytesErr):
+		// R2-CR7: the previous "exceeded the configured size limit" message
+		// didn't tell the user how to fix it. The cap is now per-datasource
+		// via MaxResponseMB — point them at it.
+		return fmt.Sprintf("Query result exceeded the configured size limit (%d MiB). Raise 'Max Response MB' in datasource settings, add LIMIT, or narrow the time range.", maxBytesErr.Limit/(1024*1024))
 	case strings.Contains(msg, "context deadline exceeded"), strings.Contains(msg, "Client.Timeout"):
 		return "Query timed out. Try reducing the time range, increasing the timeout, or enabling query splitting."
 	case strings.Contains(msg, "connection refused"):
 		return "Cannot connect to Arc — connection refused."
 	case strings.Contains(msg, "no such host"):
 		return "Cannot connect to Arc — hostname not found."
-	case strings.Contains(msg, "response body exceeded"):
-		return "Query result exceeded the configured size limit. Add LIMIT or narrow the time range."
 	case strings.HasPrefix(msg, "Arc error (HTTP "):
 		// Preserve the HTTP status (already a category, not a detail) but drop
 		// the server-supplied message body.
