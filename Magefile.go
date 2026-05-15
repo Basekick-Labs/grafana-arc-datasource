@@ -77,23 +77,13 @@ func Build() error {
 // BuildAll builds backend binaries for every platform Grafana ships on. Same
 // no-Clean behavior as Build (preserves the frontend bundle).
 //
-// Outputs to `dist/<plugin.json#executable>_<os>_<arch>` (and `.exe` on Windows) per
-// Grafana SDK loader expectations (R2-CR6).
+// Outputs to `dist/<plugin.json#executable>_<os>_<arch>` (and `.exe` on Windows)
+// per Grafana SDK loader expectations (R2-CR6). The platform list is shared
+// with CleanBackend via buildPlatforms() so a new target gets cleaned too.
 func BuildAll() error {
-	platforms := []struct {
-		os   string
-		arch string
-	}{
-		{"linux", "amd64"},
-		{"linux", "arm64"},
-		{"linux", "arm"},
-		{"darwin", "amd64"},
-		{"darwin", "arm64"},
-		{"windows", "amd64"},
-	}
-	for _, platform := range platforms {
-		fmt.Printf("Building for %s/%s...\n", platform.os, platform.arch)
-		if err := buildPlatform(platform.os, platform.arch); err != nil {
+	for _, p := range buildPlatforms() {
+		fmt.Printf("Building for %s/%s...\n", p.os, p.arch)
+		if err := buildPlatform(p.os, p.arch); err != nil {
 			return err
 		}
 	}
@@ -103,14 +93,10 @@ func BuildAll() error {
 // buildPlatform builds the backend binary for one OS/arch combination and
 // places it where the Grafana SDK loader expects to find it.
 func buildPlatform(goos, goarch string) error {
-	binary := fmt.Sprintf("%s_%s_%s", pluginName(), goos, goarch)
-	if goos == "windows" {
-		binary += ".exe"
-	}
 	if err := os.MkdirAll("dist", 0755); err != nil {
 		return err
 	}
-	outPath := filepath.Join("dist", binary)
+	outPath := filepath.Join("dist", platformBinary(goos, goarch))
 	env := map[string]string{"GOOS": goos, "GOARCH": goarch, "CGO_ENABLED": "0"}
 	// Pin GOARM=7 on linux/arm so the binary actually runs on the hardware
 	// users have. Go's default GOARM=6 targets ARMv6 (Raspberry Pi 1 / Zero
@@ -148,23 +134,58 @@ func Clean() error {
 	return nil
 }
 
-// CleanBackend removes only the backend binaries from dist/, preserving the
-// webpack frontend output. Useful inside a single dev iteration where you
-// want to force a backend rebuild without re-running `npm run build`.
+// CleanBackend removes only the backend binaries — both the per-platform
+// outputs in `dist/<exe>_<os>_<arch>` and any stray root-level `<exe>` /
+// `<exe>.exe` from older `go build` invocations — while preserving the
+// webpack frontend output in dist/. Useful inside a single dev iteration
+// where you want to force a backend rebuild without re-running
+// `npm run build`.
+//
+// Uses the same buildPlatforms() set as BuildAll rather than a `<exe>_*`
+// glob (which could in principle match non-binary files sharing the
+// prefix). The known-platforms list is the only set BuildAll ever produces.
 func CleanBackend() error {
-	fmt.Println("Cleaning backend binaries from dist/...")
-	matches, err := filepath.Glob(filepath.Join("dist", pluginName()+"_*"))
-	if err != nil {
-		return err
+	fmt.Println("Cleaning backend binaries...")
+	for _, p := range buildPlatforms() {
+		_ = sh.Rm(filepath.Join("dist", platformBinary(p.os, p.arch)))
 	}
-	for _, m := range matches {
-		if err := sh.Rm(m); err != nil {
-			return err
-		}
-	}
+	// Legacy: `mage build` (single-platform target) used to drop the binary
+	// at repo root. New shape puts it under dist/, but clean up any stragglers
+	// from older trees.
 	_ = sh.Rm(pluginName())
 	_ = sh.Rm(pluginName() + ".exe")
 	return nil
+}
+
+// platform describes one cross-compile target.
+type platform struct {
+	os   string
+	arch string
+}
+
+// buildPlatforms returns the canonical list of (os, arch) targets we build
+// release binaries for. Used by BuildAll and CleanBackend so the two stay
+// in lock-step — adding a platform to BuildAll automatically extends
+// CleanBackend's cleanup scope.
+func buildPlatforms() []platform {
+	return []platform{
+		{"linux", "amd64"},
+		{"linux", "arm64"},
+		{"linux", "arm"},
+		{"darwin", "amd64"},
+		{"darwin", "arm64"},
+		{"windows", "amd64"},
+	}
+}
+
+// platformBinary returns the filename for one platform's backend binary,
+// per Grafana SDK loader expectations (R2-CR6).
+func platformBinary(goos, goarch string) string {
+	name := fmt.Sprintf("%s_%s_%s", pluginName(), goos, goarch)
+	if goos == "windows" {
+		name += ".exe"
+	}
+	return name
 }
 
 // Test runs the Go test suite across the whole module (./...) so any
