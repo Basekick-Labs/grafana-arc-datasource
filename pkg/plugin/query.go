@@ -65,8 +65,15 @@ func truncateForLog(s string) string {
 func formatRequestError(err error) error {
 	friendly := "Request to Arc failed"
 	switch {
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-		friendly = "Query timed out or was cancelled — try reducing the time range, increasing the timeout in datasource settings, or enabling query splitting"
+	case errors.Is(err, context.Canceled):
+		// User-initiated cancellation (Grafana panel edit, dashboard close,
+		// click-cancel). Grafana surfaces "Query canceled" already; a verbose
+		// "try reducing the time range" message confuses users who weren't
+		// timing out. Keep the error chain (so errors.Is still detects it)
+		// but use a neutral phrase.
+		friendly = "Query canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		friendly = "Query timed out — try reducing the time range, increasing the timeout in datasource settings, or enabling query splitting"
 	case errors.Is(err, errBlockedAddr):
 		friendly = "Arc URL resolves to a blocked address (private/loopback). Update the datasource URL or enable Allow Private IPs."
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):

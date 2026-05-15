@@ -1265,7 +1265,7 @@ func TestFormatRequestError_UsesTypedErrors(t *testing.T) {
 		expectIn string
 	}{
 		{"deadline-exceeded", context.DeadlineExceeded, "timed out"},
-		{"canceled", context.Canceled, "cancelled"},
+		{"canceled", context.Canceled, "canceled"},
 		{"blocked-addr", errBlockedAddr, "blocked address"},
 		{"wrapped-deadline", fmt.Errorf("wrap: %w", context.DeadlineExceeded), "timed out"},
 		{"dns-error", &net.DNSError{Err: "no such host", Name: "arc.example.com"}, "hostname not found"},

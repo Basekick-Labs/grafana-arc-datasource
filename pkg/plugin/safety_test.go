@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/http"
@@ -251,9 +252,18 @@ func TestSanitizeUserError_StripsServerDetail(t *testing.T) {
 		expect string
 	}{
 		{
+			// Real context.DeadlineExceeded so the typed-error branch fires.
 			name:   "timeout",
-			err:    errors.New("context deadline exceeded"),
+			err:    context.DeadlineExceeded,
 			expect: "timed out",
+		},
+		{
+			// User-cancelled query — must be distinguished from timeout and
+			// must use the neutral "Query canceled" message (not "try
+			// reducing the time range" which confuses interactive users).
+			name:   "user-cancel",
+			err:    context.Canceled,
+			expect: "canceled",
 		},
 		{
 			name:   "refused",

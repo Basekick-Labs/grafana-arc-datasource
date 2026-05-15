@@ -252,6 +252,14 @@ func newHTTPClient(timeout time.Duration, policy dialPolicy) *http.Client {
 // The full error is logged server-side for operator diagnostics; the returned
 // string keeps the high-level category but strips identifiers and paths.
 func sanitizeUserError(refID string, err error) string {
+	// User-initiated cancellation is benign — Grafana cancels the in-flight
+	// request when the user edits a query, changes the dashboard, or
+	// navigates away. Logging at Error level on every panel edit would
+	// flood the operator's log; log at Debug and return a neutral message.
+	if errors.Is(err, context.Canceled) {
+		log.DefaultLogger.Debug("Arc query canceled by client", "refId", refID)
+		return "Query canceled"
+	}
 	log.DefaultLogger.Error("Arc query failed", "refId", refID, "error", err.Error())
 	msg := err.Error()
 	// Typed-error matching first (preferred). String contains is a fallback
@@ -265,7 +273,7 @@ func sanitizeUserError(refID string, err error) string {
 		// didn't tell the user how to fix it. The cap is now per-datasource
 		// via MaxResponseMB — point them at it.
 		return fmt.Sprintf("Query result exceeded the configured size limit (%d MiB). Raise 'Max Response MB' in datasource settings, add LIMIT, or narrow the time range.", maxBytesErr.Limit/(1024*1024))
-	case strings.Contains(msg, "context deadline exceeded"), strings.Contains(msg, "Client.Timeout"):
+	case errors.Is(err, context.DeadlineExceeded), strings.Contains(msg, "Client.Timeout"):
 		return "Query timed out. Try reducing the time range, increasing the timeout, or enabling query splitting."
 	case strings.Contains(msg, "connection refused"):
 		return "Cannot connect to Arc — connection refused."
