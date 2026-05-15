@@ -37,7 +37,7 @@ export function ConfigEditor(props: Props) {
 
   const onTimeoutChange = (event: ChangeEvent<HTMLInputElement>) => {
     const timeout = parseInt(event.target.value, 10);
-    onOptionsChange({ ...options, jsonData: { ...jsonData, timeout: isNaN(timeout) ? 30 : timeout } });
+    onOptionsChange({ ...options, jsonData: { ...jsonData, timeout: isNaN(timeout) || timeout < 1 ? 30 : timeout } });
   };
 
   const onUseArrowChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -63,7 +63,11 @@ export function ConfigEditor(props: Props) {
   };
 
   const onAPIKeyChange = (event: ChangeEvent<HTMLInputElement>) => {
-    onOptionsChange({ ...options, secureJsonData: { apiKey: event.target.value } });
+    // Spread existing secureJsonData rather than overwrite. Currently
+    // `apiKey` is the only secure field, but if another lands later the
+    // overwrite form would silently drop it on every keystroke in the API
+    // key input. `onResetAPIKey` below already uses this pattern.
+    onOptionsChange({ ...options, secureJsonData: { ...secureJsonData, apiKey: event.target.value } });
   };
 
   const onResetAPIKey = () => {
