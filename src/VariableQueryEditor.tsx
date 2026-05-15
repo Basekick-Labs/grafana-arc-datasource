@@ -1,5 +1,7 @@
-import React, { useState } from 'react';
-import { InlineField, TextArea } from '@grafana/ui';
+import React, { useEffect, useState } from 'react';
+import { InlineField, TextArea, useStyles2 } from '@grafana/ui';
+import { GrafanaTheme2 } from '@grafana/data';
+import { css } from '@emotion/css';
 
 interface VariableQuery {
   query: string;
@@ -10,8 +12,17 @@ interface VariableQueryProps {
   onChange: (query: VariableQuery, definition: string) => void;
 }
 
-export const VariableQueryEditor: React.FC<VariableQueryProps> = ({ query, onChange }) => {
+export function VariableQueryEditor({ query, onChange }: VariableQueryProps) {
+  const styles = useStyles2(getStyles);
   const [state, setState] = useState(query);
+
+  // Sync local state when the parent passes a new `query` prop (e.g. a
+  // different variable is selected in the dropdown above this editor).
+  // Without this, useState(query) only captures the initial value and
+  // the editor stays stuck on the old variable's SQL. (R1 H6)
+  useEffect(() => {
+    setState(query);
+  }, [query]);
 
   const saveQuery = () => {
     onChange(state, state.query);
@@ -33,30 +44,41 @@ export const VariableQueryEditor: React.FC<VariableQueryProps> = ({ query, onCha
         grow
       >
         <TextArea
+          className={styles.textarea}
           value={state.query || ''}
           onChange={handleChange}
           onBlur={saveQuery}
           placeholder="SELECT DISTINCT host FROM telegraf.cpu ORDER BY host"
           rows={3}
-          style={{
-            fontFamily: 'monospace',
-            fontSize: '13px',
-            width: '100%'
-          }}
         />
       </InlineField>
 
-      <div style={{ marginTop: '8px', marginLeft: '20px', paddingLeft: '8px' }}>
-        <small style={{ color: '#6e6e6e', display: 'block', lineHeight: '1.6' }}>
+      <div className={styles.examples}>
+        <small>
           <strong>Examples:</strong>
-          <br />
-          • Get distinct hosts: <code style={{ fontSize: '12px' }}>SELECT DISTINCT host FROM telegraf.cpu ORDER BY host</code>
-          <br />
-          • Get tables: <code style={{ fontSize: '12px' }}>SHOW TABLES</code>
-          <br />
-          • Get databases: <code style={{ fontSize: '12px' }}>SHOW DATABASES</code>
+          <br />• Get distinct hosts: <code className={styles.code}>SELECT DISTINCT host FROM telegraf.cpu ORDER BY host</code>
+          <br />• Get tables: <code className={styles.code}>SHOW TABLES</code>
+          <br />• Get databases: <code className={styles.code}>SHOW DATABASES</code>
         </small>
       </div>
     </>
   );
-};
+}
+
+const getStyles = (theme: GrafanaTheme2) => ({
+  textarea: css({
+    fontFamily: theme.typography.fontFamilyMonospace,
+    fontSize: '13px',
+    width: '100%',
+  }),
+  examples: css({
+    marginTop: theme.spacing(1),
+    marginLeft: theme.spacing(2.5),
+    paddingLeft: theme.spacing(1),
+    color: theme.colors.text.secondary,
+    lineHeight: 1.6,
+  }),
+  code: css({
+    fontSize: '12px',
+  }),
+});

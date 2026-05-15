@@ -5,10 +5,22 @@ import {
   CoreApp,
   ScopedVars,
   VariableWithMultiSupport,
+  LegacyMetricFindQueryOptions,
 } from '@grafana/data';
 import { frameToMetricFindValue, DataSourceWithBackend, getTemplateSrv } from '@grafana/runtime';
 import { ArcQuery, ArcDataSourceOptions, defaultQuery } from './types';
 import { lastValueFrom } from 'rxjs';
+
+/**
+ * Shapes a `metricFindQuery` argument can arrive as. Grafana's
+ * `DataSourceApi.metricFindQuery` is typed as `(query: any, ...)` upstream so
+ * it can't narrow for us; this is the set we accept in practice.
+ *  - plain string: the SQL text directly
+ *  - object: legacy variable-query shapes from other datasources we want to
+ *    interoperate with (Postgres, MySQL, MSSQL all use `rawSql`; the Arc-
+ *    native shape uses `sql`)
+ */
+type VariableQueryInput = string | { sql?: string; query?: string; rawSql?: string } | null | undefined;
 
 /**
  * Arc DataSource - extends DataSourceWithBackend to automatically handle
@@ -20,26 +32,13 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
   }
 
   /**
-   * Query for template variables
+   * Query for template variables. Accepts both string SQL and an object
+   * containing one of `sql`/`query`/`rawSql` (the latter two for cross-
+   * datasource compatibility — Postgres/MySQL/MSSQL/ClickHouse all use
+   * `rawSql`).
    */
-  async metricFindQuery(query: any, options?: any): Promise<MetricFindValue[]> {
-    // Handle both string SQL and query object
-    let sqlQuery: string;
-
-    if (typeof query === 'string') {
-      // Simple string query
-      sqlQuery = query;
-    } else if (query && typeof query === 'object') {
-      // Query object - extract SQL from various possible field names
-      sqlQuery = query.sql || query.query || query.rawSql || '';
-
-      // Log to help debug
-      if (!sqlQuery) {
-        console.warn('metricFindQuery received object without sql:', query);
-      }
-    } else {
-      sqlQuery = '';
-    }
+  async metricFindQuery(query: VariableQueryInput, options?: LegacyMetricFindQueryOptions): Promise<MetricFindValue[]> {
+    const sqlQuery = extractVariableSQL(query);
 
     const target: ArcQuery = {
       refId: 'metricFindQuery',
@@ -47,20 +46,32 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
       format: 'table',
     };
 
-    return lastValueFrom(
-      super.query({
-        ...(options ?? {}), // includes 'range'
-        targets: [target],
-      })
-    ).then(this.toMetricFindValue);
+    // Build the DataQueryRequest by spreading the LegacyMetricFindQueryOptions
+    // (which carries `range`, `scopedVars`, etc.) and replacing `targets`.
+    // The `as never` cast is the standard escape hatch other Grafana
+    // datasources (Postgres, MySQL) use for this exact pattern — the
+    // upstream LegacyMetricFindQueryOptions is structurally compatible with
+    // a DataQueryRequest minus targets, but the type system can't prove it.
+    const request = { ...(options ?? {}), targets: [target] } as never;
+    return lastValueFrom(super.query(request)).then(this.toMetricFindValue);
   }
 
   toMetricFindValue(rsp: DataQueryResponse): MetricFindValue[] {
     const data = rsp.data ?? [];
-    // Create MetricFindValue object for all frames
     const values = data.map((d) => frameToMetricFindValue(d)).flat();
-    // Filter out duplicate elements
-    return values.filter((elm, idx, self) => idx === self.findIndex((t) => t.text === elm.text));
+    // Dedup by `.text` in a single linear pass via Set lookup — was
+    // O(N²) via findIndex inside filter (R1 M25). Order-preserving.
+    const seen = new Set<string>();
+    const out: MetricFindValue[] = [];
+    for (const v of values) {
+      const key = String(v.text);
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      out.push(v);
+    }
+    return out;
   }
 
   getDefaultQuery(_: CoreApp): Partial<ArcQuery> {
@@ -99,4 +110,20 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
       sql: getTemplateSrv().replace(query.sql, scopedVars, this.interpolateVariable),
     };
   }
+}
+
+/**
+ * Extracts SQL text from a `metricFindQuery` argument, handling every
+ * variable-query shape Grafana datasources have used historically. Returns
+ * an empty string if no SQL is present (Grafana will surface "no data"
+ * rather than the plugin throwing).
+ */
+function extractVariableSQL(query: VariableQueryInput): string {
+  if (typeof query === 'string') {
+    return query;
+  }
+  if (query && typeof query === 'object') {
+    return query.sql ?? query.query ?? query.rawSql ?? '';
+  }
+  return '';
 }

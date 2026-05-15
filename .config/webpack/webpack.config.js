@@ -38,6 +38,9 @@ const config = (env) => ({
     '@grafana/ui',
     '@grafana/runtime',
     '@grafana/data',
+    // @emotion/css is bundled by @grafana/ui — externalizing avoids a
+    // duplicate ~20 KB copy in our module bundle.
+    '@emotion/css',
   ],
 
   mode: env.production ? 'production' : 'development',
