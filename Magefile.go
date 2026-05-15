@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
@@ -26,21 +27,37 @@ import (
 // back to "gpx_arc" only if plugin.json is missing/malformed so a
 // stripped-down checkout (or an early bootstrap) still produces a
 // recognizable filename.
+//
+// Memoized via sync.Once: a single `BuildAll` invocation calls this 6
+// times (once per platform) plus more from Clean/CleanBackend.
+// Repeated filesystem reads and duplicate stderr warnings on missing
+// plugin.json are wasted work — sync.Once also makes it safe under
+// Mage's parallel target execution.
+var (
+	pluginNameOnce  sync.Once
+	pluginNameValue string
+)
+
 func pluginName() string {
-	const fallback = "gpx_arc"
-	data, err := os.ReadFile("plugin.json")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warn: could not read plugin.json (%v); using fallback executable name %q\n", err, fallback)
-		return fallback
-	}
-	var meta struct {
-		Executable string `json:"executable"`
-	}
-	if err := json.Unmarshal(data, &meta); err != nil || meta.Executable == "" {
-		fmt.Fprintf(os.Stderr, "warn: could not parse plugin.json#executable; using fallback %q\n", fallback)
-		return fallback
-	}
-	return meta.Executable
+	pluginNameOnce.Do(func() {
+		const fallback = "gpx_arc"
+		data, err := os.ReadFile("plugin.json")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: could not read plugin.json (%v); using fallback executable name %q\n", err, fallback)
+			pluginNameValue = fallback
+			return
+		}
+		var meta struct {
+			Executable string `json:"executable"`
+		}
+		if err := json.Unmarshal(data, &meta); err != nil || meta.Executable == "" {
+			fmt.Fprintf(os.Stderr, "warn: could not parse plugin.json#executable; using fallback %q\n", fallback)
+			pluginNameValue = fallback
+			return
+		}
+		pluginNameValue = meta.Executable
+	})
+	return pluginNameValue
 }
 
 // Default target runs when `mage` is invoked with no arguments.
