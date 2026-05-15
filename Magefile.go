@@ -71,7 +71,24 @@ func buildPlatform(goos, goarch string) error {
 	}
 	outPath := filepath.Join("dist", binary)
 	env := map[string]string{"GOOS": goos, "GOARCH": goarch, "CGO_ENABLED": "0"}
-	return sh.RunWith(env, "go", "build", "-o", outPath, "./pkg")
+	// Pin GOARM=7 on linux/arm so the binary actually runs on the hardware
+	// users have. Go's default GOARM=6 targets ARMv6 (Raspberry Pi 1 / Zero
+	// W) but lacks hardware float, which trips Pi 3/4/5 and most modern ARM
+	// SBCs. GOARM=7 matches what the Grafana official plugins ship.
+	if goarch == "arm" {
+		env["GOARM"] = "7"
+	}
+	// -trimpath strips the local build-machine path from the binary
+	//   (reproducibility, no leaking /Users/nacho/... into a signed plugin).
+	// -ldflags="-s -w" strips symbol tables and debug info
+	//   (~30% smaller binary; Grafana plugins ship cross-compiled, so
+	//    binary size matters in the signed bundle).
+	// Both are baseline recommendations from the Grafana plugin signing
+	// docs and the grafana-plugin-sdk-go README.
+	return sh.RunWith(env, "go", "build",
+		"-trimpath",
+		"-ldflags", "-s -w",
+		"-o", outPath, "./pkg")
 }
 
 // Clean removes the entire dist/ tree plus any stray root-level binaries.
