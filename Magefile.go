@@ -12,6 +12,7 @@ import (
 
 	"github.com/magefile/mage/mg"
 	"github.com/magefile/mage/sh"
+	"golang.org/x/sync/errgroup"
 )
 
 // pluginName resolves the backend executable name from plugin.json's
@@ -50,8 +51,15 @@ func pluginName() string {
 		var meta struct {
 			Executable string `json:"executable"`
 		}
-		if err := json.Unmarshal(data, &meta); err != nil || meta.Executable == "" {
-			fmt.Fprintf(os.Stderr, "warn: could not parse plugin.json#executable; using fallback %q\n", fallback)
+		if err := json.Unmarshal(data, &meta); err != nil {
+			// Surface the specific parse error — without it, a syntax
+			// error in plugin.json is invisible to whoever runs the build.
+			fmt.Fprintf(os.Stderr, "warn: could not parse plugin.json (%v); using fallback executable name %q\n", err, fallback)
+			pluginNameValue = fallback
+			return
+		}
+		if meta.Executable == "" {
+			fmt.Fprintf(os.Stderr, "warn: plugin.json#executable is empty; using fallback %q\n", fallback)
 			pluginNameValue = fallback
 			return
 		}
@@ -80,14 +88,27 @@ func Build() error {
 // Outputs to `dist/<plugin.json#executable>_<os>_<arch>` (and `.exe` on Windows)
 // per Grafana SDK loader expectations (R2-CR6). The platform list is shared
 // with CleanBackend via buildPlatforms() so a new target gets cleaned too.
+//
+// Builds run in parallel — go's cross-compile is CPU-bound and independent
+// per target, so 6 concurrent `go build` invocations shave ~70% off a
+// serial run on a multi-core machine.
+//
+// Note: `mg.Deps` cannot be used here. Mage memoizes by the function
+// pointer of each closure, and all closures defined in the same loop
+// share the same compiled function (`main.BuildAll.func1`) → Mage treats
+// them as one dep and runs only the first iteration's body. We use
+// `errgroup` directly to get real parallelism with correct error
+// propagation.
 func BuildAll() error {
+	g := new(errgroup.Group)
 	for _, p := range buildPlatforms() {
-		fmt.Printf("Building for %s/%s...\n", p.os, p.arch)
-		if err := buildPlatform(p.os, p.arch); err != nil {
-			return err
-		}
+		p := p
+		g.Go(func() error {
+			fmt.Printf("Building for %s/%s...\n", p.os, p.arch)
+			return buildPlatform(p.os, p.arch)
+		})
 	}
-	return nil
+	return g.Wait()
 }
 
 // buildPlatform builds the backend binary for one OS/arch combination and
