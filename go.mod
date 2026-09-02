@@ -1,6 +1,6 @@
 module github.com/basekick-labs/grafana-arc-datasource
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/apache/arrow/go/v14 v14.0.2

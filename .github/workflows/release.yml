@@ -28,5 +28,6 @@ jobs:
         with:
           policy_token: ${{ vars.PLUGIN_SIGNING_ENABLED == 'true' && secrets.GRAFANA_ACCESS_POLICY_TOKEN || '' }}
           # The action's default is Go 1.25 with GOTOOLCHAIN=local; go.mod
-          # (via the plugin SDK) requires 1.26.5+.
-          go-version: '1.26.5'
+          # (via the plugin SDK) requires 1.26+, and the catalog's govulncheck
+          # binary scan requires the stdlib fixes in 1.26.6 or later.
+          go-version: '1.26.6'
