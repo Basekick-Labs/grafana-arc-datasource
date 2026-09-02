@@ -5,22 +5,22 @@ High-performance Grafana datasource plugin for Arc time-series database using Ap
 ## Screenshots
 
 ### Dashboard with Real-time Monitoring
-![System monitoring dashboard showing CPU, memory, disk, and network metrics](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/dashboard.png)
+![System monitoring dashboard showing CPU, memory, disk, and network metrics](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/src/img/dashboard.png)
 
 ### Query Editor
-![SQL query editor with Arc datasource](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/query-editor.png)
+![SQL query editor with Arc datasource](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/src/img/query-editor.png)
 
 ### Data Inspector
-![Query results and data inspection](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/inspect.png)
+![Query results and data inspection](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/src/img/inspect.png)
 
 ### Variable Configuration
-![Template variable configuration with dynamic host selection](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/variables.png)
+![Template variable configuration with dynamic host selection](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/src/img/variables.png)
 
 ### Datasource Configuration
-![Arc datasource settings and connection setup](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/datasource.png)
+![Arc datasource settings and connection setup](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/src/img/datasource.png)
 
 ### Alerting
-![Alert rule configuration with Arc SQL queries](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/alerts.png)
+![Alert rule configuration with Arc SQL queries](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/src/img/alerts.png)
 
 ## Features
 
