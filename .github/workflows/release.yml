@@ -11,8 +11,23 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Job-level env because the `secrets` context is not available in step
+    # `if:` expressions; the sign step gates on `env` instead.
+    env:
+      GRAFANA_ACCESS_POLICY_TOKEN: ${{ secrets.GRAFANA_ACCESS_POLICY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
+      # Fail fast before the multi-minute build if the tag doesn't match the
+      # plugin version.
+      - name: Check tag matches plugin version
+        run: |
+          PLUGIN_VERSION=$(jq -r .info.version plugin.json)
+          TAG="${GITHUB_REF#refs/*/}"
+          if [ "v${PLUGIN_VERSION}" != "${TAG}" ]; then
+            echo "Tag ${TAG} does not match plugin.json version ${PLUGIN_VERSION}"
+            exit 1
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -21,9 +36,9 @@ jobs:
           cache: 'npm'
 
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version-file: go.mod
 
       - name: Install Mage
         run: go install github.com/magefile/mage@latest
@@ -31,71 +46,45 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build frontend
-        run: npm run build
-
       - name: Test frontend
         run: npm run test:ci
 
-      - name: Preserve frontend build
-        run: |
-          # Backend build will clean dist/, so save frontend artifacts
-          mkdir -p .frontend-backup
-          cp -r dist/* .frontend-backup/
+      - name: Lint frontend
+        run: npm run lint
 
+      - name: Build frontend
+        run: npm run build
+
+      - name: Test backend
+        run: go test ./...
+
+      # Order matters: `npm run build` wipes dist/ (webpack output.clean),
+      # so backend binaries are built after. The Magefile writes flat
+      # dist/<executable>_<os>_<arch> paths per Grafana SDK loader expectations.
       - name: Build backend
         run: mage -v buildAll
 
-      - name: Merge frontend and backend builds
-        run: |
-          # Copy frontend artifacts back to dist/
-          cp -r .frontend-backup/* dist/
-          # Clean up backup
-          rm -rf .frontend-backup
-
-          # Copy all platform binaries to root with Grafana naming convention
-          # Grafana expects binaries named: executable_os_arch (e.g., gpx_arc_linux_amd64)
-          cp dist/linux_amd64/gpx_arc dist/gpx_arc_linux_amd64
-          cp dist/linux_arm64/gpx_arc dist/gpx_arc_linux_arm64
-          cp dist/linux_arm/gpx_arc dist/gpx_arc_linux_arm
-          cp dist/darwin_amd64/gpx_arc dist/gpx_arc_darwin_amd64
-          cp dist/darwin_arm64/gpx_arc dist/gpx_arc_darwin_arm64
-          cp dist/windows_amd64/gpx_arc.exe dist/gpx_arc_windows_amd64.exe
-
-      # Signing disabled - requires Grafana Labs approval for plugin.publisher scope
-      # Plugin will be distributed as unsigned until officially approved by Grafana
-      # - name: Sign plugin
-      #   run: npm run sign
-      #   env:
-      #     GRAFANA_ACCESS_POLICY_TOKEN: ${{ secrets.GRAFANA_ACCESS_POLICY_TOKEN }}
-      #   if: ${{ env.GRAFANA_ACCESS_POLICY_TOKEN != '' }}
-
-      # Validation disabled - README has relative links which fail validation
-      # We're not submitting to Grafana catalog yet, so validation not needed
-      # - name: Validate plugin
-      #   run: |
-      #     git clone https://github.com/grafana/plugin-validator
-      #     pushd ./plugin-validator/pkg/cmd/plugincheck2
-      #     go install
-      #     popd
-      #     plugincheck2 -config ./plugin-validator/config/default.yaml ${{ steps.metadata.outputs.archive }}
+      # Signs when the GRAFANA_ACCESS_POLICY_TOKEN repo secret is configured
+      # (community signature level; the token's org must own the plugin id
+      # prefix). Skipped silently otherwise so forks can still cut releases.
+      - name: Sign plugin
+        if: ${{ env.GRAFANA_ACCESS_POLICY_TOKEN != '' }}
+        run: npm run sign
 
       - name: Get plugin metadata
         id: metadata
         run: |
-          sudo apt-get install jq
-
           export GRAFANA_PLUGIN_ID=$(cat dist/plugin.json | jq -r .id)
           export GRAFANA_PLUGIN_VERSION=$(cat dist/plugin.json | jq -r .info.version)
           export GRAFANA_PLUGIN_TYPE=$(cat dist/plugin.json | jq -r .type)
           export GRAFANA_PLUGIN_ARTIFACT=${GRAFANA_PLUGIN_ID}-${GRAFANA_PLUGIN_VERSION}.zip
-          export GRAFANA_PLUGIN_ARTIFACT_CHECKSUM=${GRAFANA_PLUGIN_ARTIFACT}.md5
+          export GRAFANA_PLUGIN_ARTIFACT_SHA1SUM=${GRAFANA_PLUGIN_ARTIFACT}.sha1
 
           echo "plugin-id=${GRAFANA_PLUGIN_ID}" >> $GITHUB_OUTPUT
           echo "plugin-version=${GRAFANA_PLUGIN_VERSION}" >> $GITHUB_OUTPUT
           echo "plugin-type=${GRAFANA_PLUGIN_TYPE}" >> $GITHUB_OUTPUT
           echo "archive=${GRAFANA_PLUGIN_ARTIFACT}" >> $GITHUB_OUTPUT
-          echo "archive-checksum=${GRAFANA_PLUGIN_ARTIFACT_CHECKSUM}" >> $GITHUB_OUTPUT
+          echo "archive-sha1sum=${GRAFANA_PLUGIN_ARTIFACT_SHA1SUM}" >> $GITHUB_OUTPUT
 
           echo "github-tag=${GITHUB_REF#refs/*/}" >> $GITHUB_OUTPUT
 
@@ -104,18 +93,17 @@ jobs:
         run: |
           mv dist ${{ steps.metadata.outputs.plugin-id }}
           zip ${{ steps.metadata.outputs.archive }} ${{ steps.metadata.outputs.plugin-id }} -r
-          md5sum ${{ steps.metadata.outputs.archive }} > ${{ steps.metadata.outputs.archive-checksum }}
-          echo "checksum=$(cat ./${{ steps.metadata.outputs.archive-checksum }} | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+          # Keep the `hash  filename` format so `sha1sum -c` accepts the file.
+          sha1sum ${{ steps.metadata.outputs.archive }} > ${{ steps.metadata.outputs.archive-sha1sum }}
+          echo "checksum=$(cut -f1 -d' ' ./${{ steps.metadata.outputs.archive-sha1sum }})" >> $GITHUB_OUTPUT
 
-      # Validation disabled - README has relative links which fail validation
-      # We're not submitting to Grafana catalog yet, so validation not needed
-      # - name: Validate plugin
-      #   run: |
-      #     git clone https://github.com/grafana/plugin-validator
-      #     pushd ./plugin-validator/pkg/cmd/plugincheck2
-      #     go install
-      #     popd
-      #     plugincheck2 -config ./plugin-validator/config/default.yaml ${{ steps.metadata.outputs.archive }}
+      - name: Validate plugin
+        run: |
+          git clone --depth 1 https://github.com/grafana/plugin-validator
+          pushd ./plugin-validator/pkg/cmd/plugincheck2
+          go install
+          popd
+          plugincheck2 -config ./plugin-validator/config/default.yaml ${{ steps.metadata.outputs.archive }}
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v1
@@ -124,7 +112,7 @@ jobs:
           generate_release_notes: true
           files: |
             ./${{ steps.metadata.outputs.archive }}
-            ./${{ steps.metadata.outputs.archive-checksum }}
+            ./${{ steps.metadata.outputs.archive-sha1sum }}
           body: |
             **This is a draft release. Please update the release notes before publishing.**
 
@@ -144,4 +132,4 @@ jobs:
 
             ## Checksums
 
-            - MD5: `${{ steps.package-plugin.outputs.checksum }}`
+            - SHA1: `${{ steps.package-plugin.outputs.checksum }}`

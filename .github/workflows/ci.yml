@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Typecheck frontend
+        run: npm run typecheck
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Test frontend
+        run: npm run test:ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Vet backend
+        run: go vet ./...
+
+      - name: Test backend
+        run: go test -race ./...
+
+      - name: Install Mage
+        run: go install github.com/magefile/mage@latest
+
+      # Build the full plugin bundle and run Grafana's plugin-validator against
+      # it so catalog-submission regressions (metadata, README, permissions)
+      # surface on every PR, not at release time.
+      - name: Build backend (current platform)
+        run: mage -v build
+
+      - name: Package plugin for validation
+        run: |
+          PLUGIN_ID=$(cat dist/plugin.json | jq -r .id)
+          cp -r dist "$PLUGIN_ID"
+          zip -qr "$PLUGIN_ID.zip" "$PLUGIN_ID"
+          echo "PLUGIN_ARCHIVE=$PLUGIN_ID.zip" >> $GITHUB_ENV
+
+      - name: Validate plugin
+        run: |
+          git clone --depth 1 https://github.com/grafana/plugin-validator
+          pushd ./plugin-validator/pkg/cmd/plugincheck2
+          go install
+          popd
+          plugincheck2 -config ./plugin-validator/config/default.yaml "$PLUGIN_ARCHIVE"
