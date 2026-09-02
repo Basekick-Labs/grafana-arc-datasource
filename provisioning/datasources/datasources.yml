@@ -1,0 +1,16 @@
+apiVersion: 1
+
+datasources:
+  - name: 'Arc'
+    type: 'basekick-arc-datasource'
+    access: proxy
+    isDefault: false
+    orgId: 1
+    version: 1
+    editable: true
+    jsonData:
+      url: 'http://localhost:8000'
+      database: 'default'
+      protocol: 'arrow'
+    secureJsonData:
+      apiKey: 'provisioned-dev-api-key'

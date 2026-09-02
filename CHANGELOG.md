@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-09-02
+
+### Changed
+- Migrated the repository to Grafana's official create-plugin scaffolding, as required by the plugin catalog's source and build-tooling checks: plugin.json moved to src/, standard webpack/jest/eslint configuration under .config/, SDK-standard Magefile that emits the Go build manifest, and the grafana/plugin-actions release pipeline.
+- Updated grafana-plugin-sdk-go to v0.296.4 and the frontend Grafana packages to 13.2.1, clearing all high and critical vulnerabilities the catalog's dependency scanner flagged in the previous lockfile.
+- Minimum supported Grafana version is now 12.3 (floor of the current create-plugin toolchain).
+
+### Added
+- Playwright e2e smoke tests (config editor, query editor) running against Grafana in Docker on CI.
+
 ## [1.3.0] - 2026-09-02
 
 ### Added
@@ -76,7 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Backend-only credential access
 - HTTPS support
 
-[Unreleased]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.0.0...v1.1.0

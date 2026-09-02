@@ -223,10 +223,10 @@ Then set alert condition: `WHEN avg() OF query(A, 5m, now) IS ABOVE 80`
 
 ### Prerequisites
 
-- Node.js 18+
-- Go 1.25+
+- Node.js 22+
+- Go 1.26+
 - Mage (Go build tool)
-- Grafana 10.0+
+- Grafana 12.3+
 
 ### Setup
 
@@ -237,11 +237,14 @@ npm install
 # Install Go dependencies
 go mod download
 
-# Full development build: frontend bundle + backend binary into dist/
-mage dev
-
-# Or iterate on the frontend with webpack watch
+# Frontend bundle (watch mode)
 npm run dev
+
+# Backend binary for the current platform
+mage -v build:linux
+
+# Local Grafana with the plugin mounted
+docker compose up
 ```
 
 ### Project Structure
@@ -253,14 +256,14 @@ grafana-arc-datasource/
 │   ├── ConfigEditor.tsx    # Configuration UI
 │   ├── QueryEditor.tsx     # Query editor UI
 │   ├── VariableQueryEditor.tsx
-│   └── module.ts           # Plugin entry point
+│   ├── module.ts           # Plugin entry point
+│   └── plugin.json         # Plugin metadata
 ├── pkg/
 │   ├── plugin/
 │   │   ├── datasource.go   # Backend datasource
 │   │   ├── query.go        # Query handling
 │   │   └── arrow.go        # Arrow protocol implementation
 │   └── main.go
-├── plugin.json             # Plugin metadata
 ├── package.json
 ├── go.mod
 └── README.md

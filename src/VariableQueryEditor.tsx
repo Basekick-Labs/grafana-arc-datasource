@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { InlineField, TextArea, useStyles2 } from '@grafana/ui';
 import { GrafanaTheme2 } from '@grafana/data';
 import { css } from '@emotion/css';
@@ -18,16 +18,18 @@ export function VariableQueryEditor({ query, onChange }: VariableQueryProps) {
 
   // Sync local state when the SQL content of the parent's `query` prop
   // changes (e.g. a different variable is selected in the dropdown above
-  // this editor, or the dashboard JSON is edited externally). The
-  // dependency is `query.query` specifically — NOT the `query` object —
-  // because the parent re-renders on every dashboard refresh and may
-  // pass a fresh object reference with the same content, which would
-  // overwrite the user's in-progress unsaved typing. (R1 H6, gemini
-  // round-3 follow-up.)
-  useEffect(() => {
+  // this editor, or the dashboard JSON is edited externally). Compare
+  // `query.query` content, NOT the `query` object reference, because the
+  // parent re-renders on every dashboard refresh and may pass a fresh
+  // object with the same content, which would overwrite the user's
+  // in-progress unsaved typing. (R1 H6.) Uses the adjust-state-during-
+  // render pattern rather than an effect so the resync happens before
+  // paint and stays lint-clean under react-hooks/set-state-in-effect.
+  const [syncedSQL, setSyncedSQL] = useState(query.query);
+  if (query.query !== syncedSQL) {
+    setSyncedSQL(query.query);
     setState(query);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query.query]);
+  }
 
   const saveQuery = () => {
     onChange(state, state.query);
