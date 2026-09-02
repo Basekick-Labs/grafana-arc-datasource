@@ -65,10 +65,16 @@ jobs:
         run: mage -v buildAll
 
       # Signs when the GRAFANA_ACCESS_POLICY_TOKEN repo secret is configured
-      # (community signature level; the token's org must own the plugin id
-      # prefix). Skipped silently otherwise so forks can still cut releases.
+      # AND the PLUGIN_SIGNING_ENABLED repository variable is 'true'.
+      # The variable gate exists because community signing only works after
+      # Grafana has approved the plugin's initial catalog submission; before
+      # that the signing API returns 409 "Field is required: rootUrls" (it
+      # only offers a private signature for unknown plugin ids), and the
+      # first submission is expected to be unsigned anyway. Flip the variable
+      # on once the plugin is in the catalog; from then on a signing failure
+      # fails the release loudly instead of shipping unsigned.
       - name: Sign plugin
-        if: ${{ env.GRAFANA_ACCESS_POLICY_TOKEN != '' }}
+        if: ${{ env.GRAFANA_ACCESS_POLICY_TOKEN != '' && vars.PLUGIN_SIGNING_ENABLED == 'true' }}
         run: npm run sign
 
       - name: Get plugin metadata
