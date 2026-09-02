@@ -14,18 +14,26 @@ import (
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
-// parseArcError extracts a human-readable error from Arc's JSON error
-// response. Arc returns errors as `{"error": "message"}` or plain text. Body
-// is truncated to maxErrorBodyBytes, backing off to the previous rune boundary
-// so the result is always valid UTF-8 even if the body byte-cap fell inside a
-// multi-byte sequence (L8 fix).
+// parseArcError extracts a human-readable error from Arc's error response.
+// Arc returns errors as JSON `{"error": "message"}` on most paths, as a
+// MessagePack map with the same `error` key on the msgpack query endpoint,
+// or as plain text. Body is truncated to maxErrorBodyBytes, backing off to
+// the previous rune boundary so the result is always valid UTF-8 even if the
+// body byte-cap fell inside a multi-byte sequence (L8 fix).
 func parseArcError(statusCode int, body []byte) string {
 	var parsed struct {
-		Error string `json:"error"`
+		Error string `json:"error" msgpack:"error"`
 	}
 	if json.Unmarshal(body, &parsed) == nil && parsed.Error != "" {
+		return fmt.Sprintf("Arc error (HTTP %d): %s", statusCode, truncateForLog(parsed.Error))
+	}
+	// The msgpack query endpoint encodes its own errors (400/429/500/504) as
+	// msgpack; auth-middleware and cluster-gate errors stay JSON even on that
+	// route, which the branch above already handled.
+	if msgpack.Unmarshal(body, &parsed) == nil && parsed.Error != "" {
 		return fmt.Sprintf("Arc error (HTTP %d): %s", statusCode, truncateForLog(parsed.Error))
 	}
 	text := strings.TrimSpace(string(body))

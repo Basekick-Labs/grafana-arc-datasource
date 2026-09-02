@@ -153,6 +153,12 @@ func createEmptyField(f arrow.Field) *data.Field {
 		return data.NewField(f.Name, nil, []*bool{})
 	case arrow.TIMESTAMP:
 		return data.NewField(f.Name, nil, []*time.Time{})
+	case arrow.DATE32:
+		// DuckDB DATE columns. Decoded to *time.Time for parity with the
+		// msgpack path, which receives date32 as a timestamp extension —
+		// without this case the arrow path rendered dates as strings and
+		// flipping the protocol selector changed the field type.
+		return data.NewField(f.Name, nil, []*time.Time{})
 	default:
 		// Fallback to nullable string for unsupported types — the writer
 		// path's default branch must match this (R2-HI12).
@@ -283,6 +289,12 @@ func writeArrowColumnIntoField(field *data.Field, col arrow.Array, startIdx int)
 			return writeUnsupportedAsString(field, col, startIdx)
 		}
 		return writePromotedColumn[uint64](field, arr, arr.Uint64Values(), startIdx, allValid)
+	case arrow.DATE32:
+		arr, ok := col.(*array.Date32)
+		if !ok {
+			return writeUnsupportedAsString(field, col, startIdx)
+		}
+		return writeDate32Column(field, arr, startIdx, allValid)
 	default:
 		// Unsupported Arrow type: render via String() so the column is still
 		// visible (matches createEmptyField's *string fallback — R2-HI12).
@@ -384,6 +396,23 @@ func writeTimestampColumn(field *data.Field, col *array.Timestamp, unit arrow.Ti
 			continue
 		}
 		t := values[i].ToTime(unit)
+		field.Set(startIdx+i, &t)
+	}
+	return nil
+}
+
+// writeDate32Column converts Arrow date32 (days since epoch) into *time.Time
+// via the type's own ToTime (midnight UTC), matching the msgpack path's
+// timestamp-extension decoding of DATE columns.
+func writeDate32Column(field *data.Field, col *array.Date32, startIdx int, allValid bool) error {
+	n := col.Len()
+	for i := 0; i < n; i++ {
+		if !allValid && col.IsNull(i) {
+			var t *time.Time
+			field.Set(startIdx+i, t)
+			continue
+		}
+		t := col.Value(i).ToTime()
 		field.Set(startIdx+i, &t)
 	}
 	return nil

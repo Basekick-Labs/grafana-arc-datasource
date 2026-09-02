@@ -28,12 +28,23 @@ type ArcDataSourceSettings struct {
 	URL                   string `json:"url"`
 	Database              string `json:"database"`
 	Timeout               int    `json:"timeout"`               // seconds
-	UseArrow              *bool  `json:"useArrow"`              // pointer so unset (fresh install) is distinguishable from explicit false
+	Protocol              string `json:"protocol"`              // "arrow" (default), "msgpack", or "json" — wire format for query responses
+	UseArrow              *bool  `json:"useArrow"`              // legacy toggle superseded by Protocol; pointer so unset (fresh install) is distinguishable from explicit false
 	MaxConcurrency        int    `json:"maxConcurrency"`        // max parallel chunks for query splitting (default 4)
 	MaxResponseMB         int    `json:"maxResponseMB"`         // per-response body size cap in MiB (default 1024 — large analytical queries cross 256 MiB easily, R2-CR7)
 	AllowPrivateIPs       bool   `json:"allowPrivateIPs"`       // opt-in: permit Arc URL to resolve to RFC1918/private addresses (corporate intranets)
 	AllowDatabaseOverride bool   `json:"allowDatabaseOverride"` // opt-in: permit per-query `database` field to override the datasource default (R2-HI6 confused-deputy guard)
 }
+
+// Wire protocols for Arc query responses. Arrow is the fastest and the
+// default; MessagePack (stable since Arc 26.09.1) is a typed columnar
+// binary envelope at roughly 78% of Arrow's decode throughput; JSON is the
+// compatibility fallback.
+const (
+	ProtocolArrow   = "arrow"
+	ProtocolMsgpack = "msgpack"
+	ProtocolJSON    = "json"
+)
 
 // ArcQuery represents a query to Arc
 type ArcQuery struct {
@@ -222,9 +233,21 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	if dsSettings.MaxResponseMB > MaxResponseMBCap {
 		dsSettings.MaxResponseMB = MaxResponseMBCap
 	}
-	if dsSettings.UseArrow == nil {
-		t := true
-		dsSettings.UseArrow = &t
+	// Protocol resolution. Existing datasources predate the selector and only
+	// carry the legacy UseArrow toggle: unset/true meant Arrow, explicit false
+	// meant JSON. An unknown value is a validation error rather than a silent
+	// fallback so a typo in provisioned YAML surfaces at Save & Test.
+	switch dsSettings.Protocol {
+	case ProtocolArrow, ProtocolMsgpack, ProtocolJSON:
+	case "":
+		if dsSettings.UseArrow != nil && !*dsSettings.UseArrow {
+			dsSettings.Protocol = ProtocolJSON
+		} else {
+			dsSettings.Protocol = ProtocolArrow
+		}
+	default:
+		return nil, fmt.Errorf("unknown protocol %q (use %q, %q, or %q)",
+			dsSettings.Protocol, ProtocolArrow, ProtocolMsgpack, ProtocolJSON)
 	}
 
 	inst := &ArcInstanceSettings{
@@ -434,10 +457,21 @@ func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceS
 	// but keep the original range for $__interval calculation
 	sql := ApplyMacrosWithSplit(rawSQL, chunk, originalRange)
 
-	if *settings.settings.UseArrow {
+	return executeProtocolQuery(ctx, settings, sql)
+}
+
+// executeProtocolQuery routes a fully macro-expanded SQL statement through
+// the wire protocol the datasource is configured for. Protocol is validated
+// at instance construction, so the default arm only ever sees ProtocolArrow.
+func executeProtocolQuery(ctx context.Context, settings *ArcInstanceSettings, sql string) (*data.Frame, error) {
+	switch settings.settings.Protocol {
+	case ProtocolMsgpack:
+		return queryMsgpack(ctx, settings, sql)
+	case ProtocolJSON:
+		return queryJSON(ctx, settings, sql)
+	default:
 		return queryArrow(ctx, settings, sql)
 	}
-	return queryJSON(ctx, settings, sql)
 }
 
 // frameSchemaCompatible returns true when `f` can be safely appended into
@@ -728,18 +762,10 @@ func (d *ArcDatasource) querySingle(ctx context.Context, settings *ArcInstanceSe
 		"refId", qm.RefID,
 		"sql", sql,
 		"format", qm.Format,
-		"useArrow", *settings.settings.UseArrow,
+		"protocol", settings.settings.Protocol,
 	)
 
-	var frame *data.Frame
-	var err error
-
-	if *settings.settings.UseArrow {
-		frame, err = queryArrow(ctx, settings, sql)
-	} else {
-		frame, err = queryJSON(ctx, settings, sql)
-	}
-
+	frame, err := executeProtocolQuery(ctx, settings, sql)
 	if err != nil {
 		return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserError(qm.RefID, err))
 	}
@@ -782,7 +808,10 @@ func (d *ArcDatasource) CheckHealth(ctx context.Context, req *backend.CheckHealt
 
 	// Test connection with a simple query against the production decode path,
 	// so a CheckHealth pass actually proves the path real queries use.
-	_, err = queryArrow(ctx, settings, "SHOW DATABASES")
+	// SELECT 1, not SHOW DATABASES: Arc rejects SHOW statements on the Arrow
+	// endpoint (query_arrow.go gates them to the JSON/msgpack paths), so the
+	// previous SHOW-based probe failed Save & Test on the default config.
+	_, err = executeProtocolQuery(ctx, settings, "SELECT 1")
 
 	if err != nil {
 		status = backend.HealthStatusError

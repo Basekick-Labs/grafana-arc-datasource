@@ -3,10 +3,25 @@ import { DataQuery, DataSourceJsonData } from '@grafana/data';
 /**
  * Arc datasource configuration options
  */
+/**
+ * Wire protocol for Arc query responses.
+ * - arrow: Apache Arrow IPC — fastest decode path, the default
+ * - msgpack: columnar MessagePack — stable since Arc 26.09.1, ~78% of
+ *   Arrow's throughput, supports SHOW statements and zstd/gzip compression
+ * - json: compatibility fallback
+ */
+export type ArcProtocol = 'arrow' | 'msgpack' | 'json';
+
 export interface ArcDataSourceOptions extends DataSourceJsonData {
   url?: string;
   database?: string;
   timeout?: number;
+  protocol?: ArcProtocol;
+  /**
+   * Legacy toggle superseded by `protocol`. Kept so datasources saved by
+   * older plugin versions keep their JSON/Arrow choice, and written on
+   * protocol changes so a plugin downgrade still honors the selection.
+   */
   useArrow?: boolean;
   maxConcurrency?: number;
   /**

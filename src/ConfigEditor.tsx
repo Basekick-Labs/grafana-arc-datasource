@@ -1,8 +1,14 @@
 import React, { ChangeEvent } from 'react';
-import { InlineField, Input, SecretInput, Switch, useStyles2 } from '@grafana/ui';
+import { InlineField, Input, RadioButtonGroup, SecretInput, Switch, useStyles2 } from '@grafana/ui';
 import { DataSourcePluginOptionsEditorProps, GrafanaTheme2 } from '@grafana/data';
 import { css } from '@emotion/css';
-import { ArcDataSourceOptions, ArcSecureJsonData } from './types';
+import { ArcDataSourceOptions, ArcProtocol, ArcSecureJsonData } from './types';
+
+const PROTOCOL_OPTIONS: Array<{ label: string; value: ArcProtocol; description: string }> = [
+  { label: 'Arrow', value: 'arrow', description: 'Apache Arrow IPC — fastest, recommended' },
+  { label: 'MessagePack', value: 'msgpack', description: 'Columnar MessagePack — stable since Arc 26.09.1' },
+  { label: 'JSON', value: 'json', description: 'Compatibility fallback' },
+];
 
 interface Props extends DataSourcePluginOptionsEditorProps<ArcDataSourceOptions, ArcSecureJsonData> {}
 
@@ -58,8 +64,17 @@ export function ConfigEditor(props: Props) {
   const onMaxResponseMBChange = handleNumericChange('maxResponseMB');
   const onMaxResponseMBBlur = handleNumericBlur('maxResponseMB', 1024);
 
-  const onUseArrowChange = (event: ChangeEvent<HTMLInputElement>) => {
-    onOptionsChange({ ...options, jsonData: { ...jsonData, useArrow: event.target.checked } });
+  // Resolve the effective protocol the same way the backend does: explicit
+  // `protocol` wins; otherwise the legacy useArrow toggle (false meant JSON).
+  // `||` rather than `??` so a provisioned empty string also falls through
+  // to the legacy resolution instead of leaving no radio selected.
+  const effectiveProtocol: ArcProtocol = jsonData.protocol || (jsonData.useArrow === false ? 'json' : 'arrow');
+
+  const onProtocolChange = (value: ArcProtocol) => {
+    // Also write the legacy useArrow toggle so a plugin downgrade keeps the
+    // closest equivalent behavior (arrow stays arrow, msgpack degrades to
+    // arrow rather than the slow JSON path).
+    onOptionsChange({ ...options, jsonData: { ...jsonData, protocol: value, useArrow: value !== 'json' } });
   };
 
   const onAllowPrivateIPsChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -167,13 +182,11 @@ export function ConfigEditor(props: Props) {
       </InlineField>
 
       <InlineField
-        label="Use Arrow Protocol"
+        label="Protocol"
         labelWidth={LABEL_WIDTH}
-        tooltip="Apache Arrow is a columnar binary format. 3–5x faster than JSON on the wire and on the plugin's decode hot path. Keep enabled unless debugging."
+        tooltip="Wire format for query responses. Arrow is the fastest and recommended. MessagePack is a columnar binary format at roughly 78% of Arrow's throughput that also supports response compression. JSON is the compatibility fallback."
       >
-        <div className={styles.switchCell}>
-          <Switch value={jsonData.useArrow ?? true} onChange={onUseArrowChange} />
-        </div>
+        <RadioButtonGroup options={PROTOCOL_OPTIONS} value={effectiveProtocol} onChange={onProtocolChange} />
       </InlineField>
 
       <InlineField
