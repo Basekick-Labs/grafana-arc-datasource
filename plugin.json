@@ -65,8 +65,8 @@
         "path": "img/alerts.png"
       }
     ],
-    "version": "1.2.0",
-    "updated": "2026-05-14"
+    "version": "1.3.0",
+    "updated": "2026-09-02"
   },
   "dependencies": {
     "grafanaDependency": ">=10.0.0",

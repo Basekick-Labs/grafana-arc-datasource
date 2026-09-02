@@ -5,34 +5,34 @@ High-performance Grafana datasource plugin for Arc time-series database using Ap
 ## Screenshots
 
 ### Dashboard with Real-time Monitoring
-![System monitoring dashboard showing CPU, memory, disk, and network metrics](img/dashboard.png)
+![System monitoring dashboard showing CPU, memory, disk, and network metrics](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/dashboard.png)
 
 ### Query Editor
-![SQL query editor with Arc datasource](img/query-editor.png)
+![SQL query editor with Arc datasource](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/query-editor.png)
 
 ### Data Inspector
-![Query results and data inspection](img/inspect.png)
+![Query results and data inspection](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/inspect.png)
 
 ### Variable Configuration
-![Template variable configuration with dynamic host selection](img/variables.png)
+![Template variable configuration with dynamic host selection](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/variables.png)
 
 ### Datasource Configuration
-![Arc datasource settings and connection setup](img/datasource.png)
+![Arc datasource settings and connection setup](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/datasource.png)
 
 ### Alerting
-![Alert rule configuration with Arc SQL queries](img/alerts.png)
+![Alert rule configuration with Arc SQL queries](https://raw.githubusercontent.com/basekick-labs/grafana-arc-datasource/main/img/alerts.png)
 
 ## Features
 
-- **Apache Arrow Protocol**: Uses Arc's `/api/v1/query/arrow` endpoint for columnar data transfer
-- **High Performance**: Optimized data processing with streaming deserialization
-- **JSON Fallback**: Automatic fallback to JSON endpoint for compatibility
+- **Three wire protocols**: Apache Arrow IPC (default, fastest), columnar MessagePack (stable since Arc 26.09.1), and JSON (compatibility fallback)
+- **High Performance**: Streaming deserialization straight into Grafana DataFrames
+- **Query Splitting**: Large time ranges chunked and executed in parallel, with automatic skip for queries where splitting would change results
 - **Alerting Support**: Full support for Grafana alerting and notifications
-- **SQL Query Editor**: Full SQL support with syntax highlighting
+- **SQL Query Editor**: Direct DuckDB SQL with Grafana macro expansion
 - **Template Variables**: Dynamic dashboard filters with variable support
 - **Time-series Optimized**: Native support for DuckDB time functions
-- **Multi-database**: Query across different Arc databases/schemas
-- **Secure**: API key authentication with secure credential storage
+- **Multi-database**: Query across different Arc databases/schemas (opt-in per-query override)
+- **Secure**: API key authentication with secure credential storage, SSRF-guarded outbound connections
 
 ## Performance
 
@@ -96,56 +96,71 @@ systemctl restart grafana-server
 | API Key | Authentication token | Yes | - |
 | Database | Default database name | No | `default` |
 | Timeout | Query timeout in seconds | No | `30` |
-| Use Arrow | Enable Arrow protocol | No | `true` (recommended) |
+| Protocol | Query response wire format: `Arrow` (fastest, recommended), `MessagePack`, or `JSON` | No | `Arrow` |
+| Max Concurrency | Maximum parallel Arc requests per datasource (query splitting fan-out) | No | `4` |
+| Max Response MB | Per-response body size cap in MiB | No | `1024` |
+| Allow Private IPs | Permit the Arc URL to resolve to private/RFC1918 addresses | No | off |
+| Allow Database Override | Permit per-query `database` field to override the default | No | off |
+
+### Choosing a protocol
+
+- **Arrow** decodes Arc's Arrow IPC stream directly and is the fastest option; keep it unless you have a reason not to.
+- **MessagePack** uses Arc's columnar `/api/v1/query/msgpack` endpoint (stable since Arc 26.09.1). It reaches roughly 78% of Arrow's decode throughput and additionally supports gzip response compression, which can help on constrained links.
+- **JSON** is the slowest path and exists for compatibility and debugging.
 
 ## Usage
 
 ### Query Editor
 
 The Arc datasource provides a SQL query editor with:
-- Syntax highlighting
-- Auto-completion for tables and columns
-- Time range macros
+- Time range macros expanded server-side (safe against injection via literals/comments)
+- Result format selection (time series or table)
+- Query splitting controls and per-query database override
 
 #### Example Queries
 
 **Basic time-series query (CPU usage):**
 ```sql
 SELECT
-  time_bucket(INTERVAL '$__interval', time) as time,
+  $__timeGroup(time, '$__interval') AS time,
   AVG(usage_idle) * -1 + 100 AS cpu_usage,
   host
 FROM telegraf.cpu
 WHERE cpu = 'cpu-total'
   AND $__timeFilter(time)
-GROUP BY time_bucket(INTERVAL '$__interval', time), host
-ORDER BY time ASC
+GROUP BY 1, host
+ORDER BY 1 ASC
 ```
 
 **Memory usage:**
 ```sql
 SELECT
-  time_bucket(INTERVAL '$__interval', time) as time,
+  $__timeGroup(time, '$__interval') AS time,
   AVG(used_percent) AS memory_used,
   host
 FROM telegraf.mem
 WHERE $__timeFilter(time)
-GROUP BY time_bucket(INTERVAL '$__interval', time), host
-ORDER BY time ASC
+GROUP BY 1, host
+ORDER BY 1 ASC
 ```
 
 **Network traffic (bytes to bits):**
 ```sql
 SELECT
-  time_bucket(INTERVAL '$__interval', time) as time,
+  $__timeGroup(time, '$__interval') AS time,
   AVG(bytes_recv) * 8 AS bits_in,
   host,
   interface
 FROM telegraf.net
 WHERE $__timeFilter(time)
-GROUP BY time_bucket(INTERVAL '$__interval', time), host, interface
-ORDER BY time ASC
+GROUP BY 1, host, interface
+ORDER BY 1 ASC
 ```
+
+> Prefer `$__timeGroup` over raw `time_bucket`/`date_trunc` for bucketing:
+> DuckDB's `date_trunc` retains nanosecond residuals on `TIMESTAMP_NS`
+> columns, which makes `GROUP BY` produce per-second rows. The macro expands
+> to integer epoch math that avoids this.
 
 ### Macros
 
@@ -156,7 +171,8 @@ The datasource provides several macros for dynamic queries:
 | `$__timeFilter(columnName)` | Complete time range filter | `WHERE $__timeFilter(time)` |
 | `$__timeFrom()` | Start of time range | `time >= $__timeFrom()` |
 | `$__timeTo()` | End of time range | `time < $__timeTo()` |
-| `$__interval` | Grafana's calculated interval | `time_bucket(INTERVAL '$__interval', time)` |
+| `$__interval` | Grafana's calculated interval | `$__timeGroup(time, '$__interval')` |
+| `$__timeGroup(columnName, interval)` | Epoch-based time bucketing | `$__timeGroup(time, '1m') AS time` |
 
 ### Variables
 
@@ -208,7 +224,7 @@ Then set alert condition: `WHEN avg() OF query(A, 5m, now) IS ABOVE 80`
 ### Prerequisites
 
 - Node.js 18+
-- Go 1.21+
+- Go 1.25+
 - Mage (Go build tool)
 - Grafana 10.0+
 
@@ -221,11 +237,11 @@ npm install
 # Install Go dependencies
 go mod download
 
-# Start development
-npm run dev
+# Full development build: frontend bundle + backend binary into dist/
+mage dev
 
-# In another terminal, run backend
-mage -v watch
+# Or iterate on the frontend with webpack watch
+npm run dev
 ```
 
 ### Project Structure
@@ -276,31 +292,31 @@ Frontend (TypeScript)
   ↓
 Backend (Go)
   ↓
-Arc API (/api/v1/query/arrow)
+Arc API (/api/v1/query/arrow, /api/v1/query/msgpack, or /api/v1/query)
   ↓
-Apache Arrow IPC Response
+Columnar Response (Arrow IPC / MessagePack / JSON)
   ↓
-Arrow Decoder (Go)
+Streaming Decoder (Go)
   ↓
 Grafana DataFrame
   ↓
 Visualization
 ```
 
-### Arrow Protocol
+### Wire Protocols
 
-The datasource uses Arc's Arrow endpoint for optimal performance:
+Regardless of protocol, the flow is the same:
 
-1. **Query Submission**: SQL query sent to Arc with time range
-2. **Columnar Response**: Arc returns Apache Arrow IPC stream
-3. **Streaming Decode**: Go Arrow library reads the IPC stream record-by-record
-4. **DataFrame Conversion**: Arrow Table → Grafana DataFrame
+1. **Query Submission**: SQL query sent to Arc with time range macros expanded
+2. **Columnar Response**: Arc returns the result in the configured wire format
+3. **Streaming Decode**: The backend decodes the response incrementally
+4. **DataFrame Conversion**: Columns land in Grafana DataFrames with identical field types across all three protocols
 5. **Rendering**: Grafana visualizes data
 
-Benefits:
+Benefits of the binary formats (Arrow, MessagePack) over JSON:
 - No JSON serialization/deserialization overhead
-- Columnar format well-suited for time-series
-- Type-safe data transfer
+- Columnar layout well-suited for time-series
+- Typed data transfer, no string-based type inference
 
 ## Troubleshooting
 
@@ -344,37 +360,34 @@ Benefits:
 
 ## Performance Tips
 
-1. **Use Arrow protocol**: Arrow is enabled by default and provides significantly faster data transfer compared to JSON
+1. **Keep the Arrow protocol**: Arrow is the default and the fastest transfer format; MessagePack is a close second, JSON the slowest
 2. **Optimize time ranges**: Smaller time ranges mean faster queries. Use Grafana's time picker to narrow down your analysis
-3. **Leverage time_bucket**: Use appropriate intervals in `time_bucket()` to avoid returning millions of points. Grafana will automatically adjust `$__interval` based on your dashboard width
+3. **Leverage $__timeGroup**: Bucket with `$__timeGroup(time, '$__interval')` to avoid returning millions of points. Grafana automatically adjusts `$__interval` based on your dashboard width
 4. **Index your time column**: Arc automatically indexes time columns, but ensure your queries filter by time first for optimal performance
 5. **Enable caching**: Configure Grafana query caching for frequently accessed data
 
 ## Contributing
 
-Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions welcome! Please see [CONTRIBUTING.md](https://github.com/basekick-labs/grafana-arc-datasource/blob/main/CONTRIBUTING.md) for guidelines.
 
 ### Building a Release
 
 ```bash
-# Build frontend
+# Build frontend, then backend binaries for all platforms into dist/
 npm run build
-
-# Build backend for all platforms
 mage -v buildAll
-
-# Create release archive
-npm run package
 ```
+
+Releases are cut by pushing a `v*` tag; the GitHub Actions release workflow builds, packages, and validates the plugin archive.
 
 ## License
 
-Apache License 2.0 - see [LICENSE](LICENSE)
+Apache License 2.0 - see [LICENSE](https://github.com/basekick-labs/grafana-arc-datasource/blob/main/LICENSE)
 
 ## Support
 
 - GitHub Issues: https://github.com/basekick-labs/grafana-arc-datasource/issues
-- Arc Documentation: https://docs.arc.io
+- Arc Documentation: https://docs.basekick.net/arc
 - Grafana Plugin Development: https://grafana.com/docs/grafana/latest/developers/plugins/
 
 ## Related Projects

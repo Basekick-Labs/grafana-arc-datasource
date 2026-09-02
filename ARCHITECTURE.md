@@ -25,15 +25,16 @@ The Arc Grafana datasource plugin provides high-performance data visualization f
 │                   Backend Plugin (Go)                        │
 │  • datasource.go - Main datasource logic                    │
 │  • arrow.go - Arrow protocol handler                        │
+│  • msgpack.go - MessagePack protocol handler                │
 │  • query.go - Query execution & macros                      │
 └─────────────────────────────────────────────────────────────┘
                               │
-                              ↓ (HTTP POST /api/v1/query/arrow)
+                              ↓ (HTTP POST /api/v1/query[/arrow|/msgpack])
 ┌─────────────────────────────────────────────────────────────┐
 │                        Arc Database                          │
 │  • DuckDB query engine                                      │
 │  • Parquet storage (MinIO/S3)                               │
-│  • Arrow IPC response                                       │
+│  • Arrow IPC / MessagePack / JSON response                  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,13 +59,13 @@ The Arc Grafana datasource plugin provides high-performance data visualization f
      $__timeFilter(time) → time >= '2025-10-22T00:00:00Z' AND time < '2025-10-22T23:59:59Z'
      $__interval → '1 minute' (calculated based on time range)
      ```
-   - Routes to Arrow or JSON handler based on settings
+   - Routes to the Arrow, MessagePack, or JSON handler based on the configured protocol
 
 4. **Arrow Protocol Handler** (`arrow.go`)
    ```go
    // Send HTTP request to Arc
    POST /api/v1/query/arrow
-   Headers: x-api-key: <token>
+   Headers: Authorization: Bearer <token>
    Body: {"sql": "SELECT ..."}
 
    // Receive Arrow IPC stream
@@ -86,7 +87,7 @@ The Arc Grafana datasource plugin provides high-performance data visualization f
 6. **Response Conversion**
    - Arrow RecordBatch → Grafana DataFrame
    - Type mapping:
-     - `arrow.INT64` → `*int64`
+     - `arrow.INT64` → `*float64` (promoted so Grafana panels treat aggregates as numeric)
      - `arrow.FLOAT64` → `*float64`
      - `arrow.TIMESTAMP` → `*time.Time`
      - `arrow.STRING` → `*string`
@@ -184,7 +185,7 @@ SELECT time_bucket(INTERVAL '1 minute', time) as time, AVG(usage)
     "url": "http://localhost:8000",
     "database": "production",
     "timeout": 30,
-    "useArrow": true
+    "protocol": "arrow"
   },
   "secureJsonData": {
     "apiKey": "<encrypted>"
@@ -220,7 +221,7 @@ SELECT time_bucket(INTERVAL '1 minute', time) as time, AVG(usage)
 - Secure API key input (masked)
 - Database name (optional)
 - Timeout setting
-- Arrow protocol toggle
+- Protocol selector (Arrow / MessagePack / JSON)
 
 **User Experience:**
 ```
@@ -233,7 +234,7 @@ SELECT time_bucket(INTERVAL '1 minute', time) as time, AVG(usage)
 │                                         │
 │ Advanced Settings                       │
 │ Timeout: [30] seconds                   │
-│ Use Arrow: [✓] (recommended)           │
+│ Protocol: (•) Arrow ( ) MsgPack ( ) JSON│
 └─────────────────────────────────────────┘
 ```
 
@@ -354,8 +355,9 @@ func createTimestampField(name string, records []arrow.Record, colIdx int, total
 ```go
 func (d *ArcDatasource) CheckHealth(ctx context.Context, req *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
     // Test with simple query
-    testSQL := "SHOW DATABASES"
-    _, err := QueryArrow(ctx, settings, testSQL, timeRange)
+    // SELECT 1, not SHOW DATABASES: Arc rejects SHOW on the Arrow endpoint
+    testSQL := "SELECT 1"
+    _, err := executeProtocolQuery(ctx, settings, testSQL)
 
     if err != nil {
         return &backend.CheckHealthResult{

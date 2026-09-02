@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-02
+
+### Added
+- MessagePack protocol support: new datasource Protocol selector (Arrow, MessagePack, JSON) wired to Arc's `/api/v1/query/msgpack` endpoint (stable since Arc 26.09.1). The columnar envelope is decoded in a single streaming pass, with identical Grafana field types across all three protocols (int64/uint64 promoted to float64, all fields nullable). The legacy Use Arrow toggle is migrated automatically.
+- MessagePack-aware error parsing: the msgpack endpoint encodes its errors as msgpack; these are now decoded to readable messages instead of falling through to a raw-bytes fallback.
+- CI workflow: build, typecheck, lint, and tests for both frontend and backend on every push and pull request, plus a plugin-validator run against the packaged plugin.
+
+### Fixed
+- Arrow decoder: DuckDB DATE columns (Arrow date32) now decode to time fields instead of strings, matching the MessagePack path so switching protocols never changes a dashboard's field types.
+- Health check: `Save & Test` failed on the default (Arrow) configuration because Arc rejects `SHOW DATABASES` on the Arrow endpoint. The probe now runs `SELECT 1` through the configured protocol.
+- Release workflow: binary copy steps referenced the pre-rewrite Magefile output layout (`dist/linux_amd64/gpx_arc`), which no longer exists, so tag builds failed. The workflow now uses the flat `dist/gpx_arc_<os>_<arch>` layout the Magefile produces, pins Go from `go.mod` instead of a stale 1.21, runs tests before packaging, verifies the tag matches `plugin.json`, and re-enables plugin-validator.
+- Grafana catalog readiness: README links converted to absolute URLs (required by the catalog), dead `docs.arc.io` link replaced with `docs.basekick.net/arc`, LICENSE upgraded to the full Apache 2.0 text, and stale documentation claims removed (editor auto-completion, `mage watch`, `npm run package`).
+
+## [1.2.0] - 2026-05-14
+
+### Fixed
+- Promote INT64/UINT64 Arrow columns to float64 so Grafana panels (Stat, Time series) recognize aggregate results as numeric value fields.
+- Aggregation detection now strips string literals before keyword matching, so a literal such as `'count of things'` no longer disables query splitting.
+- Error chain preserved through request-failure wrapping for programmatic inspection via `errors.Is`/`errors.As`.
+
 ## [1.1.0] - 2026-02-20
 
 ### Fixed
@@ -56,6 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Backend-only credential access
 - HTTPS support
 
-[Unreleased]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/basekick-labs/grafana-arc-datasource/releases/tag/v1.0.0
