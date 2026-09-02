@@ -23,7 +23,7 @@ func queryArrow(ctx context.Context, settings *ArcInstanceSettings, sql string) 
 	if err != nil {
 		return nil, err
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	reader, err := ipc.NewReader(body)
 	if err != nil {

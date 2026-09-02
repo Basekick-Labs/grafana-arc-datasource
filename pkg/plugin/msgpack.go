@@ -24,7 +24,7 @@ func queryMsgpack(ctx context.Context, settings *ArcInstanceSettings, sql string
 	if err != nil {
 		return nil, err
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	// The element cap bounds up-front slice allocations from length headers:
 	// a hostile/buggy server can claim a 4-billion-element array in 5 wire

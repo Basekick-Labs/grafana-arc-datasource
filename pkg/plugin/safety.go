@@ -167,7 +167,7 @@ func isBlockedIP(ip net.IP, policy dialPolicy) bool {
 	}
 	if ip.IsLoopback() {
 		// Loopback is allowed by either flag.
-		return !(policy.allowLoopback || policy.allowPrivate)
+		return !policy.allowLoopback && !policy.allowPrivate
 	}
 	// Non-loopback private ranges: only allowed by allowPrivate.
 	if policy.allowPrivate {

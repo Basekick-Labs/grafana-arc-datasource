@@ -115,7 +115,7 @@ func queryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string) (
 	if err != nil {
 		return nil, err
 	}
-	defer body.Close()
+	defer func() { _ = body.Close() }()
 
 	var result map[string]interface{}
 	if err := json.NewDecoder(body).Decode(&result); err != nil {
