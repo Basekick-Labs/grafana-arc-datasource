@@ -817,12 +817,20 @@ func expandTimeGroup(sql string, tz string) string {
 				if tz == "UTC" {
 					return fmt.Sprintf("date_trunc('%s', %s)", unit, column), true
 				}
-				// Convert to wall-clock in tz, truncate there, then convert the
-				// result back to an instant so Grafana still receives a real
-				// timestamp rather than a naive local one.
+				// timezone(tz, ts), not `ts AT TIME ZONE tz`. The infix form's
+				// direction depends on the operand's type, and which of
+				// TIMESTAMP/TIMESTAMPTZ it yields varies between DuckDB/ICU
+				// builds: on Arc's build the first conversion returned
+				// TIMESTAMPTZ and the second went naive, so the round trip
+				// converted forward twice and shifted the bucket by the UTC
+				// offset (watchdog, 1.3.4: local midnight rendered as noon).
+				// The function form is explicit -- inner call takes the
+				// instant to wall-clock in tz, outer call reads that wall
+				// clock back as an instant -- and yields TIMESTAMPTZ on both
+				// builds.
 				return fmt.Sprintf(
-					"(date_trunc('%s', %s AT TIME ZONE %s) AT TIME ZONE %s)",
-					unit, column, quoteTimezone(tz), quoteTimezone(tz)), true
+					"timezone(%s, date_trunc('%s', timezone(%s, %s)))",
+					quoteTimezone(tz), unit, quoteTimezone(tz), column), true
 			}
 			// Not a whole calendar unit (e.g. '6h'): fall through to epoch math.
 		}

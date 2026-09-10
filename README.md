@@ -173,7 +173,7 @@ The datasource provides several macros for dynamic queries:
 | `$__timeTo()` | End of time range | `time < $__timeTo()` |
 | `$__interval` | Grafana's calculated interval | `$__timeGroup(time, '$__interval')` |
 | `$__timeGroup(columnName, interval)` | Time bucketing, aligned to the dashboard timezone | `$__timeGroup(time, '1d') AS time` |
-| `$__timezone` | Dashboard timezone as a quoted IANA name | `date_trunc('day', time AT TIME ZONE $__timezone)` |
+| `$__timezone` | Dashboard timezone as a quoted IANA name | `timezone($__timezone, time)` |
 
 #### Timezones
 
@@ -200,8 +200,13 @@ For expressions `$__timeGroup` doesn't cover, `$__timezone` expands to the
 dashboard's timezone as a quoted IANA name:
 
 ```sql
-SELECT date_trunc('month', time AT TIME ZONE $__timezone) AT TIME ZONE $__timezone AS time
+SELECT timezone($__timezone, date_trunc('month', timezone($__timezone, time))) AS time
 ```
+
+Prefer the `timezone(zone, ts)` function over the `ts AT TIME ZONE zone`
+infix form: the infix form's direction depends on the operand type, and
+which of `TIMESTAMP`/`TIMESTAMPTZ` it returns differs between DuckDB
+builds.
 
 Both follow the dashboard's timezone setting — including **Browser Time** —
 so a dashboard is correct for every viewer without hardcoding a zone. An

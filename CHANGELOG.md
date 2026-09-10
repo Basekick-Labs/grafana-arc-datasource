@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.5] - 2026-09-10
+
+### Fixed
+- Timezone-aware `$__timeGroup` buckets were shifted by the UTC offset on
+  Arc's DuckDB build. `AT TIME ZONE` applies in a direction that depends on
+  the operand's type, and which type it yields varies between DuckDB/ICU
+  builds, so the round trip converted forward twice and local midnight
+  rendered as noon. Bucketing now uses the explicit `timezone(zone, ts)`
+  function form, which is unambiguous on both builds.
+
 ## [1.3.4] - 2026-09-10
 
 ### Fixed
