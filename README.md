@@ -97,10 +97,20 @@ systemctl restart grafana-server
 | Database | Default database name | No | `default` |
 | Timeout | Query timeout in seconds | No | `30` |
 | Protocol | Query response wire format: `Arrow` (fastest, recommended), `MessagePack`, or `JSON` | No | `Arrow` |
-| Max Concurrency | Maximum parallel Arc requests per datasource (query splitting fan-out) | No | `4` |
+| Max Concurrency | Parallel chunks within a single split query | No | `4` |
+| Max In Flight | Simultaneous Arc requests for this datasource, across all panels | No | `32` |
 | Max Response MB | Per-response body size cap in MiB | No | `1024` |
-| Allow Private IPs | Permit the Arc URL to resolve to private/RFC1918 addresses | No | off |
-| Allow Database Override | Permit per-query `database` field to override the default | No | off |
+| Allow Private IPs | Permit the Arc URL to resolve to private/RFC1918 addresses | No | on |
+| Allow Database Override | Permit per-query `database` field to override the default | No | on |
+
+**Allow Private IPs** is on because self-hosted Arc usually runs on a private
+network or a Docker service name such as `http://arc:8000`. Turn it off to
+require a public address. Link-local and cloud-metadata addresses (including
+`169.254.169.254`) are blocked either way.
+
+**Allow Database Override** is on, matching the per-query override supported
+since 1.1.0. Turn it off when the API key reaches more databases than
+dashboard editors should.
 
 ### Choosing a protocol
 
