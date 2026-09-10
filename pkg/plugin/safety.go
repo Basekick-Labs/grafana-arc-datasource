@@ -298,16 +298,28 @@ func newHTTPClient(timeout time.Duration, policy dialPolicy) *http.Client {
 // the SQL the user wrote, rather than anything about the server. Each names
 // the user's own text back to them and carries no schema they did not already
 // reference, no file path, and no query plan.
-// "Catalog Error" is deliberately absent: it names tables and schemas, which
-// is the one class of detail a dashboard VIEWER (who may have less privilege
-// than the datasource admin) should not learn from a failed panel. The
-// remaining types quote the user's own SQL back at them.
+// duckdbUserErrorPrefixes lists the DuckDB error types whose text contains
+// NOTHING but the user's own SQL. Membership was decided by running each
+// error type against DuckDB 1.4.3 and reading what it actually emits, not by
+// how the name sounds:
+//
+//	Parser Error: "syntax error at or near \"h01\"" — quotes the user's text.
+//	Syntax Error: same shape.
+//
+// Deliberately EXCLUDED, because each leaks something the dashboard viewer
+// never referenced and may not be entitled to see:
+//
+//	Catalog Error:    names tables and schemas.
+//	Binder Error:     appends `Candidate bindings: "secret_salary"` — a list
+//	                  of real column names from the table.
+//	Conversion Error: echoes the offending ROW VALUE, e.g. Could not convert
+//	                  string 'secret-value-xyz' to INT32.
+//	Type Error:       can carry column names from the failing expression.
+//
+// Those stay summarised; their full text is in the server log.
 var duckdbUserErrorPrefixes = []string{
 	"Parser Error",
 	"Syntax Error",
-	"Binder Error",
-	"Conversion Error",
-	"Type Error",
 }
 
 // userFixableArcError returns the DuckDB detail from an Arc error message when

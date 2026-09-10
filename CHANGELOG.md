@@ -86,10 +86,14 @@ and `plugin.json` cannot drift apart across review rounds.
   was advertised in 1.1.0 and silently disabled in 1.3.2 because it matched
   "time" as a substring, rewriting queries whose only "time" was inside
   `lifetime` or `timestamp`. Table-format queries keep the author's row order.
-- DuckDB parser, binder and conversion errors reach the panel again instead of
-  "query failed (see server logs for detail)". They describe a mistake in the
-  SQL the author just wrote. Catalog errors stay summarised, since they name
-  tables and schemas. The failing SQL is now on the error-level log line.
+- DuckDB parser and syntax errors reach the panel again instead of "query
+  failed (see server logs for detail)". They quote the author's own SQL back
+  at them, so hiding them meant reading the server log to find a mistake that
+  was fixable in the editor. Every other DuckDB error type stays summarised:
+  catalog errors name tables, binder errors append a list of candidate column
+  names, and conversion errors echo an actual row value, none of which a
+  dashboard viewer should learn from a failed panel. The failing SQL is now on
+  the error-level log line for operators.
 - `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` are honoured again; the custom
   transport added in 1.3.2 ignored them, so Grafana behind an egress proxy
   could not reach a cloud-hosted Arc. Idle connections are also kept for five

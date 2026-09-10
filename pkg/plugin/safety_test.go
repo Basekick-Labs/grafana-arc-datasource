@@ -351,8 +351,7 @@ func TestSanitizeUserError_PassesThroughClientErrors(t *testing.T) {
 	// DuckDB error TYPE, not by status.
 	for _, msg := range []string{
 		`Arc error (HTTP 500): arrow query failed: Parser Error: syntax error at or near "h01"`,
-		`Arc error (HTTP 500): Binder Error: Referenced column "cpu38" not found`,
-		`Arc error (HTTP 400): Conversion Error: Could not convert string '$__interval' to INTERVAL`,
+		`Arc error (HTTP 500): Syntax Error: unexpected token`,
 	} {
 		got := sanitizeUserError("A", errors.New(msg))
 		if got != msg {
@@ -360,16 +359,20 @@ func TestSanitizeUserError_PassesThroughClientErrors(t *testing.T) {
 		}
 	}
 
-	// Anything not naming a user-fixable SQL defect stays summarised. Catalog
-	// Error is on this side of the line on purpose: it names tables and
-	// schemas, which a dashboard viewer should not learn from a failed panel.
+	// Everything else stays summarised. Verified against DuckDB 1.4.3: each of
+	// these error types emits something the viewer never referenced —
+	// candidate column names, a table name, or an actual row value.
 	for _, msg := range []string{
 		"Arc error (HTTP 500): internal storage failure at /var/lib/arc/hot/x.parquet",
 		"Arc error (HTTP 503): upstream unavailable",
 		"Arc error (HTTP 500): Catalog Error: Table with name 'secret_prices' does not exist!",
+		`Arc error (HTTP 500): Binder Error: Referenced column "x" not found in FROM clause! Candidate bindings: "secret_salary"`,
+		"Arc error (HTTP 500): Conversion Error: Could not convert string 'secret-value-xyz' to INT32",
 	} {
 		got := sanitizeUserError("A", errors.New(msg))
-		if strings.Contains(got, "/var/lib") || strings.Contains(got, "upstream") || strings.Contains(got, "secret_prices") {
+		if strings.Contains(got, "/var/lib") || strings.Contains(got, "upstream") ||
+			strings.Contains(got, "secret_prices") || strings.Contains(got, "secret_salary") ||
+			strings.Contains(got, "secret-value-xyz") {
 			t.Errorf("server detail leaked: %q", got)
 		}
 		if !strings.Contains(got, "see server logs") {
@@ -384,9 +387,10 @@ func TestUserFixableArcError(t *testing.T) {
 		ok  bool
 	}{
 		{"Arc error (HTTP 500): Parser Error: syntax error", true},
-		{"Arc error (HTTP 500): Binder Error: column not found", true},
+		{"Arc error (HTTP 500): Syntax Error: unexpected token", true},
+		{"Arc error (HTTP 500): Binder Error: column not found", false},
 		{"Arc error (HTTP 500): Catalog Error: Table missing", false},
-		{"Arc error (HTTP 500): Conversion Error: bad cast", true},
+		{"Arc error (HTTP 500): Conversion Error: bad cast", false},
 		{"Arc error (HTTP 500): IO Error: /var/lib/arc/x.parquet missing", false},
 		{"Arc error (HTTP 503): upstream unavailable", false},
 		{"Arc error (HTTP 500): out of memory", false},
