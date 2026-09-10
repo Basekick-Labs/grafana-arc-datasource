@@ -4,6 +4,19 @@
  */
 
 /**
+ * Doubles embedded single quotes so a value cannot terminate the string
+ * literal it is interpolated into, without adding surrounding quotes.
+ *
+ * This is the half of SQL-literal safety that actually stops injection. The
+ * surrounding quotes belong to the query author (`WHERE host = '$server'`),
+ * and adding a second pair here yields ''value'' -- a parser error, not extra
+ * safety.
+ */
+export function escapeLiteral(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+/**
  * True for Grafana's built-in variables, whose names all start with `__`
  * (`$__interval`, `$__rate_interval`, `$__from`, `$__to`, `$__name`, ...).
  * Their values come from Grafana itself, not from the URL or a dashboard

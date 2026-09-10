@@ -1,0 +1,14 @@
+apiVersion: 1
+datasources:
+  - name: Arc (prod)
+    type: basekick-arc-datasource
+    uid: arc-prod
+    access: proxy
+    isDefault: true
+    jsonData:
+      url: ${ARC_URL}
+      database: default
+      timeout: 30
+      protocol: arrow
+    secureJsonData:
+      apiKey: ${ARC_TOKEN}

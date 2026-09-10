@@ -1,0 +1,30 @@
+# Local Grafana pointed at PRODUCTION Arc (https://arc.basekick.net), so the
+# plugin can be exercised against real data before anything is released.
+#
+# Grafana is pinned to 12.4.2 -- what h01 actually runs -- not the scaffold's
+# grafana-enterprise:13.1.0, so behaviour here matches production.
+#
+# The plugin is mounted from ../dist: after `npm run build && mage -v`,
+# `docker compose restart grafana` picks up the new build.
+#
+# Read-only by intent: the token supplied via ARC_TOKEN should be a read-scoped
+# Arc token. Nothing here writes to Arc.
+services:
+  grafana:
+    image: grafana/grafana:12.4.2
+    container_name: devstack-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: basekick-arc-datasource
+      GF_LOG_FILTERS: plugin.basekick-arc-datasource:debug
+      GF_DATAPROXY_LOGGING: "1"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Supplied from devstack/.env (gitignored), never baked into the image.
+      ARC_URL: ${ARC_URL:-https://arc.basekick.net}
+      ARC_TOKEN: ${ARC_TOKEN:?set ARC_TOKEN in devstack/.env}
+    volumes:
+      - ../dist:/var/lib/grafana/plugins/basekick-arc-datasource:ro
+      - ./provisioning:/etc/grafana/provisioning:ro

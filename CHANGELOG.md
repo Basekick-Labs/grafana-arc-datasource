@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.9] - 2026-09-10
+
+### Fixed
+- Single-value template variables were given surrounding quotes, so the
+  standard `WHERE host = '$server'` idiom produced `''h01''` and failed with
+  `Parser Error: syntax error`. Dashboards written against 1.2.x broke on
+  upgrade. Values are now escaped but not wrapped — the author's own quotes
+  wrap them, as in every other SQL datasource.
+
+  The URL-driven injection guard (R2-HI5) is unaffected: doubling embedded
+  quotes is what keeps a payload inside the literal, and that is retained.
+  Multi-value variables, which land in `IN (...)` positions the author cannot
+  pre-quote, are still quoted per element.
+
 ## [1.3.8] - 2026-09-10
 
 ### Fixed

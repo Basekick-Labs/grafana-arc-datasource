@@ -10,7 +10,7 @@ import {
 } from '@grafana/data';
 import { frameToMetricFindValue, DataSourceWithBackend, getTemplateSrv } from '@grafana/runtime';
 import { ArcQuery, ArcDataSourceOptions, defaultQuery } from './types';
-import { isBuiltInVariable, resolveTimezone } from './interpolation';
+import { escapeLiteral, isBuiltInVariable, resolveTimezone } from './interpolation';
 import { lastValueFrom, Observable } from 'rxjs';
 
 /**
@@ -99,12 +99,16 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     }
 
     if (typeof value === 'string') {
-      // R2-HI5: always quote single-value strings. Previously this branch
-      // doubled embedded `'` but returned the value without surrounding
-      // quotes — `WHERE host = $foo` with `?var-foo=1 OR 1=1--` produced a
-      // URL-driven SQL injection with the API key's full scope. Matches the
-      // Postgres datasource which quotes unconditionally.
-      return this.quoteLiteral(value);
+      // Escape embedded quotes but do NOT add surrounding ones. Dashboards
+      // universally write `WHERE host = '$server'` with the quotes in the
+      // SQL, so wrapping here produces ''value'' and a parser error -- that
+      // is what broke every such panel after 1.3.2.
+      //
+      // Escaping alone is what closes R2-HI5 (`?var-foo=1' OR 1=1--` against
+      // `host = '$foo'`): the doubled quote keeps the payload inside the
+      // literal, so it cannot terminate the string and append SQL. A single
+      // value is emitted bare precisely so the author's own quotes wrap it.
+      return escapeLiteral(value);
     }
 
     if (typeof value === 'number') {
@@ -112,6 +116,8 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     }
 
     if (Array.isArray(value)) {
+      // Multi-value variables land in `IN ($hosts)` style positions, where the
+      // author cannot pre-quote each element, so each one is quoted here.
       const quotedValues = value.map((v) => this.quoteLiteral(v));
       return quotedValues.join(',');
     }
