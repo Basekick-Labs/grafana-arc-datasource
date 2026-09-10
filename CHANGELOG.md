@@ -7,9 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Ships as **1.4.0**, together with the datasource-default restorations tracked
-in issue #12. Versions are bumped once, in the release PR, so `package.json`
-and `plugin.json` cannot drift apart across review rounds.
+## [1.4.0] - 2026-09-10
+
+Restores compatibility with dashboards written against 1.2.0. Upgrade straight
+from 1.2.0; releases 1.3.0 through 1.3.11 are superseded.
+
+### Changed
+- Several defaults introduced by the 1.3.2 hardening are restored to what
+  1.2.0 did, because they rejected input that had been valid. Each is still
+  configurable; only the default changed.
+
+  - **Private/RFC1918 Arc URLs are permitted again.** Self-hosted Arc usually
+    runs on a private network or a Docker service name like
+    `http://arc:8000`, and blocking those by default meant the datasource
+    could not connect at all. An explicit "Allow Private IPs" setting is still
+    honoured; link-local and cloud-metadata addresses remain blocked.
+  - **The per-query database override works again** without first enabling a
+    toggle. It has been an advertised feature since 1.1.0.
+  - **A datasource with no protocol recorded resolves to JSON**, as in 1.2.0.
+    Resolving it to Arrow broke `SHOW DATABASES` / `SHOW TABLES` variable
+    queries, which Arc's Arrow endpoint rejects, and changed column type
+    inference. New datasources still default to Arrow.
+  - **`$__timeGroup` accepts any `<n><unit>` interval**, not 13 fixed strings.
+    Grafana's own `$__interval` routinely produces `20s`, `2m` and `2h`, none
+    of which were accepted, so the macro was left unexpanded and Arc received
+    a literal `$`.
+  - **Macro column arguments accept expressions**: `"time"`, `t."time"`,
+    `time::TIMESTAMP`, a function call, a non-ASCII name. Only characters that
+    could break out of the generated SQL are refused.
+  - **`$__timeGroup` tolerates the Postgres/Timescale fill argument** instead
+    of rejecting the whole macro, so migrated dashboards keep working.
+  - **Concurrency is two settings.** "Max Concurrency" (default 4) shapes one
+    query's chunk fan-out; the new "Max In Flight" (default 32) bounds the
+    datasource across all panels. Using one number for both meant a 12-panel
+    dashboard served requests four at a time.
 
 ### Changed
 - Several defaults introduced by the 1.3.2 hardening are restored to what
@@ -190,7 +221,8 @@ query idiom while breaking another. Use 1.2.0 until this release ships.
 - Backend-only credential access
 - HTTPS support
 
-[Unreleased]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.3.2...HEAD
+[Unreleased]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.3.2...v1.4.0
 [1.3.2]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.2.0...v1.3.0
