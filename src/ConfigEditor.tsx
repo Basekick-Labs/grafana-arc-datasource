@@ -23,8 +23,23 @@ export function ConfigEditor(props: Props) {
   const { jsonData, secureJsonFields, secureJsonData } = options;
   const styles = useStyles2(getStyles);
 
+  // True only for a datasource that has never been configured: no URL, and
+  // neither protocol key. Used to decide whether a default should be stamped
+  // in (new) or inherited from 1.2.x behaviour (existing).
+  const isNewDatasource = !jsonData.url && jsonData.protocol === undefined && jsonData.useArrow === undefined;
+
   const onURLChange = (event: ChangeEvent<HTMLInputElement>) => {
-    onOptionsChange({ ...options, jsonData: { ...jsonData, url: event.target.value } });
+    // Stamp the protocol on a brand-new datasource as soon as it gains a URL.
+    // Without this, a datasource created without touching the Protocol radio
+    // would save no `protocol` key, and the backend would then resolve it as a
+    // pre-1.3 instance and fall back to JSON — the opposite of what the editor
+    // displayed. Existing datasources keep whatever they already have.
+    const next = { ...jsonData, url: event.target.value };
+    if (isNewDatasource) {
+      next.protocol = 'arrow';
+      next.useArrow = true;
+    }
+    onOptionsChange({ ...options, jsonData: next });
   };
 
   const onDatabaseChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -65,10 +80,16 @@ export function ConfigEditor(props: Props) {
   const onMaxResponseMBBlur = handleNumericBlur('maxResponseMB', 1024);
 
   // Resolve the effective protocol the same way the backend does: explicit
-  // `protocol` wins; otherwise the legacy useArrow toggle (false meant JSON).
+  // `protocol` wins; otherwise the legacy `useArrow` toggle, where anything
+  // but an explicit true means JSON — that was 1.2.0's behaviour, since
+  // UseArrow was a plain bool defaulting to false.
+  //
+  // A brand-new datasource has neither key and no URL yet, and should start on
+  // Arrow (the fastest protocol) rather than inheriting the legacy fallback.
   // `||` rather than `??` so a provisioned empty string also falls through
-  // to the legacy resolution instead of leaving no radio selected.
-  const effectiveProtocol: ArcProtocol = jsonData.protocol || (jsonData.useArrow === false ? 'json' : 'arrow');
+  // instead of leaving no radio selected.
+  const effectiveProtocol: ArcProtocol =
+    jsonData.protocol || (isNewDatasource || jsonData.useArrow === true ? 'arrow' : 'json');
 
   const onProtocolChange = (value: ArcProtocol) => {
     // Also write the legacy useArrow toggle so a plugin downgrade keeps the

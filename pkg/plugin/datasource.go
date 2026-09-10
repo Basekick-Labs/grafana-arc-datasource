@@ -257,17 +257,28 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	if dsSettings.MaxResponseMB > MaxResponseMBCap {
 		dsSettings.MaxResponseMB = MaxResponseMBCap
 	}
-	// Protocol resolution. Existing datasources predate the selector and only
-	// carry the legacy UseArrow toggle: unset/true meant Arrow, explicit false
-	// meant JSON. An unknown value is a validation error rather than a silent
-	// fallback so a typo in provisioned YAML surfaces at Save & Test.
+	// Protocol resolution for datasources that predate the selector and carry
+	// only the legacy UseArrow toggle. An unknown value is a validation error
+	// rather than a silent fallback so a typo in provisioned YAML surfaces at
+	// Save & Test.
+	//
+	// An ABSENT useArrow key resolves to JSON, matching 1.2.0, where UseArrow
+	// was a plain bool whose zero value was false. 1.3.2 resolved the same
+	// datasource to Arrow, which silently changed two things: Arc's Arrow
+	// endpoint rejects `SHOW DATABASES` / `SHOW TABLES` (the variable-query
+	// examples in this plugin's own editor) with HTTP 400, and the two paths
+	// infer column types differently, so a VARCHAR of RFC3339 strings that was
+	// a time field under JSON became a string field under Arrow.
+	//
+	// New datasources get Arrow: the ConfigEditor writes `protocol` explicitly,
+	// so this branch only ever sees instances created before 1.3.
 	switch dsSettings.Protocol {
 	case ProtocolArrow, ProtocolMsgpack, ProtocolJSON:
 	case "":
-		if dsSettings.UseArrow != nil && !*dsSettings.UseArrow {
-			dsSettings.Protocol = ProtocolJSON
-		} else {
+		if dsSettings.UseArrow != nil && *dsSettings.UseArrow {
 			dsSettings.Protocol = ProtocolArrow
+		} else {
+			dsSettings.Protocol = ProtocolJSON
 		}
 	default:
 		return nil, fmt.Errorf("unknown protocol %q (use %q, %q, or %q)",
