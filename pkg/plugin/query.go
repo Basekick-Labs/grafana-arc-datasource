@@ -588,6 +588,32 @@ func findMatchingParen(sql string, openIdx int) int {
 	return -1
 }
 
+// validateTimezone resolves an IANA timezone name via the system tzdata.
+//
+// The name is interpolated into SQL, so it must never be taken on trust:
+// time.LoadLocation both rejects unknown zones and constrains the value to
+// something tzdata recognises, which no SQL metacharacter survives. An empty
+// or unrecognised zone falls back to UTC rather than failing the query --
+// a bad timezone should not black out a panel, and UTC is the behaviour the
+// plugin had before timezone support existed.
+func validateTimezone(tz string) string {
+	if tz == "" {
+		return "UTC"
+	}
+	if _, err := time.LoadLocation(tz); err != nil {
+		log.DefaultLogger.Warn("unknown timezone, falling back to UTC", "timezone", tz)
+		return "UTC"
+	}
+	return tz
+}
+
+// quoteTimezone renders a validated zone as a SQL string literal. Doubling
+// any quote is belt-and-braces: validateTimezone has already excluded
+// anything tzdata does not know, and no such name contains a quote.
+func quoteTimezone(tz string) string {
+	return "'" + strings.ReplaceAll(tz, "'", "''") + "'"
+}
+
 // expandTimeFilter replaces $__timeFilter(column) with column >= 'from' AND column < 'to'.
 // Column arguments are validated against columnNameRe — anything else is left
 // un-expanded so Arc surfaces a clear error rather than the macro silently
@@ -610,16 +636,17 @@ func expandTimeFilter(sql string, from, to time.Time) string {
 	})
 }
 
-// ApplyMacros replaces Grafana macros in SQL query
-func ApplyMacros(sql string, timeRange backend.TimeRange) string {
-	return applyMacrosWith(sql, timeRange.From, timeRange.To, timeRange.To.Sub(timeRange.From))
+// ApplyMacros replaces Grafana macros in SQL query. tz is the dashboard's
+// IANA timezone; empty means UTC.
+func ApplyMacros(sql string, timeRange backend.TimeRange, tz string) string {
+	return applyMacrosWith(sql, timeRange.From, timeRange.To, timeRange.To.Sub(timeRange.From), tz)
 }
 
 // ApplyMacrosWithSplit replaces macros using the chunk's time range for
 // `$__timeFilter`/`$__timeFrom`/`$__timeTo`, but the ORIGINAL range for
 // `$__interval` so bucket sizes stay consistent across chunks.
-func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange backend.TimeRange) string {
-	return applyMacrosWith(sql, chunk.From, chunk.To, originalRange.To.Sub(originalRange.From))
+func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange backend.TimeRange, tz string) string {
+	return applyMacrosWith(sql, chunk.From, chunk.To, originalRange.To.Sub(originalRange.From), tz)
 }
 
 // applyMacrosWith routes EVERY macro through literal-and-comment-aware
@@ -627,7 +654,11 @@ func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange bac
 // for `$__timeFrom()`, `$__timeTo()`, and `$__interval`, which rewrote macro
 // text inside string literals (`WHERE msg = 'see $__timeFrom()'` mangled the
 // literal). All five Grafana macros now share the same safety.
-func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuration time.Duration) string {
+func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuration time.Duration, tz string) string {
+	tz = validateTimezone(tz)
+	// $__timezone -> 'America/Costa_Rica'. Expanded before the other macros so
+	// it can be used inside their arguments.
+	sql = replaceLiteralAwareTokens(sql, "$__timezone", quoteTimezone(tz))
 	sql = expandTimeFilter(sql, filterFrom, filterTo)
 	sql = replaceLiteralAwareTokens(sql, "$__timeFrom()", fmt.Sprintf("'%s'", filterFrom.Format(time.RFC3339)))
 	sql = replaceLiteralAwareTokens(sql, "$__timeTo()", fmt.Sprintf("'%s'", filterTo.Format(time.RFC3339)))
@@ -635,7 +666,7 @@ func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuratio
 	// $__timeGroup(column, interval) -> epoch-based bucketing
 	// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
 	// causing GROUP BY to produce per-second rows. Epoch math avoids this.
-	sql = expandTimeGroup(sql)
+	sql = expandTimeGroup(sql, tz)
 	return sql
 }
 
@@ -721,7 +752,28 @@ func intervalToSeconds(interval string) (int, bool) {
 // Column argument is validated against columnNameRe; unknown intervals and
 // arg-count mismatches are rejected (macro left un-expanded so Arc surfaces a
 // clear error) rather than silently defaulting.
-func expandTimeGroup(sql string) string {
+// truncUnitForSeconds maps an interval to the date_trunc unit that means
+// exactly the same span, for the intervals where a timezone-aware bucket is
+// expressible as a calendar truncation. Anything else (6h, 3d, ...) has no
+// date_trunc equivalent and stays on epoch arithmetic.
+func truncUnitForSeconds(secs int) (string, bool) {
+	switch secs {
+	case 3600:
+		return "hour", true
+	case 86400:
+		return "day", true
+	case 7 * 86400:
+		return "week", true
+	default:
+		return "", false
+	}
+}
+
+func expandTimeGroup(sql string, tz string) string {
+	// Validate here rather than trusting the caller: expandTimeGroup is called
+	// directly (tests, and any future macro path) and an empty or bogus zone
+	// must degrade to UTC, never reach SQL as AT TIME ZONE ''.
+	tz = validateTimezone(tz)
 	return replaceMacroOccurrences(sql, "$__timeGroup(", func(arg string) (string, bool) {
 		parts := strings.Split(arg, ",")
 		if len(parts) < 2 {
@@ -745,6 +797,34 @@ func expandTimeGroup(sql string) string {
 			log.DefaultLogger.Warn("$__timeGroup rejected unknown interval — expected '1s', '10s', '1m', '5m', '1h', '1d', etc.",
 				"interval", interval)
 			return "", false
+		}
+		// Buckets of a day or more must align to LOCAL midnight, not UTC
+		// midnight: with epoch arithmetic a "day" starts at 00:00 UTC, which in
+		// UTC-6 renders as 18:00 the previous day and splits every local
+		// calendar day across two buckets. date_trunc on the wall-clock time
+		// gets this right, including across DST transitions where a local day
+		// is not 86400 seconds long.
+		//
+		// Sub-day buckets keep the epoch path: it sidesteps DuckDB's
+		// nanosecond-residual issue (see above), and for whole-hour-or-smaller
+		// buckets UTC and local alignment coincide for every zone with a
+		// whole-hour offset. Zones at :30/:45 offsets (India, Nepal, Chatham)
+		// are the exception, so anything from an hour up goes the local route
+		// too, leaving only sub-hour buckets on epoch math.
+		if secs >= 3600 {
+			unit, ok := truncUnitForSeconds(secs)
+			if ok {
+				if tz == "UTC" {
+					return fmt.Sprintf("date_trunc('%s', %s)", unit, column), true
+				}
+				// Convert to wall-clock in tz, truncate there, then convert the
+				// result back to an instant so Grafana still receives a real
+				// timestamp rather than a naive local one.
+				return fmt.Sprintf(
+					"(date_trunc('%s', %s AT TIME ZONE %s) AT TIME ZONE %s)",
+					unit, column, quoteTimezone(tz), quoteTimezone(tz)), true
+			}
+			// Not a whole calendar unit (e.g. '6h'): fall through to epoch math.
 		}
 		// Use epoch_ns() (BIGINT) with // (integer division) instead of epoch() (DOUBLE)
 		// to avoid floating-point precision loss that causes timestamps near hour

@@ -10,7 +10,7 @@ import {
 } from '@grafana/data';
 import { frameToMetricFindValue, DataSourceWithBackend, getTemplateSrv } from '@grafana/runtime';
 import { ArcQuery, ArcDataSourceOptions, defaultQuery } from './types';
-import { lastValueFrom } from 'rxjs';
+import { lastValueFrom, Observable } from 'rxjs';
 
 /**
  * Shapes a `metricFindQuery` argument can arrive as. Grafana's
@@ -54,7 +54,10 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     // target type explicitly so future maintainers see what shape is being
     // produced (was `as never`, which preserved no type info).
     const request = { ...(options ?? {}), targets: [target] } as unknown as DataQueryRequest<ArcQuery>;
-    return lastValueFrom(super.query(request)).then(this.toMetricFindValue);
+    // this.query(), not super.query(): the override stamps the dashboard
+    // timezone, so a variable query using $__timezone/$__timeGroup buckets the
+    // same way a panel query would.
+    return lastValueFrom(this.query(request)).then(this.toMetricFindValue);
   }
 
   toMetricFindValue(rsp: DataQueryResponse): MetricFindValue[] {
@@ -105,6 +108,27 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     return value;
   };
 
+  /**
+   * Stamps the dashboard's timezone onto every query before it reaches the
+   * backend, so `$__timezone` and `$__timeGroup` can bucket by local calendar
+   * days rather than UTC ones.
+   *
+   * Grafana reports the dashboard setting as an IANA name, the literal
+   * "utc", or "browser" (meaning "whatever the viewer's browser is"), and the
+   * backend only understands IANA names -- so "browser" is resolved here,
+   * where the browser actually is, and "utc"/empty normalise to "UTC".
+   * Resolving on the frontend also keeps the dashboard authoritative: two
+   * viewers in different timezones each get their own bucketing, which a
+   * server-side default could not provide.
+   */
+  query(request: DataQueryRequest<ArcQuery>): Observable<DataQueryResponse> {
+    const timezone = resolveTimezone(request.timezone);
+    return super.query({
+      ...request,
+      targets: request.targets.map((t) => ({ ...t, timezone })),
+    });
+  }
+
   applyTemplateVariables(query: ArcQuery, scopedVars: ScopedVars): ArcQuery {
     return {
       ...query,
@@ -127,4 +151,26 @@ function extractVariableSQL(query: VariableQueryInput): string {
     return query.sql ?? query.query ?? query.rawSql ?? '';
   }
   return '';
+}
+
+/**
+ * Normalises Grafana's dashboard timezone setting to an IANA zone name.
+ *
+ * "browser" (the default) is resolved via Intl to the viewer's actual zone;
+ * "utc" and anything unset or unresolvable become "UTC". Returning UTC on
+ * failure keeps behaviour identical to the pre-timezone plugin rather than
+ * erroring a panel over a timezone lookup.
+ */
+export function resolveTimezone(timezone?: string): string {
+  if (!timezone || timezone === 'utc' || timezone === 'UTC') {
+    return 'UTC';
+  }
+  if (timezone === 'browser') {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    } catch {
+      return 'UTC';
+    }
+  }
+  return timezone;
 }

@@ -172,7 +172,40 @@ The datasource provides several macros for dynamic queries:
 | `$__timeFrom()` | Start of time range | `time >= $__timeFrom()` |
 | `$__timeTo()` | End of time range | `time < $__timeTo()` |
 | `$__interval` | Grafana's calculated interval | `$__timeGroup(time, '$__interval')` |
-| `$__timeGroup(columnName, interval)` | Epoch-based time bucketing | `$__timeGroup(time, '1m') AS time` |
+| `$__timeGroup(columnName, interval)` | Time bucketing, aligned to the dashboard timezone | `$__timeGroup(time, '1d') AS time` |
+| `$__timezone` | Dashboard timezone as a quoted IANA name | `date_trunc('day', time AT TIME ZONE $__timezone)` |
+
+#### Timezones
+
+Arc stores and returns timestamps in UTC. Grafana renders them in the
+dashboard's timezone, so anything that groups by **day or larger** has to
+bucket in that timezone too — otherwise a "day" starts at 00:00 UTC, which in
+UTC-6 is 18:00 the previous evening, and every bar mixes two local days.
+
+`$__timeGroup` handles this for you:
+
+```sql
+SELECT $__timeGroup(time, '1d') AS time, COUNT(DISTINCT instance_id) AS daily_active
+FROM installations
+WHERE $__timeFilter(time)
+GROUP BY 1
+ORDER BY 1
+```
+
+Buckets of an hour or more align to local calendar boundaries (correctly
+across DST transitions); smaller buckets use epoch arithmetic, where the
+distinction does not arise.
+
+For expressions `$__timeGroup` doesn't cover, `$__timezone` expands to the
+dashboard's timezone as a quoted IANA name:
+
+```sql
+SELECT date_trunc('month', time AT TIME ZONE $__timezone) AT TIME ZONE $__timezone AS time
+```
+
+Both follow the dashboard's timezone setting — including **Browser Time** —
+so a dashboard is correct for every viewer without hardcoding a zone. An
+unrecognised timezone falls back to UTC.
 
 ### Variables
 

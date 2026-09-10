@@ -55,6 +55,10 @@ type ArcQuery struct {
 	Format        string `json:"format"`         // "time_series" or "table"
 	MaxDataPoints int64  `json:"maxDataPoints"`
 	SplitDuration string `json:"splitDuration"`  // "auto" (default), "off", or explicit: "1h", "6h", "12h", "1d", "3d", "7d"
+	// Timezone is the dashboard's timezone as an IANA name, resolved by the
+	// frontend ("browser" is expanded there, where the browser is). Empty
+	// means UTC, which is also the behaviour of every pre-1.3 plugin build.
+	Timezone string `json:"timezone"`
 }
 
 // ArcInstanceSettings is the cached, parsed view of a datasource instance.
@@ -452,10 +456,10 @@ func splitTimeRange(from, to time.Time, chunkSize time.Duration) []backend.TimeR
 }
 
 // executeChunk runs a single query chunk against Arc
-func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceSettings, rawSQL string, chunk backend.TimeRange, originalRange backend.TimeRange) (*data.Frame, error) {
+func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceSettings, rawSQL string, chunk backend.TimeRange, originalRange backend.TimeRange, tz string) (*data.Frame, error) {
 	// Apply macros with the chunk's time range for time filtering,
 	// but keep the original range for $__interval calculation
-	sql := ApplyMacrosWithSplit(rawSQL, chunk, originalRange)
+	sql := ApplyMacrosWithSplit(rawSQL, chunk, originalRange, tz)
 
 	return executeProtocolQuery(ctx, settings, sql)
 }
@@ -694,7 +698,7 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 						chunk.To.Format("2006-01-02 15:04"), r)
 				}
 			}()
-			frame, runErr := d.executeChunk(gctx, settings, qm.SQL, chunk, query.TimeRange)
+			frame, runErr := d.executeChunk(gctx, settings, qm.SQL, chunk, query.TimeRange, qm.Timezone)
 			if runErr != nil {
 				return fmt.Errorf("[chunk %s to %s] %w",
 					chunk.From.Format("2006-01-02 15:04"),
@@ -756,7 +760,7 @@ func (d *ArcDatasource) querySingle(ctx context.Context, settings *ArcInstanceSe
 	var response backend.DataResponse
 
 	// Apply time range macros
-	sql := ApplyMacros(qm.SQL, query.TimeRange)
+	sql := ApplyMacros(qm.SQL, query.TimeRange, qm.Timezone)
 
 	log.DefaultLogger.Debug("Executing Arc query",
 		"refId", qm.RefID,

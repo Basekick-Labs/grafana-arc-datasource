@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-09-09
+
+### Added
+- `$__timezone` macro, expanding to the dashboard's timezone as a quoted IANA
+  name, for timezone-aware expressions in raw SQL.
+- The dashboard timezone is now sent to the backend with every query.
+  "Browser Time" is resolved on the frontend, so each viewer gets their own
+  local bucketing rather than the server's.
+
+### Fixed
+- `$__timeGroup` bucketed by **UTC** boundaries regardless of the dashboard
+  timezone. Any grouping of a day or more was misaligned for non-UTC
+  dashboards — in UTC-6 a "day" bucket started at 18:00 the previous evening,
+  so each bar mixed two local calendar days. Buckets of an hour or more now
+  truncate in the dashboard's timezone, including across DST transitions.
+
+### Changed
+- `$__timeGroup` emits `date_trunc` for hour/day/week intervals instead of
+  epoch arithmetic. Sub-hour and non-calendar intervals (`6h`, `3d`) are
+  unchanged. Bucket **values** shift for non-UTC dashboards — that is the
+  fix — while UTC dashboards produce identical results to 1.2.0.
 ## [1.3.2] - 2026-09-02
 
 ### Fixed
