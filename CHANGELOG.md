@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.7] - 2026-09-10
+
+### Fixed
+- Grafana's built-in macros were SQL-quoted like user variables, so
+  `time_bucket('$__interval', time)` — the form this plugin's own docs
+  recommended — expanded to `time_bucket(''30s'', time)` and failed with a
+  parser error. Panels written against 1.2.x broke on upgrade. Built-in
+  variables (`$__interval`, `$__rate_interval`, `$__from`, `$__to`, ...) are
+  now passed through unquoted; user variables are still quoted, so the
+  URL-driven injection guard added in 1.3.2 is unchanged.
+
 ## [1.3.6] - 2026-09-10
 
 ### Added
