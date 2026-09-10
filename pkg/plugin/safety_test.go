@@ -9,6 +9,11 @@ import (
 	"testing"
 )
 
+// TestValidateColumnArg: the guard rejects characters that would let the
+// argument break out of the SQL the macro generates, and accepts everything
+// else. 1.3.2 required a bare identifier, which rejected ordinary DuckDB
+// column expressions and left the macro unexpanded — Arc then received a
+// literal `$__timeFilter(...)` and failed to parse.
 func TestValidateColumnArg(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -19,13 +24,23 @@ func TestValidateColumnArg(t *testing.T) {
 		{"qualified", "events.time", false},
 		{"underscored", "_time", false},
 		{"camel", "createdAt", false},
+		// Valid DuckDB column expressions that 1.3.2 rejected.
+		{"quoted identifier", `"time"`, false},
+		{"qualified quoted identifier", `t."time"`, false},
+		{"cast", "time::TIMESTAMP", false},
+		{"function call", "epoch_ms(time)", false},
+		{"unicode column name", "τime", false},
+		{"spaced expression", "time col", false},
+		// Still rejected: anything that could terminate or comment out the
+		// surrounding generated SQL.
 		{"empty", "", true},
-		{"space", "time col", true},
+		{"whitespace only", "   ", true},
 		{"injection", "time) OR 1=1 --", true},
 		{"semicolon", "time;DROP", true},
 		{"quote", "time'", true},
-		{"paren", "time(x)", true},
-		{"unicode", "τime", true},
+		{"double quote alone is a quoted identifier, not a threat", `time"x`, false},
+		{"a single quote is, since the macro emits '<timestamp>' literals", `time" OR '1'='1`, true},
+		{"block comment", "time/*x*/", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateColumnArg(tc.input)

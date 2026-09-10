@@ -31,10 +31,6 @@ const MaxResponseMBCap = 8192
 // Higher values risk file-descriptor pressure and TLS-handshake storms against Arc.
 const MaxConcurrencyCap = 32
 
-// columnNameRe matches a SQL column or qualified column reference (table.col).
-// Used to validate macro arguments before interpolating them into SQL.
-var columnNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*$`)
-
 // databaseNameRe matches a permitted Arc database name. Conservative on purpose —
 // the name flows into an HTTP header and into SQL identifier contexts.
 var databaseNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
@@ -43,11 +39,40 @@ var databaseNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // a private, loopback, or link-local address. Surfaces in errors.Is for callers.
 var errBlockedAddr = errors.New("destination address is not permitted")
 
-// validateColumnArg returns an error if name doesn't look like a safe SQL column
-// reference. Used by macro expanders before interpolating column arguments.
+// columnArgUnsafe matches the characters that could let a macro's column
+// argument escape the SQL the macro generates.
+//
+// The argument is interpolated as an EXPRESSION, never inside a quoted
+// literal — `%s >= '<from>'` and `epoch_ns(%s) // n` — so the risk is a single
+// quote (which would open a literal and swallow the timestamp that follows),
+// a statement separator, or a comment introducer that would comment out the
+// rest of the generated predicate.
+//
+// A double quote is NOT unsafe here: DuckDB uses it for quoted identifiers,
+// `"time"` and `t."time"` are ordinary column references, and it cannot
+// terminate the single-quoted literals this macro emits.
+var columnArgUnsafe = regexp.MustCompile(`[';]|--|/\*`)
+
+// validateColumnArg returns an error if a macro's column argument contains
+// something that could break out of the SQL the macro generates.
+//
+// Deliberately permissive: it rejects dangerous characters rather than
+// requiring a bare identifier. 1.3.2 required `^[A-Za-z_][A-Za-z0-9_.]*$`,
+// which rejected every ordinary DuckDB column expression -- a quoted
+// identifier `"time"`, a qualified-and-quoted `t."time"`, a cast
+// `time::TIMESTAMP`, a non-ASCII column name -- and left the macro unexpanded,
+// so Arc received a literal `$__timeFilter(...)` and failed to parse.
+//
+// The permissiveness costs nothing here: the SQL the user types is forwarded
+// to Arc verbatim anyway, so Arc's API-key scope, not this regex, is the
+// authorization boundary. What this guard is actually for is making sure the
+// text WE generate around the argument stays well-formed.
 func validateColumnArg(name string) error {
-	if !columnNameRe.MatchString(name) {
-		return fmt.Errorf("invalid column argument %q: must match %s", name, columnNameRe.String())
+	if strings.TrimSpace(name) == "" {
+		return errors.New("empty column argument")
+	}
+	if columnArgUnsafe.MatchString(name) {
+		return fmt.Errorf("column argument contains an unsafe character (quote, semicolon, or comment marker)")
 	}
 	return nil
 }

@@ -573,12 +573,33 @@ func TestIntervalToSeconds(t *testing.T) {
 			t.Errorf("intervalToSeconds(%q): expected (%d, true), got (%d, %v)", c.input, c.expected, result, ok)
 		}
 	}
-	// Unknown intervals must now fail loudly rather than silently bucket at 1h.
-	if _, ok := intervalToSeconds("1minutes"); ok {
-		t.Errorf("intervalToSeconds(\"1minutes\") should fail; previously silently returned 3600s")
+	// The <n><unit> grammar, which is what Grafana's own $__interval emits.
+	// The 1.3.2 lookup table accepted none of these and left $__timeGroup
+	// unexpanded, so Arc received a literal `$` and failed to parse.
+	for _, c := range []struct {
+		input    string
+		expected int
+	}{
+		{"20s", 20}, {"2m", 120}, {"2h", 7200}, {"3h", 10800},
+		{"2d", 172800}, {"1w", 604800}, {"90 seconds", 90},
+		{"1minutes", 60}, {"45 MINUTES", 2700},
+	} {
+		if got, ok := intervalToSeconds(c.input); !ok || got != c.expected {
+			t.Errorf("intervalToSeconds(%q) = (%d, %v), want (%d, true)", c.input, got, ok, c.expected)
+		}
 	}
-	if _, ok := intervalToSeconds("nonsense"); ok {
-		t.Errorf("intervalToSeconds(\"nonsense\") should fail")
+
+	// Still rejected: not an interval, or not one epoch division can express.
+	for _, input := range []string{
+		"nonsense", "", "h", "1", "-5m", "0s",
+		"500ms",   // sub-second: rounds to a zero-length bucket
+		"1 month", // not a fixed number of seconds
+		"1 year",
+		"1h ; DROP TABLE t",
+	} {
+		if _, ok := intervalToSeconds(input); ok {
+			t.Errorf("intervalToSeconds(%q) should fail", input)
+		}
 	}
 }
 
@@ -676,13 +697,14 @@ func TestApplyMacros_TimeFilter_RejectsUnsafeColumn(t *testing.T) {
 		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
 	}
-	// First macro has an injection payload — must be rejected and left as-is.
+	// First macro's argument carries a quote, which would terminate the
+	// timestamp literal the macro emits — must be rejected and left as-is.
 	// Second macro is valid — must still expand.
-	sql := "WHERE $__timeFilter(t1 OR 1=1) AND x = 5 AND $__timeFilter(t2)"
+	sql := "WHERE $__timeFilter(t1' OR '1'='1) AND x = 5 AND $__timeFilter(t2)"
 	result := ApplyMacros(sql, tr)
 
 	// First (unsafe) macro should be left un-expanded so Arc surfaces an error.
-	if !strings.Contains(result, "$__timeFilter(t1 OR 1=1)") {
+	if !strings.Contains(result, "$__timeFilter(t1' OR '1'='1)") {
 		t.Errorf("unsafe macro should be left un-expanded: %s", result)
 	}
 	// Second (safe) macro must still expand — proves the rejection branch
@@ -771,25 +793,28 @@ func TestApplyMacros_NotExpandedInsideComment(t *testing.T) {
 
 // TestApplyMacros_TimeFilter_NestedParens locks in the paren-matching fix:
 // $__timeFilter(COALESCE(t1, t2)) used to find the FIRST `)` and produce
-// broken SQL. Now we leave it un-expanded because the column arg isn't a
-// simple identifier (validateColumnArg rejects it).
+// broken SQL. The paren-matching walker now handles the nesting, and the
+// argument is a legitimate DuckDB expression, so it EXPANDS. What this test
+// guards is that the walker terminates and does not truncate or duplicate the
+// surrounding SQL.
 func TestApplyMacros_TimeFilter_NestedParens(t *testing.T) {
 	tr := backend.TimeRange{
 		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
 	}
-	// Nested-paren arg: validator rejects (not a plain identifier), macro
-	// is left as-is. The important thing is the function returns and the
-	// outer macro after it still expands.
 	sql := "WHERE $__timeFilter(COALESCE(t1, t2)) AND x = 1"
 	done := make(chan string, 1)
 	go func() { done <- ApplyMacros(sql, tr) }()
 	select {
 	case result := <-done:
-		// Macro left un-expanded (validator rejected the arg). What MUST not
-		// happen: SQL truncation or duplication. Verify it's still well-formed.
-		if !strings.Contains(result, "$__timeFilter(COALESCE(t1, t2))") {
-			t.Errorf("expected nested-paren macro to be left un-expanded: %s", result)
+		// The full nested expression must be used as the column, on both
+		// sides of the generated range predicate.
+		if strings.Count(result, "COALESCE(t1, t2) >= '") != 1 ||
+			strings.Count(result, "COALESCE(t1, t2) < '") != 1 {
+			t.Errorf("nested-paren column should expand on both bounds: %s", result)
+		}
+		if strings.Contains(result, "$__timeFilter") {
+			t.Errorf("macro should have expanded: %s", result)
 		}
 		if !strings.Contains(result, "x = 1") {
 			t.Errorf("trailing SQL should not be truncated: %s", result)
@@ -799,10 +824,15 @@ func TestApplyMacros_TimeFilter_NestedParens(t *testing.T) {
 	}
 }
 
-// TestExpandTimeGroup_UnknownInterval locks in M4: unknown intervals are no
-// longer silently bucketed at 1h.
+// TestExpandTimeGroup_UnknownInterval: an interval that is not a duration at
+// all leaves the macro un-expanded, so Arc surfaces a clear error instead of
+// the plugin silently choosing a bucket size (1.2.0 defaulted to 1h).
+//
+// Note "1minutes" is NOT such a case — it parses as one minute. 1.3.2 used it
+// as the example of an unknown interval, which is what made every ordinary
+// Grafana interval (20s, 2m, 2h) fail too.
 func TestExpandTimeGroup_UnknownInterval(t *testing.T) {
-	sql := "SELECT $__timeGroup(time, '1minutes') AS time FROM t"
+	sql := "SELECT $__timeGroup(time, 'nonsense') AS time FROM t"
 	tr := backend.TimeRange{
 		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
@@ -810,22 +840,33 @@ func TestExpandTimeGroup_UnknownInterval(t *testing.T) {
 	result := ApplyMacros(sql, tr)
 	// Macro left un-expanded so Arc surfaces a clear error rather than
 	// silently using the wrong bucket size.
-	if !strings.Contains(result, "$__timeGroup(time, '1minutes')") {
+	if !strings.Contains(result, "$__timeGroup(time, 'nonsense')") {
 		t.Errorf("unknown interval should leave macro un-expanded: %s", result)
 	}
 }
 
-// TestExpandTimeGroup_ExtraArgs locks in M3: extra arguments warn loudly
-// and leave the macro un-expanded.
-func TestExpandTimeGroup_ExtraArgs(t *testing.T) {
-	sql := "SELECT $__timeGroup(time, '1h', surprise) AS time FROM t"
+// TestExpandTimeGroup_FillArgIgnored: Postgres and Timescale accept a third
+// "fill" argument, so dashboards migrated from those datasources carry it.
+// This plugin does not fill gaps (Grafana's panel options do), so the argument
+// is ignored and the macro still expands. 1.3.2 rejected it outright, leaving
+// the macro unexpanded and breaking every migrated panel.
+func TestExpandTimeGroup_FillArgIgnored(t *testing.T) {
 	tr := backend.TimeRange{
 		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
 	}
-	result := ApplyMacros(sql, tr)
-	if !strings.Contains(result, "$__timeGroup(time, '1h', surprise)") {
-		t.Errorf("extra args should leave macro un-expanded: %s", result)
+	for _, sql := range []string{
+		"SELECT $__timeGroup(time, '1h', 0) AS time FROM t",
+		"SELECT $__timeGroup(time, '1h', NULL) AS time FROM t",
+		"SELECT $__timeGroup(time, '1h', previous) AS time FROM t",
+	} {
+		result := ApplyMacros(sql, tr)
+		if strings.Contains(result, "$__timeGroup") {
+			t.Errorf("fill argument should be ignored, not reject the macro: %s", result)
+		}
+		if !strings.Contains(result, "3600") {
+			t.Errorf("expected the 1h bucket in: %s", result)
+		}
 	}
 }
 

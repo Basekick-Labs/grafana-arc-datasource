@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -705,7 +706,7 @@ func findMatchingParen(sql string, openIdx int) int {
 }
 
 // expandTimeFilter replaces $__timeFilter(column) with column >= 'from' AND column < 'to'.
-// Column arguments are validated against columnNameRe — anything else is left
+// Column arguments are checked by validateColumnArg — anything unsafe is left
 // un-expanded so Arc surfaces a clear error rather than the macro silently
 // injecting attacker-controlled SQL. Macros inside string literals or comments
 // are not expanded.
@@ -826,22 +827,65 @@ var intervalSecondsTable = map[string]int{
 	"1d": 86400, "1 day": 86400,
 }
 
-// intervalToSeconds converts a DuckDB interval string to seconds. Returns
-// (seconds, true) on a hit and (0, false) on an unknown interval — caller
-// is responsible for deciding fallback behavior. Before this signature the
-// function silently defaulted unknown input to 3600s, masking typos like
-// '1minutes' as a one-hour bucket.
+// intervalUnitSeconds maps an interval unit, and its accepted spellings, to
+// its length in seconds. Months and years are deliberately absent: they are
+// not fixed-length, so epoch division cannot express them.
+var intervalUnitSeconds = map[string]int{
+	"s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+	"m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+	"h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+	"d": 86400, "day": 86400, "days": 86400,
+	"w": 604800, "week": 604800, "weeks": 604800,
+}
+
+// intervalPattern matches "<n><unit>" and "<n> <unit>", e.g. 30s, 2 minutes,
+// 500ms. Anchored, so anything with trailing junk is rejected rather than
+// silently truncated.
+var intervalPattern = regexp.MustCompile(`^(\d+)\s*([a-zA-Z]+)$`)
+
+// intervalToSeconds converts a DuckDB interval string to whole seconds.
+// Returns (seconds, true) on success and (0, false) when the input is not an
+// interval this plugin can bucket by.
+//
+// Parses the general `<n><unit>` grammar rather than consulting a fixed table.
+// The table form (added in 1.3.2) accepted only 13 literal strings, which
+// excluded most of what Grafana's own `$__interval` produces — 20s, 2m, 2h,
+// 3h, 2d are all routine — and an unlisted value left the whole
+// `$__timeGroup` macro unexpanded, so Arc received a literal `$` and failed to
+// parse. 1.2.0 accepted anything by silently defaulting to one hour, which
+// hid typos; parsing gets the coverage without the silence.
+//
+// Sub-second intervals (500ms) parse to 0 seconds and are rejected: epoch
+// division by zero is meaningless, and a sub-second bucket is not something
+// the epoch-seconds path can express.
 func intervalToSeconds(interval string) (int, bool) {
-	if secs, ok := intervalSecondsTable[strings.TrimSpace(interval)]; ok {
+	interval = strings.TrimSpace(interval)
+	if secs, ok := intervalSecondsTable[interval]; ok {
 		return secs, true
 	}
-	return 0, false
+	m := intervalPattern.FindStringSubmatch(interval)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	unit, ok := intervalUnitSeconds[strings.ToLower(m[2])]
+	if !ok {
+		return 0, false
+	}
+	secs := n * unit
+	if secs <= 0 {
+		return 0, false
+	}
+	return secs, true
 }
 
 // expandTimeGroup replaces $__timeGroup(column, interval) with epoch-based bucketing SQL.
 // DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
 // causing GROUP BY to produce per-second rows. Epoch math avoids this.
-// Column argument is validated against columnNameRe; unknown intervals and
+// Column argument is checked by validateColumnArg; unknown intervals and
 // arg-count mismatches are rejected (macro left un-expanded so Arc surfaces a
 // clear error) rather than silently defaulting.
 func expandTimeGroup(sql string) string {
@@ -852,10 +896,14 @@ func expandTimeGroup(sql string) string {
 			return "", false
 		}
 		if len(parts) > 2 {
-			// Extra args silently ignored before; now warn loudly.
-			log.DefaultLogger.Warn("$__timeGroup ignored extra arguments — expected $__timeGroup(column, interval)",
+			// Postgres and Timescale accept a third "fill" argument
+			// ($__timeGroup(time, '5m', 0)), so dashboards migrated from those
+			// datasources carry it. This plugin does not fill gaps — Grafana's
+			// own "Connect null values" / "Fill" panel options do — so the
+			// argument is ignored rather than rejected. Rejecting it (1.3.2)
+			// left the whole macro unexpanded and broke every migrated panel.
+			log.DefaultLogger.Debug("$__timeGroup ignoring extra arguments — this plugin does not fill gaps; use the panel's fill option",
 				"found", arg, "extra_count", len(parts)-2)
-			return "", false
 		}
 		column := strings.TrimSpace(parts[0])
 		if err := validateColumnArg(column); err != nil {
