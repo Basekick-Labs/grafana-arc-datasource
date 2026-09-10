@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-10
+
+Timezone-aware time bucketing, plus two correctness fixes found while building
+it. Safe to upgrade from 1.4.0; UTC dashboards are unaffected by design.
+
 ### Added
 - `$__timeGroup` buckets by the dashboard's timezone. Previously a "day"
   bucket started at 00:00 UTC, so a dashboard in UTC-6 showed bars that each
@@ -35,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately not treated as a calendar week: `date_trunc('week')` anchors on
   Monday, and "seven days wide" does not mean "Monday to Sunday". Ask for `1w`
   if that is what you want.
+
+### Changed
+- Macro expansion skips the query entirely when a macro is absent, instead of
+  copying the statement byte by byte and allocating a buffer its size. Most
+  queries use one or two of the five macros and paid that cost for each of the
+  others, once per query and once per chunk when splitting. On a 16 KB query
+  the macro pipeline halves, from 110 µs and 38 KB to 58 µs and 19 KB.
 
 ### Fixed
 - Query splitting no longer corrupts wide time buckets. A bucket wider than a
@@ -262,7 +274,8 @@ query idiom while breaking another. Use 1.2.0 until this release ships.
 - Backend-only credential access
 - HTTPS support
 
-[Unreleased]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.3.2...v1.4.0
 [1.3.2]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/basekick-labs/grafana-arc-datasource/compare/v1.3.0...v1.3.1
