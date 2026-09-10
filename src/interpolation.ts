@@ -49,27 +49,42 @@ export function resolveTimezone(timezone?: string): string {
 }
 
 /**
- * Names of the variables in `sql` that the author already wrapped in single
- * quotes -- `WHERE host = '$server'` or `'${server:raw}'`.
+ * Names of the variables that appear INSIDE a single-quoted string literal in
+ * `sql` -- `WHERE host = '$server'`, and equally `host ~ '^$server$'` where
+ * the variable sits in the middle of the literal.
  *
- * Dashboards use both idioms, often in the same panel: quoting every value
- * breaks `'$server'` (yielding ''h01''), and quoting none breaks a bare
- * `AND cpu = $cpu` (DuckDB then reads the value as a column name). Neither
- * blanket rule works, so interpolation quotes a value only when the author
- * did not.
+ * Dashboards use both idioms, often in one panel: quoting every value breaks
+ * the quoted forms (''h01'', or '^'h01'$'), and quoting none breaks a bare
+ * `AND cpu = $cpu`, where DuckDB reads the value as a column name. So a value
+ * is quoted only when the author did not already put it in quotes.
  *
- * Conservative by construction: a variable is treated as pre-quoted only
- * where a `'` immediately precedes the `$` and a `'` closes on the same line
- * with no quote in between. Anything ambiguous is left to be quoted, which
- * fails loudly (a parser error) rather than silently emitting an identifier.
+ * Implemented by walking the string and tracking literal state (with '' as an
+ * escaped quote) rather than pattern-matching the edges: the variable can be
+ * anywhere inside the literal, which an edge-anchored regex misses.
  */
 export function preQuotedVariables(sql: string): Set<string> {
   const found = new Set<string>();
-  // '$name' or '${name}' or '${name:format}', no quote inside the literal.
-  const re = /'\$\{?(\w+)(?::\w+)?\}?'/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(sql)) !== null) {
-    found.add(m[1]);
+  let i = 0;
+  let inLiteral = false;
+  while (i < sql.length) {
+    const c = sql[i];
+    if (c === "'") {
+      // '' inside a literal is an escaped quote, not a close.
+      if (inLiteral && sql[i + 1] === "'") {
+        i += 2;
+        continue;
+      }
+      inLiteral = !inLiteral;
+      i++;
+      continue;
+    }
+    if (inLiteral && c === '$') {
+      const m = /^\$\{?(\w+)/.exec(sql.slice(i));
+      if (m) {
+        found.add(m[1]);
+      }
+    }
+    i++;
   }
   return found;
 }

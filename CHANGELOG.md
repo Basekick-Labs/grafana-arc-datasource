@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.11] - 2026-09-10
+
+### Fixed
+- Pre-quoted variable detection now finds a variable anywhere inside a string
+  literal, not only at its edges. `WHERE host ~ '^$server$'` — the form used
+  by most panels in a typical host dashboard — was not recognised as quoted,
+  so the value was quoted again and produced `'^'h01'$'`. This form has been
+  broken since 1.3.2.
+
 ## [1.3.10] - 2026-09-10
 
 ### Fixed

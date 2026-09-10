@@ -75,29 +75,28 @@ describe('dashboard idioms', () => {
 });
 
 describe('preQuotedVariables', () => {
-  // The real "System Monitoring ARC v2" dashboard uses BOTH idioms, so
-  // quoting must depend on what the author wrote.
-  it('detects quoted variables and ignores bare ones', () => {
-    const sql = "WHERE host = '$server' AND cpu = $cpu AND m = '${mountpoint:raw}'";
-    const q = preQuotedVariables(sql);
+  // Every idiom the real "System Monitoring ARC v2" dashboard uses. 13 of its
+  // panels put the variable in the MIDDLE of a quoted regex, which an
+  // edge-anchored match misses -- that was the bug in the first attempt.
+  it('detects a variable anywhere inside a literal', () => {
+    expect([...preQuotedVariables("WHERE host ~ '^$server$'")]).toEqual(['server']);
+    expect([...preQuotedVariables("WHERE host ~ '$server$'")]).toEqual(['server']);
+    expect([...preQuotedVariables("WHERE host = '$server'")]).toEqual(['server']);
+    expect([...preQuotedVariables("WHERE m = '${mountpoint:raw}'")]).toEqual(['mountpoint']);
+  });
+
+  it('does not match a bare variable', () => {
+    expect(preQuotedVariables('AND cpu = $cpu').size).toBe(0);
+  });
+
+  it('handles quoted and bare in the same query', () => {
+    const q = preQuotedVariables("WHERE host ~ '^$server$' AND cpu = $cpu");
     expect(q.has('server')).toBe(true);
-    expect(q.has('mountpoint')).toBe(true);
     expect(q.has('cpu')).toBe(false);
   });
 
-  it('handles ${var} and ${var:format}', () => {
-    expect(preQuotedVariables("x = '${server}'").has('server')).toBe(true);
-    expect(preQuotedVariables("x = '${server:raw}'").has('server')).toBe(true);
-  });
-
-  it('does not treat a bare variable as quoted', () => {
-    expect(preQuotedVariables('WHERE cpu = $cpu').size).toBe(0);
-  });
-
-  // Both shapes must produce exactly one valid literal.
-  it('yields one literal for each idiom', () => {
-    const v = escapeLiteral('cpu-total');
-    expect(`AND cpu = '${v}'`).toBe("AND cpu = 'cpu-total'");   // bare -> we add quotes
-    expect(`AND cpu = '${v}'`.match(/'/g)!.length).toBe(2);
+  it('treats \'\' as an escaped quote, not a literal boundary', () => {
+    // The literal stays open across '', so $x is still inside it.
+    expect(preQuotedVariables("WHERE a = 'it''s $x'").has('x')).toBe(true);
   });
 });
