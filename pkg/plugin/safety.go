@@ -27,6 +27,16 @@ const DefaultMaxResponseMB = 1024
 // memory profile.
 const MaxResponseMBCap = 8192
 
+// DefaultMaxInFlight bounds simultaneous Arc requests per datasource across
+// every panel and viewer. 32 keeps a busy dashboard responsive while still
+// protecting Arc; 1.3.2 used MaxConcurrency (default 4) for both, so a
+// 12-panel dashboard served requests four at a time.
+const DefaultMaxInFlight = 32
+
+// MaxInFlightCap bounds MaxInFlight. Beyond this, file-descriptor pressure and
+// TLS-handshake storms against Arc become the limiting factor.
+const MaxInFlightCap = 128
+
 // MaxConcurrencyCap is the upper bound on user-configurable parallel chunk fanout.
 // Higher values risk file-descriptor pressure and TLS-handshake storms against Arc.
 const MaxConcurrencyCap = 32
@@ -247,9 +257,17 @@ func isLoopbackURL(raw string) bool {
 // 3244943519).
 func newHTTPClient(timeout time.Duration, policy dialPolicy) *http.Client {
 	transport := &http.Transport{
-		DialContext:           safeDialContext(policy),
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
+		// Honour HTTP_PROXY / HTTPS_PROXY / NO_PROXY. The custom transport
+		// added in 1.3.2 omitted this, so a Grafana behind a corporate egress
+		// proxy silently stopped reaching a cloud-hosted Arc — http.Transport
+		// defaults to no proxy, unlike http.DefaultTransport.
+		Proxy:           http.ProxyFromEnvironment,
+		DialContext:     safeDialContext(policy),
+		MaxIdleConns:    100,
+		MaxConnsPerHost: MaxInFlightCap,
+		// A dashboard refreshing every 1-5 minutes re-dialled on every refresh
+		// at 90s, paying a TLS handshake each time.
+		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
@@ -276,7 +294,53 @@ func newHTTPClient(timeout time.Duration, policy dialPolicy) *http.Client {
 //
 // The full error is logged server-side for operator diagnostics; the returned
 // string keeps the high-level category but strips identifiers and paths.
+// duckdbUserErrorPrefixes are the DuckDB error types that describe a defect in
+// the SQL the user wrote, rather than anything about the server. Each names
+// the user's own text back to them and carries no schema they did not already
+// reference, no file path, and no query plan.
+// "Catalog Error" is deliberately absent: it names tables and schemas, which
+// is the one class of detail a dashboard VIEWER (who may have less privilege
+// than the datasource admin) should not learn from a failed panel. The
+// remaining types quote the user's own SQL back at them.
+var duckdbUserErrorPrefixes = []string{
+	"Parser Error",
+	"Syntax Error",
+	"Binder Error",
+	"Conversion Error",
+	"Type Error",
+}
+
+// userFixableArcError returns the DuckDB detail from an Arc error message when
+// that detail describes a mistake in the user's SQL. The returned string keeps
+// the "Arc error (HTTP n):" prefix so the origin stays visible.
+func userFixableArcError(msg string) (string, bool) {
+	for _, prefix := range duckdbUserErrorPrefixes {
+		if strings.Contains(msg, prefix+":") {
+			return msg, true
+		}
+	}
+	return "", false
+}
+
+// sanitizeUserErrorSQL is sanitizeUserError plus the expanded SQL in the
+// server-side log line.
+//
+// The panel deliberately never shows the SQL, but an operator reading the log
+// needs it: without it the log says a query failed and not which one, so
+// diagnosing a macro or interpolation problem means reconstructing the query
+// by hand. That reconstruction is what produced four wrong diagnoses during
+// the 1.3.x regression.
+func sanitizeUserErrorSQL(refID, sql string, err error) string {
+	return sanitizeUserErrorWith(refID, err, "sql", sql)
+}
+
 func sanitizeUserError(refID string, err error) string {
+	return sanitizeUserErrorWith(refID, err)
+}
+
+// sanitizeUserErrorWith is the shared implementation. `extra` is appended to
+// the server-side log line as key/value pairs and never reaches the user.
+func sanitizeUserErrorWith(refID string, err error, extra ...any) string {
 	// User-initiated cancellation is benign — Grafana cancels the in-flight
 	// request when the user edits a query, changes the dashboard, or
 	// navigates away. Logging at Error level on every panel edit would
@@ -285,7 +349,8 @@ func sanitizeUserError(refID string, err error) string {
 		log.DefaultLogger.Debug("Arc query canceled by client", "refId", refID)
 		return "Query canceled"
 	}
-	log.DefaultLogger.Error("Arc query failed", "refId", refID, "error", err.Error())
+	fields := append([]any{"refId", refID, "error", err.Error()}, extra...)
+	log.DefaultLogger.Error("Arc query failed", fields...)
 	msg := err.Error()
 	// Typed-error matching first (preferred). String contains is a fallback
 	// for paths that don't have a typed sentinel yet.
@@ -305,8 +370,19 @@ func sanitizeUserError(refID string, err error) string {
 	case strings.Contains(msg, "no such host"):
 		return "Cannot connect to Arc — hostname not found."
 	case strings.HasPrefix(msg, "Arc error (HTTP "):
-		// Preserve the HTTP status (already a category, not a detail) but drop
-		// the server-supplied message body.
+		// A DuckDB error naming the user's own mistake — a parser error, an
+		// unknown column, a missing table — belongs in the panel. Hiding it
+		// forces the dashboard author to hunt through the Grafana server log
+		// for something they could fix in the editor, which is exactly what
+		// made the 1.3.x regression take a day to diagnose instead of minutes.
+		//
+		// Classified by DuckDB's error TYPE, not by HTTP status: Arc reports a
+		// parser error as 500, so a status-based rule would hide the very
+		// errors that matter most. Anything not on the allowlist stays
+		// summarised, and the full text is in the log line above.
+		if detail, ok := userFixableArcError(msg); ok {
+			return detail
+		}
 		end := strings.Index(msg, "):")
 		if end > 0 {
 			return msg[:end+1] + " query failed (see server logs for detail)"

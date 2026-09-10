@@ -339,3 +339,61 @@ func TestIsLoopbackURL(t *testing.T) {
 		})
 	}
 }
+
+// TestSanitizeUserError_PassesThroughClientErrors: a 4xx from Arc is a verdict
+// on the SQL the dashboard author just wrote — a parser error, an unknown
+// column, a missing table. Hiding it behind "see server logs" makes a mistake
+// that is fixable in the editor require access to the Grafana server log,
+// which is what made the 1.3.x regression so slow to diagnose. 5xx describes
+// the server's internals and stays summarised.
+func TestSanitizeUserError_PassesThroughClientErrors(t *testing.T) {
+	// Arc reports a DuckDB parser error as HTTP 500, so classification is by
+	// DuckDB error TYPE, not by status.
+	for _, msg := range []string{
+		`Arc error (HTTP 500): arrow query failed: Parser Error: syntax error at or near "h01"`,
+		`Arc error (HTTP 500): Binder Error: Referenced column "cpu38" not found`,
+		`Arc error (HTTP 400): Conversion Error: Could not convert string '$__interval' to INTERVAL`,
+	} {
+		got := sanitizeUserError("A", errors.New(msg))
+		if got != msg {
+			t.Errorf("a user-fixable SQL error should reach the panel verbatim:\n got %q\nwant %q", got, msg)
+		}
+	}
+
+	// Anything not naming a user-fixable SQL defect stays summarised. Catalog
+	// Error is on this side of the line on purpose: it names tables and
+	// schemas, which a dashboard viewer should not learn from a failed panel.
+	for _, msg := range []string{
+		"Arc error (HTTP 500): internal storage failure at /var/lib/arc/hot/x.parquet",
+		"Arc error (HTTP 503): upstream unavailable",
+		"Arc error (HTTP 500): Catalog Error: Table with name 'secret_prices' does not exist!",
+	} {
+		got := sanitizeUserError("A", errors.New(msg))
+		if strings.Contains(got, "/var/lib") || strings.Contains(got, "upstream") || strings.Contains(got, "secret_prices") {
+			t.Errorf("server detail leaked: %q", got)
+		}
+		if !strings.Contains(got, "see server logs") {
+			t.Errorf("expected a summarised message, got %q", got)
+		}
+	}
+}
+
+func TestUserFixableArcError(t *testing.T) {
+	cases := []struct {
+		msg string
+		ok  bool
+	}{
+		{"Arc error (HTTP 500): Parser Error: syntax error", true},
+		{"Arc error (HTTP 500): Binder Error: column not found", true},
+		{"Arc error (HTTP 500): Catalog Error: Table missing", false},
+		{"Arc error (HTTP 500): Conversion Error: bad cast", true},
+		{"Arc error (HTTP 500): IO Error: /var/lib/arc/x.parquet missing", false},
+		{"Arc error (HTTP 503): upstream unavailable", false},
+		{"Arc error (HTTP 500): out of memory", false},
+	}
+	for _, c := range cases {
+		if _, ok := userFixableArcError(c.msg); ok != c.ok {
+			t.Errorf("userFixableArcError(%q) = %v, want %v", c.msg, ok, c.ok)
+		}
+	}
+}

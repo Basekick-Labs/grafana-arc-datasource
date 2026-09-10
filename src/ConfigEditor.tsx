@@ -56,7 +56,7 @@ export function ConfigEditor(props: Props) {
   // onBlur: clamp to the field's minimum + apply the default if the
   //   user left the input empty or below 1. Persists the final value.
   const handleNumericChange =
-    (key: 'timeout' | 'maxConcurrency' | 'maxResponseMB') =>
+    (key: 'timeout' | 'maxConcurrency' | 'maxResponseMB' | 'maxInFlight') =>
     (event: ChangeEvent<HTMLInputElement>) => {
       const parsed = parseInt(event.target.value, 10);
       const next = isNaN(parsed) ? undefined : parsed;
@@ -64,7 +64,7 @@ export function ConfigEditor(props: Props) {
     };
 
   const handleNumericBlur =
-    (key: 'timeout' | 'maxConcurrency' | 'maxResponseMB', fallback: number) =>
+    (key: 'timeout' | 'maxConcurrency' | 'maxResponseMB' | 'maxInFlight', fallback: number) =>
     () => {
       const current = jsonData[key];
       if (current === undefined || current === null || current < 1) {
@@ -76,6 +76,8 @@ export function ConfigEditor(props: Props) {
   const onTimeoutBlur = handleNumericBlur('timeout', 30);
   const onMaxConcurrencyChange = handleNumericChange('maxConcurrency');
   const onMaxConcurrencyBlur = handleNumericBlur('maxConcurrency', 4);
+  const onMaxInFlightChange = handleNumericChange('maxInFlight');
+  const onMaxInFlightBlur = handleNumericBlur('maxInFlight', 32);
   const onMaxResponseMBChange = handleNumericChange('maxResponseMB');
   const onMaxResponseMBBlur = handleNumericBlur('maxResponseMB', 1024);
 
@@ -175,7 +177,7 @@ export function ConfigEditor(props: Props) {
       <InlineField
         label="Max Concurrency"
         labelWidth={LABEL_WIDTH}
-        tooltip="Maximum parallel chunks for query splitting. Each Grafana panel can spawn up to this many concurrent Arc requests. Lower values reduce Arc load in multi-user deployments."
+        tooltip="Maximum parallel chunks within a single split query. Bounded by Max In Flight."
       >
         <Input
           width={INPUT_WIDTH}
@@ -184,6 +186,21 @@ export function ConfigEditor(props: Props) {
           placeholder="4"
           onChange={onMaxConcurrencyChange}
           onBlur={onMaxConcurrencyBlur}
+        />
+      </InlineField>
+
+      <InlineField
+        label="Max In Flight"
+        labelWidth={LABEL_WIDTH}
+        tooltip="Maximum simultaneous Arc requests for this datasource, across every panel and viewer. Lower it to reduce load on Arc; raise it if a busy dashboard's panels queue behind each other."
+      >
+        <Input
+          width={INPUT_WIDTH}
+          type="number"
+          value={jsonData.maxInFlight ?? ''}
+          placeholder="32"
+          onChange={onMaxInFlightChange}
+          onBlur={onMaxInFlightBlur}
         />
       </InlineField>
 

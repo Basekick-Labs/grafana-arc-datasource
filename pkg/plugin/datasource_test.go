@@ -1273,9 +1273,21 @@ func TestMergeFrames_TypeMismatchSkipped(t *testing.T) {
 	if merged == nil {
 		t.Fatal("merged should not be nil")
 	}
-	// Must NOT panic; mismatched chunk silently skipped (logged as warning).
+	// Must NOT panic; the mismatched chunk is skipped.
 	if merged.Rows() != 1 {
 		t.Errorf("expected 1 row (mismatched chunk skipped), got %d", merged.Rows())
+	}
+	// ...and the user must be told, rather than shown a silently partial
+	// series that is indistinguishable from a gap in the data.
+	if merged.Meta == nil || len(merged.Meta.Notices) == 0 {
+		t.Fatal("expected a frame notice reporting the dropped chunk")
+	}
+	notice := merged.Meta.Notices[0]
+	if notice.Severity != data.NoticeSeverityWarning {
+		t.Errorf("notice severity = %v, want warning", notice.Severity)
+	}
+	if !strings.Contains(notice.Text, "incomplete") {
+		t.Errorf("notice should say the series is incomplete, got %q", notice.Text)
 	}
 }
 
@@ -1674,6 +1686,47 @@ func TestOptimizeTimeSeriesQuery(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := OptimizeTimeSeriesQuery(c.sql); got != c.sql {
 				t.Errorf("OptimizeTimeSeriesQuery(%q) should be unchanged, got %q", c.sql, got)
+			}
+		})
+	}
+}
+
+// TestNewArcInstance_ConcurrencyLimits: MaxConcurrency shapes a single split
+// query's fan-out; MaxInFlight bounds the whole datasource across panels and
+// viewers. 1.3.2 used one number for both, so a 12-panel dashboard served
+// requests four at a time and panels timed out waiting for a slot.
+func TestNewArcInstance_ConcurrencyLimits(t *testing.T) {
+	cases := []struct {
+		name            string
+		json            map[string]any
+		wantConcurrency int
+		wantInFlight    int
+	}{
+		{"defaults", map[string]any{}, 4, DefaultMaxInFlight},
+		{"explicit values", map[string]any{"maxConcurrency": 8, "maxInFlight": 64}, 8, 64},
+		{"concurrency clamped to its cap", map[string]any{"maxConcurrency": 999, "maxInFlight": 128}, MaxConcurrencyCap, 128},
+		{"in-flight clamped to its cap", map[string]any{"maxInFlight": 9999}, 4, MaxInFlightCap},
+		// A per-query fan-out wider than the instance budget can never be
+		// realised, so it is clamped down rather than left misleading.
+		{"concurrency cannot exceed in-flight", map[string]any{"maxConcurrency": 16, "maxInFlight": 8}, 8, 8},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			c.json["url"] = "https://arc.example.com"
+			jsonData, _ := jsonMarshal(c.json)
+			inst, err := newArcInstance(t.Context(), backend.DataSourceInstanceSettings{
+				JSONData:                jsonData,
+				DecryptedSecureJSONData: map[string]string{"apiKey": "k"},
+			})
+			if err != nil {
+				t.Fatalf("build failed: %v", err)
+			}
+			got := inst.(*ArcInstanceSettings).settings
+			if got.MaxConcurrency != c.wantConcurrency {
+				t.Errorf("MaxConcurrency = %d, want %d", got.MaxConcurrency, c.wantConcurrency)
+			}
+			if got.MaxInFlight != c.wantInFlight {
+				t.Errorf("MaxInFlight = %d, want %d", got.MaxInFlight, c.wantInFlight)
 			}
 		})
 	}

@@ -30,8 +30,14 @@ type ArcDataSourceSettings struct {
 	Timeout        int    `json:"timeout"`        // seconds
 	Protocol       string `json:"protocol"`       // "arrow" (default), "msgpack", or "json" — wire format for query responses
 	UseArrow       *bool  `json:"useArrow"`       // legacy toggle superseded by Protocol; pointer so unset (fresh install) is distinguishable from explicit false
-	MaxConcurrency int    `json:"maxConcurrency"` // max parallel chunks for query splitting (default 4)
-	MaxResponseMB  int    `json:"maxResponseMB"`  // per-response body size cap in MiB (default 1024 — large analytical queries cross 256 MiB easily, R2-CR7)
+	MaxConcurrency int    `json:"maxConcurrency"` // max parallel chunks WITHIN one split query (default 4)
+	// MaxInFlight bounds total simultaneous Arc requests for this datasource,
+	// across every panel and viewer. Separate from MaxConcurrency: that one
+	// shapes a single query's fan-out, while this one protects Arc and the
+	// plugin process. Collapsing them (1.3.2) meant a 12-panel dashboard
+	// queued behind 4 slots and panels timed out waiting their turn.
+	MaxInFlight   int `json:"maxInFlight"`   // default 32
+	MaxResponseMB int `json:"maxResponseMB"` // per-response body size cap in MiB (default 1024 — large analytical queries cross 256 MiB easily, R2-CR7)
 	// AllowPrivateIPs permits the Arc URL to resolve to an RFC1918/CGNAT
 	// address. Pointer so an absent key (a datasource created before 1.3) is
 	// distinguishable from an explicit false: absent defaults to TRUE, because
@@ -245,6 +251,17 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	if dsSettings.MaxConcurrency > MaxConcurrencyCap {
 		dsSettings.MaxConcurrency = MaxConcurrencyCap
 	}
+	if dsSettings.MaxInFlight <= 0 {
+		dsSettings.MaxInFlight = DefaultMaxInFlight
+	}
+	if dsSettings.MaxInFlight > MaxInFlightCap {
+		dsSettings.MaxInFlight = MaxInFlightCap
+	}
+	// A per-query fan-out wider than the instance-wide budget can never be
+	// realised, and would let one panel monopolise every slot.
+	if dsSettings.MaxConcurrency > dsSettings.MaxInFlight {
+		dsSettings.MaxConcurrency = dsSettings.MaxInFlight
+	}
 	// Per-response size cap (R2-CR7). 256 MiB (the original hardcoded value)
 	// was too low for 6M+ row analytical queries — Arc reports "Arrow IPC
 	// stream truncated after headers committed" because the plugin closes the
@@ -288,7 +305,7 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	inst := &ArcInstanceSettings{
 		settings:         dsSettings,
 		apiKey:           apiKey,
-		sem:              semaphore.NewWeighted(int64(dsSettings.MaxConcurrency)),
+		sem:              semaphore.NewWeighted(int64(dsSettings.MaxInFlight)),
 		maxResponseBytes: int64(dsSettings.MaxResponseMB) * 1024 * 1024,
 	}
 	// SSRF dial policy is two-axis (gemini 3244943519): a loopback URL only
@@ -579,6 +596,18 @@ func mergeFrames(frames []*data.Frame) *data.Frame {
 	if skipped > 0 {
 		log.DefaultLogger.Warn("mergeFrames skipped chunks with incompatible schema",
 			"skipped", skipped, "kept", len(frames)-skipped)
+		// Surface it on the panel too. Dropping a chunk silently leaves a
+		// partial series that looks like a gap in the data rather than a
+		// plugin decision, and the user has no way to tell the difference.
+		if merged.Meta == nil {
+			merged.Meta = &data.FrameMeta{}
+		}
+		merged.Meta.Notices = append(merged.Meta.Notices, data.Notice{
+			Severity: data.NoticeSeverityWarning,
+			Text: fmt.Sprintf(
+				"%d of %d query chunks returned a different set of columns and were dropped; this series is incomplete. Turn off query splitting for this panel to see the full range.",
+				skipped, len(frames)),
+		})
 	}
 
 	if additionalRows == 0 {
@@ -750,7 +779,7 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	}
 
 	if err := g.Wait(); err != nil {
-		return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserError(qm.RefID, err))
+		return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserErrorSQL(qm.RefID, qm.SQL, err))
 	}
 
 	orderedFrames := make([]*data.Frame, 0, len(chunks))
@@ -811,7 +840,7 @@ func (d *ArcDatasource) querySingle(ctx context.Context, settings *ArcInstanceSe
 
 	frame, err := executeProtocolQuery(ctx, settings, sql)
 	if err != nil {
-		return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserError(qm.RefID, err))
+		return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserErrorSQL(qm.RefID, sql, err))
 	}
 
 	// Time the frame preparation (conversion)
