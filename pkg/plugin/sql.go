@@ -3,6 +3,7 @@ package plugin
 import (
 	"regexp"
 	"strings"
+	"time"
 )
 
 // strippedSQL is the result of removing single-quoted string literals AND
@@ -159,6 +160,67 @@ func hasTimeFilterMacro(s strippedSQL) bool {
 		return true
 	}
 	return strings.Contains(s.stripped, "$__timeFrom") && strings.Contains(s.stripped, "$__timeTo")
+}
+
+// timeGroupArgsRe captures the interval argument of a $__timeGroup call, so
+// the caller can compare the bucket width against the chunk width.
+var timeGroupArgsRe = regexp.MustCompile(`(?i)\$__timeGroup\s*\([^,]+,\s*['"]?([^'",)]+)`)
+
+// maxTimeGroupBucket returns the widest bucket any $__timeGroup in the query
+// asks for, and whether the query buckets at all.
+//
+// An interval the plugin cannot parse returns ok=true with a zero duration,
+// which callers treat as "unknown, assume unsafe": the macro will be left
+// unexpanded and the query is not a candidate for splitting anyway.
+// NOTE: this reads the RAW sql, not the stripped view. Stripping removes
+// string-literal bodies, and the interval lives inside one — `'1d'` — so the
+// stripped text has already thrown away the value we need.
+func maxTimeGroupBucket(sql string) (time.Duration, bool) {
+	matches := timeGroupArgsRe.FindAllStringSubmatch(sql, -1)
+	if len(matches) == 0 {
+		return 0, false
+	}
+	var widest time.Duration
+	for _, m := range matches {
+		secs, ok := intervalToSeconds(strings.TrimSpace(m[1]))
+		if !ok {
+			return 0, true // unparseable: treat as unbounded
+		}
+		if d := time.Duration(secs) * time.Second; d > widest {
+			widest = d
+		}
+	}
+	return widest, true
+}
+
+// splitCorruptsBuckets reports whether chunking a query at `chunk` would break
+// the buckets it asks for.
+//
+// A chunked query is re-run per chunk and the frames are concatenated, so a
+// bucket WIDER than a chunk is aggregated once per chunk it spans and comes
+// back as several partial rows carrying the same timestamp. A one-day bucket
+// split into 16 chunks yields 16 rows where there should be one — and each
+// carries a fraction of the true count, so the chart is silently wrong rather
+// than obviously broken.
+//
+// Local-calendar buckets (a non-UTC dashboard) are never safe: chunk edges are
+// computed in UTC and a local midnight falls between them regardless of chunk
+// size.
+func splitCorruptsBuckets(sql string, s strippedSQL, tz string, chunk time.Duration) bool {
+	// The macro must be present in the STRIPPED view — one mentioned only
+	// inside a literal or a comment never expands, so it buckets nothing.
+	if !strings.Contains(s.stripped, "$__timeGroup") {
+		return false
+	}
+	bucket, buckets := maxTimeGroupBucket(sql)
+	if !buckets {
+		return false
+	}
+	if tz != "" && tz != "UTC" {
+		return true
+	}
+	// bucket == 0 means an interval we could not parse: assume unsafe.
+	return bucket == 0 || bucket > chunk
 }
 
 // aggregationFnRe matches any SQL aggregation function call. Anchored at a

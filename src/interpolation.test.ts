@@ -1,4 +1,4 @@
-import { escapeLiteral, quoteLiteral } from './interpolation';
+import { escapeLiteral, quoteLiteral, resolveTimezone } from './interpolation';
 
 /**
  * These tests pin the interpolation contract against the idioms the real
@@ -61,5 +61,28 @@ describe('production dashboard idioms', () => {
     // Exactly one opening and one closing quote at the edges; the payload's
     // own quote is doubled, so the literal is never terminated early.
     expect(sql.match(/'/g)!.length).toBe(4);
+  });
+});
+
+describe('resolveTimezone', () => {
+  it('normalises utc and unset to UTC', () => {
+    expect(resolveTimezone('utc')).toBe('UTC');
+    expect(resolveTimezone('UTC')).toBe('UTC');
+    expect(resolveTimezone(undefined)).toBe('UTC');
+    expect(resolveTimezone('')).toBe('UTC');
+  });
+
+  it('passes an explicit IANA zone through', () => {
+    expect(resolveTimezone('America/Costa_Rica')).toBe('America/Costa_Rica');
+    expect(resolveTimezone('Europe/Madrid')).toBe('Europe/Madrid');
+  });
+
+  it('resolves "browser" to the viewer\'s own zone', () => {
+    // Resolved on the frontend because that is where the browser is: two
+    // viewers in different zones each get their own bucketing, which a
+    // server-side default could not provide.
+    const got = resolveTimezone('browser');
+    expect(got).not.toBe('browser');
+    expect(got.length).toBeGreaterThan(0);
   });
 });

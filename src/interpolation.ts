@@ -33,3 +33,30 @@ export function escapeLiteral(value: string): string {
 export function quoteLiteral(value: string): string {
   return "'" + escapeLiteral(value) + "'";
 }
+
+/**
+ * Normalises Grafana's dashboard timezone setting to an IANA zone name.
+ *
+ * Grafana reports the setting as an IANA name, the literal "utc", or
+ * "browser" (meaning "whatever the viewer's browser is"). The backend only
+ * understands IANA names, so "browser" is resolved HERE, where the browser
+ * actually is — two viewers in different zones then each get their own local
+ * bucketing, which a server-side default could not provide.
+ *
+ * Anything unset or unresolvable becomes "UTC", matching the behaviour the
+ * plugin had before timezone support existed: a timezone lookup should never
+ * black out a panel.
+ */
+export function resolveTimezone(timezone?: string): string {
+  if (!timezone || timezone === 'utc' || timezone === 'UTC') {
+    return 'UTC';
+  }
+  if (timezone === 'browser') {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    } catch {
+      return 'UTC';
+    }
+  }
+  return timezone;
+}

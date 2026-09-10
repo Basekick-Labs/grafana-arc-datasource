@@ -85,6 +85,10 @@ type ArcQuery struct {
 	Format        string `json:"format"`   // "time_series" or "table"
 	MaxDataPoints int64  `json:"maxDataPoints"`
 	SplitDuration string `json:"splitDuration"` // "auto" (default), "off", or explicit: "1h", "6h", "12h", "1d", "3d", "7d"
+	// Timezone is the dashboard's timezone as an IANA name, resolved by the
+	// frontend ("browser" is expanded there, where the browser is). Empty
+	// means UTC, which is what every build before 1.5.0 did.
+	Timezone string `json:"timezone"`
 }
 
 // ArcInstanceSettings is the cached, parsed view of a datasource instance.
@@ -509,10 +513,10 @@ func splitTimeRange(from, to time.Time, chunkSize time.Duration) []backend.TimeR
 }
 
 // executeChunk runs a single query chunk against Arc
-func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceSettings, rawSQL string, chunk backend.TimeRange, originalRange backend.TimeRange) (*data.Frame, error) {
+func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceSettings, rawSQL string, chunk backend.TimeRange, originalRange backend.TimeRange, tz string) (*data.Frame, error) {
 	// Apply macros with the chunk's time range for time filtering,
 	// but keep the original range for $__interval calculation
-	sql := ApplyMacrosWithSplit(rawSQL, chunk, originalRange)
+	sql := ApplyMacrosWithSplit(rawSQL, chunk, originalRange, tz)
 
 	return executeProtocolQuery(ctx, settings, sql)
 }
@@ -683,6 +687,12 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	}
 
 	// Check if query splitting is enabled
+	// Normalise once. splitCorruptsBuckets and expandTimeGroup both branch on
+	// the timezone, and deriving it through two different normalisations meant
+	// a dashboard set to "Etc/UTC" emitted plain epoch SQL yet silently lost
+	// query splitting.
+	qm.Timezone = validateTimezone(qm.Timezone)
+
 	chunkSize, splitting := parseSplitDuration(qm.SplitDuration, query.TimeRange)
 
 	// Compute the stripped-and-uppercased view of the SQL once and reuse it
@@ -703,6 +713,14 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	case splitting && containsUnion(stripped):
 		// Macro expansion in multi-statement queries produces mangled SQL.
 		log.DefaultLogger.Debug("Skipping split for UNION query", "refId", qm.RefID)
+		splitting = false
+	case splitting && splitCorruptsBuckets(qm.SQL, stripped, qm.Timezone, chunkSize):
+		// A bucket wider than a chunk is aggregated once per chunk it spans
+		// and merged back as several partial rows sharing one timestamp — a
+		// silently wrong chart, not an obviously broken one. Local-calendar
+		// buckets are never safe, since chunk edges are computed in UTC.
+		log.DefaultLogger.Debug("Skipping split: bucket wider than chunk",
+			"refId", qm.RefID, "timezone", qm.Timezone, "chunk", chunkSize.String())
 		splitting = false
 	case splitting && containsAggregationWithoutTimeGroup(stripped):
 		// Aggregations without time bucketing span the full range; each chunk
@@ -776,7 +794,7 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 						chunk.To.Format("2006-01-02 15:04"), r)
 				}
 			}()
-			frame, runErr := d.executeChunk(gctx, settings, qm.SQL, chunk, query.TimeRange)
+			frame, runErr := d.executeChunk(gctx, settings, qm.SQL, chunk, query.TimeRange, qm.Timezone)
 			if runErr != nil {
 				return fmt.Errorf("[chunk %s to %s] %w",
 					chunk.From.Format("2006-01-02 15:04"),
@@ -838,7 +856,7 @@ func (d *ArcDatasource) querySingle(ctx context.Context, settings *ArcInstanceSe
 	var response backend.DataResponse
 
 	// Apply time range macros
-	sql := ApplyMacros(qm.SQL, query.TimeRange)
+	sql := ApplyMacros(qm.SQL, query.TimeRange, qm.Timezone)
 
 	log.DefaultLogger.Debug("Executing Arc query",
 		"refId", qm.RefID,

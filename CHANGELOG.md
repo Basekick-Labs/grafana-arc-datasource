@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `$__timeGroup` buckets by the dashboard's timezone. Previously a "day"
+  bucket started at 00:00 UTC, so a dashboard in UTC-6 showed bars that each
+  mixed two local calendar days, and the first and last bar of a range were
+  partial. Hour, day and week buckets now truncate on local boundaries,
+  including across DST transitions where a local day is not 86400 seconds
+  long. "Browser Time" is resolved per viewer, so two people in different
+  zones each see their own days.
+
+  UTC dashboards are unaffected: they produce byte-identical SQL to previous
+  releases, on purpose. `date_trunc` keeps nanosecond residuals on
+  `TIMESTAMP_NS` columns, and on a `TIMESTAMPTZ` column it truncates in the
+  database session's timezone — so a "UTC" dashboard on the calendar path
+  would silently follow Arc's session setting instead of UTC.
+
+  Hour buckets stay on epoch arithmetic in any zone whose offset is a whole
+  number of hours, which is nearly all of them: a local hour boundary is a UTC
+  hour boundary there, so the buckets are identical, and the calendar path
+  carries a hazard that epoch math does not. At a daylight-saving fall-back the
+  local clock repeats an hour, so two different hours truncate to the same wall
+  time and merge into one bucket while the neighbouring bucket disappears. Only
+  zones offset by :30 or :45 need the calendar path for hours.
+
+  Sub-hour buckets, and spans that are not whole calendar units (`6h`, `12h`,
+  `3d`), stay on epoch arithmetic, which is correct for them. `7d` is
+  deliberately not treated as a calendar week: `date_trunc('week')` anchors on
+  Monday, and "seven days wide" does not mean "Monday to Sunday". Ask for `1w`
+  if that is what you want.
+
+### Fixed
+- Query splitting no longer corrupts wide time buckets. A bucket wider than a
+  chunk was aggregated once per chunk it spanned and merged back as several
+  partial rows sharing one timestamp: a one-day bucket over a four-day range
+  returned 16 rows where 5 were correct, each carrying a fraction of the true
+  count. Such queries now run unsplit. This affected UTC dashboards too, and
+  predates the timezone feature.
+- The plugin binary embeds the IANA timezone database. `time.LoadLocation`
+  otherwise reads the host's zoneinfo, which Grafana's distroless image and
+  Windows hosts do not ship, and the failure was silent: every zone degraded
+  to UTC with no error.
+
 ## [1.4.0] - 2026-09-10
 
 Restores compatibility with dashboards written against 1.2.0. Upgrade straight
