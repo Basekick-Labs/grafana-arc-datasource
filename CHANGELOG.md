@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.10] - 2026-09-10
+
+### Fixed
+- Variable quoting is now context-aware. Dashboards use both
+  `WHERE host = '$server'` and a bare `AND cpu = $cpu`, often in the same
+  panel: quoting every value produced `''h01''`, and quoting none made DuckDB
+  read the value as a column name (`Referenced column "cpu38" not found`).
+  A value is now quoted only when the author did not already quote it.
+  Embedded quotes are doubled either way, which is what closes R2-HI5.
+
 ## [1.3.9] - 2026-09-10
 
 ### Fixed

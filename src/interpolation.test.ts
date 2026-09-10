@@ -1,4 +1,4 @@
-import { escapeLiteral, isBuiltInVariable, resolveTimezone } from './interpolation';
+import { escapeLiteral, isBuiltInVariable, preQuotedVariables, resolveTimezone } from './interpolation';
 
 describe('isBuiltInVariable', () => {
   // Regression: Grafana routes its own $__interval through the datasource's
@@ -71,5 +71,33 @@ describe('dashboard idioms', () => {
     // One opening and one closing quote at the edges; the payload's quote is
     // doubled, so the literal is never terminated early.
     expect(sql.match(/'/g)!.length).toBe(4);
+  });
+});
+
+describe('preQuotedVariables', () => {
+  // The real "System Monitoring ARC v2" dashboard uses BOTH idioms, so
+  // quoting must depend on what the author wrote.
+  it('detects quoted variables and ignores bare ones', () => {
+    const sql = "WHERE host = '$server' AND cpu = $cpu AND m = '${mountpoint:raw}'";
+    const q = preQuotedVariables(sql);
+    expect(q.has('server')).toBe(true);
+    expect(q.has('mountpoint')).toBe(true);
+    expect(q.has('cpu')).toBe(false);
+  });
+
+  it('handles ${var} and ${var:format}', () => {
+    expect(preQuotedVariables("x = '${server}'").has('server')).toBe(true);
+    expect(preQuotedVariables("x = '${server:raw}'").has('server')).toBe(true);
+  });
+
+  it('does not treat a bare variable as quoted', () => {
+    expect(preQuotedVariables('WHERE cpu = $cpu').size).toBe(0);
+  });
+
+  // Both shapes must produce exactly one valid literal.
+  it('yields one literal for each idiom', () => {
+    const v = escapeLiteral('cpu-total');
+    expect(`AND cpu = '${v}'`).toBe("AND cpu = 'cpu-total'");   // bare -> we add quotes
+    expect(`AND cpu = '${v}'`.match(/'/g)!.length).toBe(2);
   });
 });
