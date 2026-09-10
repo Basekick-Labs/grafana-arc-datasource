@@ -28,7 +28,7 @@ func newStrippedSQL(sql string) strippedSQL {
 // (e.g. `WHERE message = 'count(*) is high'`) or on commented-out keywords
 // (e.g. `-- LIMIT 10`).
 //
-// Single-quoted literals use SQL's escaped-quote convention (`''` inside).
+// Single-quoted literals use SQL's escaped-quote convention (`”` inside).
 // Double-quoted identifiers are NOT touched — DuckDB and Postgres use them
 // for column names that contain special characters, so keyword detection on
 // them is still desired.
@@ -113,6 +113,7 @@ func stripStringLiteralsAndComments(sql string) string {
 //   - Grafana template variable: `LIMIT $limit`
 //   - DuckDB positional / named parameter: `LIMIT ?` or `LIMIT :n`
 //   - subquery / expression: `LIMIT (SELECT max(n) FROM t)`
+//
 // Restricting to `\d` (the previous form) missed all but the first, so
 // splitting was enabled for `LIMIT $limit` queries and returned N×$limit
 // rows for a $limit-bound query (gemini round 4 finding 3244824396).
@@ -150,6 +151,27 @@ func hasTimeFilterMacro(s strippedSQL) bool {
 		strings.Contains(s.stripped, "$__timeFrom") ||
 		strings.Contains(s.stripped, "$__timeTo") ||
 		strings.Contains(s.stripped, "$__timeGroup")
+}
+
+// usesLocalTimeBuckets reports whether the query buckets time in a specific
+// timezone rather than in UTC -- either via $__timeGroup (which emits a
+// timezone-aware date_trunc for hour/day/week when the dashboard is not UTC)
+// or via an explicit $__timezone in the SQL.
+//
+// Such a query MUST NOT be split. Chunk boundaries are computed in UTC, but a
+// local-midnight bucket straddles them, so the day is aggregated once per
+// chunk and merged back as two rows with the same timestamp and partial
+// values (observed on watchdog: every bucket duplicated, e.g. 20 and 12 for
+// a day whose true count is 32). Splitting is only sound when bucket edges
+// align with chunk edges, which holds for UTC epoch buckets and not for
+// local ones.
+func usesLocalTimeBuckets(s strippedSQL, tz string) bool {
+	if strings.Contains(s.stripped, "$__timezone") {
+		return true
+	}
+	// $__timeGroup only becomes timezone-dependent outside UTC; a UTC
+	// dashboard keeps the epoch bucketing that splitting was designed for.
+	return tz != "" && tz != "UTC" && strings.Contains(s.stripped, "$__timeGroup")
 }
 
 // aggregationFnRe matches any SQL aggregation function call. Anchored at a

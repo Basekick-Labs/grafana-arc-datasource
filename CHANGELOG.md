@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-09-10
+
+### Fixed
+- Query splitting corrupted timezone-aware `$__timeGroup` results. Chunk
+  boundaries are computed in UTC, but a local-midnight bucket straddles them,
+  so each chunk aggregated the day it crossed and the merge returned two rows
+  per bucket with partial values. Queries that bucket in a non-UTC timezone
+  (or use `$__timezone`) are no longer split.
+
 ## [1.3.3] - 2026-09-09
 
 ### Added

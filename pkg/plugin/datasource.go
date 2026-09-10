@@ -50,11 +50,11 @@ const (
 type ArcQuery struct {
 	RefID         string `json:"refId"`
 	SQL           string `json:"sql"`
-	RawSQL        string `json:"rawSql"`        // Postgres/MySQL/MSSQL/ClickHouse compatibility
-	Database      string `json:"database"`       // Per-query database override (empty = use datasource default)
-	Format        string `json:"format"`         // "time_series" or "table"
+	RawSQL        string `json:"rawSql"`   // Postgres/MySQL/MSSQL/ClickHouse compatibility
+	Database      string `json:"database"` // Per-query database override (empty = use datasource default)
+	Format        string `json:"format"`   // "time_series" or "table"
 	MaxDataPoints int64  `json:"maxDataPoints"`
-	SplitDuration string `json:"splitDuration"`  // "auto" (default), "off", or explicit: "1h", "6h", "12h", "1d", "3d", "7d"
+	SplitDuration string `json:"splitDuration"` // "auto" (default), "off", or explicit: "1h", "6h", "12h", "1d", "3d", "7d"
 	// Timezone is the dashboard's timezone as an IANA name, resolved by the
 	// frontend ("browser" is expanded there, where the browser is). Empty
 	// means UTC, which is also the behaviour of every pre-1.3 plugin build.
@@ -411,7 +411,9 @@ func parseSplitDuration(s string, tr backend.TimeRange) (time.Duration, bool) {
 // Alignment ensures common aggregation intervals (1h, 10m, etc.) never span a
 // chunk boundary, which would produce incorrect partial aggregations.
 // Example with 6h chunks, range 14:30–02:30:
-//   [14:30, 18:00), [18:00, 00:00), [00:00, 02:30)
+//
+//	[14:30, 18:00), [18:00, 00:00), [00:00, 02:30)
+//
 // All internal boundaries land on 6h multiples from epoch.
 func splitTimeRange(from, to time.Time, chunkSize time.Duration) []backend.TimeRange {
 	// Truncates to whole seconds — sub-second chunk sizes are not supported,
@@ -638,6 +640,11 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	case splitting && containsUnion(stripped):
 		// Macro expansion in multi-statement queries produces mangled SQL.
 		log.DefaultLogger.Debug("Skipping split for UNION query", "refId", qm.RefID)
+		splitting = false
+	case splitting && usesLocalTimeBuckets(stripped, qm.Timezone):
+		// Local-timezone buckets don't align with UTC chunk boundaries; each
+		// chunk would emit a partial row for the day it straddles.
+		log.DefaultLogger.Debug("Skipping split for timezone-aware bucketing", "refId", qm.RefID, "timezone", qm.Timezone)
 		splitting = false
 	case splitting && containsAggregationWithoutTimeGroup(stripped):
 		// Aggregations without time bucketing span the full range; each chunk

@@ -1374,3 +1374,28 @@ func TestApplyMacros_TimezoneMacroDefaultsToUTC(t *testing.T) {
 		t.Errorf("expected UTC default, got: %s", got)
 	}
 }
+
+// --- splitting must not break local-timezone buckets ---
+
+// Regression (watchdog, 1.3.3): $__timeGroup with a non-UTC dashboard emits a
+// local-midnight date_trunc, whose bucket edges do not align with the UTC
+// chunk boundaries splitting uses. Each chunk then aggregated the day it
+// straddled and the merge returned two rows per bucket with partial counts.
+func TestUsesLocalTimeBuckets(t *testing.T) {
+	cases := []struct {
+		sql, tz string
+		want    bool
+		desc    string
+	}{
+		{"SELECT $__timeGroup(time, '1d') FROM t", "America/Costa_Rica", true, "timeGroup + non-UTC dashboard"},
+		{"SELECT $__timeGroup(time, '1d') FROM t", "UTC", false, "timeGroup + UTC stays splittable"},
+		{"SELECT $__timeGroup(time, '1d') FROM t", "", false, "timeGroup + unset tz stays splittable"},
+		{"SELECT date_trunc('day', time AT TIME ZONE $__timezone) FROM t", "UTC", true, "explicit $__timezone always unsafe"},
+		{"SELECT count(*) FROM t WHERE $__timeFilter(time)", "America/Costa_Rica", false, "no bucketing macro"},
+	}
+	for _, c := range cases {
+		if got := usesLocalTimeBuckets(newStrippedSQL(c.sql), c.tz); got != c.want {
+			t.Errorf("%s: usesLocalTimeBuckets(%q, %q) = %v, want %v", c.desc, c.sql, c.tz, got, c.want)
+		}
+	}
+}
