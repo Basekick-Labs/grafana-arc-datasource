@@ -201,6 +201,32 @@ GROUP BY time_bucket(INTERVAL '$__interval', time)
 ORDER BY time ASC
 ```
 
+#### Quoting rules
+
+This plugin follows the same rule as Grafana's built-in SQL datasources
+(Postgres, MySQL, MSSQL), so queries port between them unchanged:
+
+| Variable kind | What the plugin does | How to write it |
+|---|---|---|
+| Single-value | Escapes embedded quotes; adds **no** quotes | You supply the quotes: `WHERE host = '$server'` |
+| Multi-value or "Include All" | Quotes **each** value and joins with commas | Leave it bare: `WHERE host IN ($servers)` |
+
+The practical consequences:
+
+- A single-value variable works inside a literal of any shape, including a
+  regex: `WHERE host ~ '^$server$'`.
+- A multi-value variable must **not** be wrapped in quotes — `'$servers'`
+  would produce `''a','b''`. Use `IN ($servers)`, or `${servers:raw}` if you
+  need to place the values yourself.
+- Grafana's own macros (`$__interval`, `$__from`, `$__to`) are single-value,
+  so `INTERVAL '$__interval'` is correct.
+
+Embedded single quotes are always doubled, so a value cannot terminate the
+literal it is placed in. A variable used **without** quotes (`WHERE host =
+$server`) is interpolated as-is — identical to Grafana's SQL datasources, and
+the reason Arc's API key should be scoped to what the dashboard's viewers are
+allowed to read.
+
 ### Alerting
 
 The datasource fully supports Grafana alerting. Create alert rules with Arc queries:
