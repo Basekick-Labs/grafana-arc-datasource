@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database session's timezone — so a "UTC" dashboard on the calendar path
   would silently follow Arc's session setting instead of UTC.
 
+  Hour buckets stay on epoch arithmetic in any zone whose offset is a whole
+  number of hours, which is nearly all of them: a local hour boundary is a UTC
+  hour boundary there, so the buckets are identical, and the calendar path
+  carries a hazard that epoch math does not. At a daylight-saving fall-back the
+  local clock repeats an hour, so two different hours truncate to the same wall
+  time and merge into one bucket while the neighbouring bucket disappears. Only
+  zones offset by :30 or :45 need the calendar path for hours.
+
   Sub-hour buckets, and spans that are not whole calendar units (`6h`, `12h`,
   `3d`), stay on epoch arithmetic, which is correct for them. `7d` is
   deliberately not treated as a calendar week: `date_trunc('week')` anchors on

@@ -516,7 +516,7 @@ func splitTimeRange(from, to time.Time, chunkSize time.Duration) []backend.TimeR
 func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceSettings, rawSQL string, chunk backend.TimeRange, originalRange backend.TimeRange, tz string) (*data.Frame, error) {
 	// Apply macros with the chunk's time range for time filtering,
 	// but keep the original range for $__interval calculation
-	sql := ApplyMacrosWithSplitTZ(rawSQL, chunk, originalRange, tz)
+	sql := ApplyMacrosWithSplit(rawSQL, chunk, originalRange, tz)
 
 	return executeProtocolQuery(ctx, settings, sql)
 }
@@ -687,6 +687,12 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	}
 
 	// Check if query splitting is enabled
+	// Normalise once. splitCorruptsBuckets and expandTimeGroup both branch on
+	// the timezone, and deriving it through two different normalisations meant
+	// a dashboard set to "Etc/UTC" emitted plain epoch SQL yet silently lost
+	// query splitting.
+	qm.Timezone = validateTimezone(qm.Timezone)
+
 	chunkSize, splitting := parseSplitDuration(qm.SplitDuration, query.TimeRange)
 
 	// Compute the stripped-and-uppercased view of the SQL once and reuse it
@@ -850,7 +856,7 @@ func (d *ArcDatasource) querySingle(ctx context.Context, settings *ArcInstanceSe
 	var response backend.DataResponse
 
 	// Apply time range macros
-	sql := ApplyMacrosTZ(qm.SQL, query.TimeRange, qm.Timezone)
+	sql := ApplyMacros(qm.SQL, query.TimeRange, qm.Timezone)
 
 	log.DefaultLogger.Debug("Executing Arc query",
 		"refId", qm.RefID,

@@ -310,8 +310,8 @@ func TestSplitTimeRange_BoundaryNoDuplicates(t *testing.T) {
 	boundaryTime := chunks[0].To // e.g. 11:00:00
 	sql := "SELECT * FROM t WHERE $__timeFilter(time)"
 
-	chunk1SQL := ApplyMacrosWithSplit(sql, chunks[0], backend.TimeRange{From: from, To: to})
-	chunk2SQL := ApplyMacrosWithSplit(sql, chunks[1], backend.TimeRange{From: from, To: to})
+	chunk1SQL := ApplyMacrosWithSplit(sql, chunks[0], backend.TimeRange{From: from, To: to}, "")
+	chunk2SQL := ApplyMacrosWithSplit(sql, chunks[1], backend.TimeRange{From: from, To: to}, "")
 
 	// Chunk 1 should use: time < '...11:00:00Z' (exclusive end)
 	boundaryStr := boundaryTime.Format(time.RFC3339)
@@ -616,7 +616,7 @@ func TestApplyMacros_TimeFilter(t *testing.T) {
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
 	}
 	sql := "SELECT * FROM t WHERE $__timeFilter(time)"
-	result := ApplyMacros(sql, tr)
+	result := ApplyMacros(sql, tr, "")
 
 	if strings.Contains(result, "$__timeFilter") {
 		t.Errorf("macro not expanded: %s", result)
@@ -632,7 +632,7 @@ func TestApplyMacros_TimeFilter_CustomColumn(t *testing.T) {
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
 	}
 	sql := "SELECT * FROM t WHERE $__timeFilter(created_at)"
-	result := ApplyMacros(sql, tr)
+	result := ApplyMacros(sql, tr, "")
 
 	if strings.Contains(result, "$__timeFilter") {
 		t.Errorf("macro not expanded: %s", result)
@@ -660,7 +660,7 @@ func TestApplyMacros_Interval(t *testing.T) {
 			From: time.Date(2026, 2, 18, 0, 0, 0, 0, time.UTC),
 			To:   time.Date(2026, 2, 18, 0, 0, 0, 0, time.UTC).Add(time.Duration(c.hours) * time.Hour),
 		}
-		result := ApplyMacros("GROUP BY $__interval", tr)
+		result := ApplyMacros("GROUP BY $__interval", tr, "")
 		if !strings.Contains(result, c.expected) {
 			t.Errorf("for %dh range, expected interval %q in: %s", c.hours, c.expected, result)
 		}
@@ -676,7 +676,7 @@ func TestApplyMacros_TimeFilter_MultipleOccurrences(t *testing.T) {
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
 	}
 	sql := "SELECT * FROM a WHERE $__timeFilter(t1) UNION SELECT * FROM b WHERE $__timeFilter(t2)"
-	result := ApplyMacros(sql, tr)
+	result := ApplyMacros(sql, tr, "")
 
 	if strings.Contains(result, "$__timeFilter") {
 		t.Fatalf("expected both macros expanded, got: %s", result)
@@ -706,7 +706,7 @@ func TestApplyMacros_TimeFilter_RejectsUnsafeColumn(t *testing.T) {
 	// timestamp literal the macro emits — must be rejected and left as-is.
 	// Second macro is valid — must still expand.
 	sql := "WHERE $__timeFilter(t1' OR '1'='1) AND x = 5 AND $__timeFilter(t2)"
-	result := ApplyMacros(sql, tr)
+	result := ApplyMacros(sql, tr, "")
 
 	// First (unsafe) macro should be left un-expanded so Arc surfaces an error.
 	if !strings.Contains(result, "$__timeFilter(t1' OR '1'='1)") {
@@ -729,7 +729,7 @@ func TestApplyMacros_NotExpandedInsideStringLiteral(t *testing.T) {
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
 	}
 	sql := "SELECT * FROM logs WHERE msg = 'see $__timeFilter(time) docs' AND $__timeFilter(time)"
-	result := ApplyMacros(sql, tr)
+	result := ApplyMacros(sql, tr, "")
 
 	// The literal content must be untouched.
 	if !strings.Contains(result, "'see $__timeFilter(time) docs'") {
@@ -789,7 +789,7 @@ func TestApplyMacros_NotExpandedInsideComment(t *testing.T) {
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
 	}
 	sql := "SELECT * FROM t\n-- use $__timeFilter(time) here\nWHERE $__timeFilter(time)"
-	result := ApplyMacros(sql, tr)
+	result := ApplyMacros(sql, tr, "")
 
 	if !strings.Contains(result, "-- use $__timeFilter(time) here") {
 		t.Errorf("macro inside line comment should NOT be expanded: %s", result)
@@ -809,7 +809,7 @@ func TestApplyMacros_TimeFilter_NestedParens(t *testing.T) {
 	}
 	sql := "WHERE $__timeFilter(COALESCE(t1, t2)) AND x = 1"
 	done := make(chan string, 1)
-	go func() { done <- ApplyMacros(sql, tr) }()
+	go func() { done <- ApplyMacros(sql, tr, "") }()
 	select {
 	case result := <-done:
 		// The full nested expression must be used as the column, on both
@@ -842,7 +842,7 @@ func TestExpandTimeGroup_UnknownInterval(t *testing.T) {
 		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
 	}
-	result := ApplyMacros(sql, tr)
+	result := ApplyMacros(sql, tr, "")
 	// Macro left un-expanded so Arc surfaces a clear error rather than
 	// silently using the wrong bucket size.
 	if !strings.Contains(result, "$__timeGroup(time, 'nonsense')") {
@@ -865,7 +865,7 @@ func TestExpandTimeGroup_FillArgIgnored(t *testing.T) {
 		"SELECT $__timeGroup(time, '1h', NULL) AS time FROM t",
 		"SELECT $__timeGroup(time, '1h', previous) AS time FROM t",
 	} {
-		result := ApplyMacros(sql, tr)
+		result := ApplyMacros(sql, tr, "")
 		if strings.Contains(result, "$__timeGroup") {
 			t.Errorf("fill argument should be ignored, not reject the macro: %s", result)
 		}
@@ -884,7 +884,7 @@ func TestApplyMacros_TimeFilter_NoInfiniteLoopOnUnclosedParen(t *testing.T) {
 	}
 	sql := "SELECT * FROM t WHERE $__timeFilter(time"
 	done := make(chan string, 1)
-	go func() { done <- ApplyMacros(sql, tr) }()
+	go func() { done <- ApplyMacros(sql, tr, "") }()
 	select {
 	case result := <-done:
 		if result != sql {
@@ -906,7 +906,7 @@ func TestApplyMacrosWithSplit_UsesChunkForFilter_OriginalForInterval(t *testing.
 	}
 
 	sql := "WHERE $__timeFilter(time) GROUP BY $__interval"
-	result := ApplyMacrosWithSplit(sql, chunk, originalRange)
+	result := ApplyMacrosWithSplit(sql, chunk, originalRange, "")
 
 	// Time filter should use chunk boundaries
 	if !strings.Contains(result, "2026-02-18T06:00:00Z") {
@@ -1232,7 +1232,7 @@ func TestApplyMacros_ParenthesisedMacrosLiteralSafe(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			result := ApplyMacros(c.sql, tr)
+			result := ApplyMacros(c.sql, tr, "")
 			if !strings.Contains(result, c.preserved) {
 				t.Errorf("macro inside literal was expanded — expected to find %q in: %s", c.preserved, result)
 			}
@@ -1248,7 +1248,7 @@ func TestApplyMacros_ZeroArgMacrosOutsideLiteralStillExpand(t *testing.T) {
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
 	}
 	sql := "SELECT * WHERE start = $__timeFrom() AND end = $__timeTo() GROUP BY $__interval"
-	result := ApplyMacros(sql, tr)
+	result := ApplyMacros(sql, tr, "")
 	for _, macro := range []string{"$__timeFrom(", "$__timeTo(", "$__interval"} {
 		if strings.Contains(result, macro) {
 			t.Errorf("macro %s was NOT expanded outside a literal: %s", macro, result)
@@ -1420,7 +1420,7 @@ func TestApplyMacros_IntervalExpandsInsideLiteral(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := ApplyMacros(c.sql, tr); got != c.want {
+			if got := ApplyMacros(c.sql, tr, ""); got != c.want {
 				t.Errorf("ApplyMacros() =\n  %s\nwant\n  %s", got, c.want)
 			}
 		})
@@ -1456,7 +1456,7 @@ func TestApplyMacros_IntervalTokenBoundaries(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := ApplyMacros(c.sql, tr); got != c.want {
+			if got := ApplyMacros(c.sql, tr, ""); got != c.want {
 				t.Errorf("ApplyMacros() = %q, want %q", got, c.want)
 			}
 		})
@@ -1483,7 +1483,7 @@ func TestApplyMacros_IntervalSkipsComments(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := ApplyMacros(c.sql, tr); got != c.want {
+			if got := ApplyMacros(c.sql, tr, ""); got != c.want {
 				t.Errorf("ApplyMacros() = %q, want %q", got, c.want)
 			}
 		})
@@ -1865,16 +1865,19 @@ func TestReplaceMacroOccurrences_AbsentMacroAllocatesNothing(t *testing.T) {
 // column date_trunc truncates in the DuckDB SESSION's timezone — so a "UTC"
 // dashboard would silently follow Arc's session setting instead of UTC.
 func TestExpandTimeGroup_UTCUnchanged(t *testing.T) {
-	for _, interval := range []string{"10s", "1m", "5m", "30m", "1h", "6h", "12h", "1d", "1w", "3d"} {
+	// Golden comparison, not a substring check: the claim is "byte-identical",
+	// and a substring assertion would pass even if the bucket WIDTH changed.
+	for interval, secs := range map[string]int{
+		"10s": 10, "1m": 60, "5m": 300, "30m": 1800, "1h": 3600,
+		"6h": 21600, "12h": 43200, "1d": 86400, "1w": 604800, "3d": 259200,
+	} {
 		sql := "SELECT $__timeGroup(time, '" + interval + "') AS t FROM x"
-		for _, tz := range []string{"", "UTC"} {
-			got := expandTimeGroup(sql, tz)
-			if strings.Contains(got, "timezone(") || strings.Contains(got, "date_trunc(") {
-				t.Errorf("interval %q tz %q took the calendar path; UTC must stay on epoch math: %s",
-					interval, tz, got)
-			}
-			if !strings.Contains(got, "epoch_ns(") {
-				t.Errorf("interval %q tz %q lost the epoch expansion: %s", interval, tz, got)
+		want := fmt.Sprintf("SELECT to_timestamp((epoch_ns(time) // 1000000000 // %d) * %d) AS t FROM x", secs, secs)
+		// Every spelling that means UTC must reach the same expansion, so the
+		// split heuristic and the macro expander cannot disagree.
+		for _, tz := range []string{"", "UTC", "utc", "Etc/UTC"} {
+			if got := expandTimeGroup(sql, tz); got != want {
+				t.Errorf("interval %q tz %q:\n got %s\nwant %s", interval, tz, got, want)
 			}
 		}
 	}
@@ -1887,7 +1890,6 @@ func TestExpandTimeGroup_LocalCalendarBuckets(t *testing.T) {
 		interval string
 		unit     string
 	}{
-		{"1h", "hour"},
 		{"1d", "day"},
 		{"1w", "week"},
 	}
@@ -1898,6 +1900,11 @@ func TestExpandTimeGroup_LocalCalendarBuckets(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("interval %q:\n got %s\nwant it to contain %s", c.interval, got, want)
 		}
+	}
+	// An hour bucket takes the calendar path only where the offset is not a
+	// whole hour — see TestExpandTimeGroup_HourAvoidsDSTAmbiguity.
+	if got := expandTimeGroup("SELECT $__timeGroup(time, '1h') AS t FROM x", "Asia/Kolkata"); !strings.Contains(got, "date_trunc('hour'") {
+		t.Errorf("a sub-hour-offset zone needs local hour boundaries: %s", got)
 	}
 }
 
@@ -2012,6 +2019,73 @@ func TestExpandTimeGroup_WeekOnlyWhenAsked(t *testing.T) {
 		if strings.Contains(got, "date_trunc(") {
 			t.Errorf("%q is a fixed-width span, not a calendar week; anchoring it on Monday "+
 				"would move every bucket: %s", iv, got)
+		}
+	}
+}
+
+// TestExpandTimeGroup_HourAvoidsDSTAmbiguity pins the one case where the
+// calendar path is WORSE than epoch arithmetic.
+//
+// At a fall-back transition the local wall clock repeats an hour, so
+// timezone(tz, ts) is not injective: 01:30 EDT and 01:30 EST truncate to the
+// same wall time and convert back to one instant. Verified in DuckDB 1.4.3 —
+// America/New_York on 2024-11-03 put 120 minutes in the 06:00Z bucket and
+// produced no 05:00Z bucket at all. One bar doubles and its neighbour
+// vanishes, once a year, in every DST zone.
+//
+// In a whole-hour zone a local hour boundary IS a UTC hour boundary, so epoch
+// arithmetic gives byte-identical buckets with none of that risk. Only a
+// sub-hour offset needs the calendar path, to get :30/:45 boundaries at all.
+func TestExpandTimeGroup_HourAvoidsDSTAmbiguity(t *testing.T) {
+	for _, tz := range []string{
+		"America/New_York", "Europe/Madrid", "Australia/Sydney",
+		"America/Costa_Rica", "Asia/Shanghai",
+	} {
+		got := expandTimeGroup("SELECT $__timeGroup(time, '1h') AS t FROM x", tz)
+		if strings.Contains(got, "date_trunc(") {
+			t.Errorf("tz %q has a whole-hour offset; an hour bucket must stay on epoch math "+
+				"so a DST fall-back cannot merge two hours into one: %s", tz, got)
+		}
+	}
+	for _, tz := range []string{"Asia/Kolkata", "Pacific/Chatham", "Asia/Kathmandu"} {
+		got := expandTimeGroup("SELECT $__timeGroup(time, '1h') AS t FROM x", tz)
+		if !strings.Contains(got, "date_trunc('hour'") {
+			t.Errorf("tz %q has a sub-hour offset and needs local hour boundaries: %s", tz, got)
+		}
+	}
+	// A day boundary never falls inside a repeated hour, so days keep the
+	// calendar path everywhere.
+	for _, tz := range []string{"America/New_York", "Asia/Kolkata"} {
+		got := expandTimeGroup("SELECT $__timeGroup(time, '1d') AS t FROM x", tz)
+		if !strings.Contains(got, "date_trunc('day'") {
+			t.Errorf("tz %q: day buckets must align to local midnight: %s", tz, got)
+		}
+	}
+}
+
+// TestValidateTimezone_RejectsNonIANANames: time.LoadLocation blocks only ".."
+// and a leading "/", so "./Asia/Tokyo" loads from the host's zoneinfo and would
+// then reach DuckDB, which rejects it and fails the whole panel. "Local" is a
+// valid Go name meaning the HOST's zone rather than an IANA one.
+func TestValidateTimezone_RejectsNonIANANames(t *testing.T) {
+	for _, tz := range []string{
+		"./UTC", "./Asia/Tokyo", "./././UTC", "../UTC", "/etc/passwd",
+		"Local", "Factory", "posixrules", "Asia/Tokyo\n", "Asia Tokyo",
+	} {
+		if got := validateTimezone(tz); got != "UTC" {
+			t.Errorf("validateTimezone(%q) = %q, want UTC", tz, got)
+		}
+	}
+	for _, tz := range []string{"Asia/Tokyo", "America/Argentina/Salta", "Etc/GMT+5"} {
+		if got := validateTimezone(tz); got != tz {
+			t.Errorf("validateTimezone(%q) = %q, want it preserved", tz, got)
+		}
+	}
+	// Zones that sit at offset zero all year canonicalise to "UTC" so they take
+	// the byte-identical epoch path.
+	for _, tz := range []string{"utc", "UTC", "Etc/UTC", "Etc/GMT"} {
+		if got := validateTimezone(tz); got != "UTC" {
+			t.Errorf("validateTimezone(%q) = %q, want UTC", tz, got)
 		}
 	}
 }

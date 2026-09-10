@@ -747,6 +747,13 @@ func expandTimeFilter(sql string, from, to time.Time) string {
 // — once per chunk when splitting is on.
 var tzCache sync.Map // string -> bool (known to tzdata)
 
+// ianaZoneNameRe matches a plain IANA zone name: letters, digits, underscore,
+// plus and minus, in one to three slash-separated segments. Every real zone
+// fits ("Europe/Madrid", "America/Argentina/Salta", "UTC", "Etc/GMT+5"), while
+// "." and any leading slash — the shapes that turn LoadLocation into a
+// filesystem probe — do not.
+var ianaZoneNameRe = regexp.MustCompile(`^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+){0,2}$`)
+
 // validateTimezone returns an IANA zone name that is safe to interpolate, or
 // "UTC".
 //
@@ -756,7 +763,26 @@ var tzCache sync.Map // string -> bool (known to tzdata)
 // degrades to UTC rather than failing the query — a bad timezone should not
 // black out a panel, and UTC is what the plugin did before this feature.
 func validateTimezone(tz string) string {
-	if tz == "" || tz == "UTC" {
+	if tz == "" || strings.EqualFold(tz, "UTC") {
+		return "UTC"
+	}
+	// Go accepts these; DuckDB does not. "Local" in particular is a valid Go
+	// name meaning the HOST's zone, not an IANA zone, and reaches DuckDB as
+	// `Unknown TimeZone 'Local'!` — a hard panel failure rather than a
+	// fallback.
+	switch tz {
+	case "Local", "Factory", "posixrules":
+		log.DefaultLogger.Warn("timezone is not an IANA zone name, bucketing in UTC instead", "timezone", tz)
+		return "UTC"
+	}
+	// Reject anything that is not a plain IANA name BEFORE loading it.
+	// time.LoadLocation is a weaker filter than it looks: it blocks only ".."
+	// and a leading "/", so "./Asia/Tokyo" loads happily from the host's
+	// /usr/share/zoneinfo and would then reach DuckDB, which rejects it and
+	// fails the whole panel. Restricting the character set first makes this
+	// function the allowlist its name implies.
+	if !ianaZoneNameRe.MatchString(tz) {
+		log.DefaultLogger.Warn("timezone is not a plain IANA zone name, bucketing in UTC instead", "timezone", tz)
 		return "UTC"
 	}
 	if known, ok := tzCache.Load(tz); ok {
@@ -765,13 +791,51 @@ func validateTimezone(tz string) string {
 		}
 		return "UTC"
 	}
-	_, err := time.LoadLocation(tz)
-	tzCache.Store(tz, err == nil)
+	loc, err := time.LoadLocation(tz)
 	if err != nil {
+		tzCache.Store(tz, false)
 		log.DefaultLogger.Warn("unknown timezone, bucketing in UTC instead", "timezone", tz)
 		return "UTC"
 	}
+	// A zone that sits at offset zero all year (Etc/UTC, Etc/GMT,
+	// Atlantic/Reykjavik...) is canonicalised to "UTC" so it takes the
+	// byte-identical epoch path, and so the split heuristic and the macro
+	// expander cannot disagree about what "UTC" means.
+	if isAlwaysUTC(loc) {
+		tzCache.Store(tz, false)
+		return "UTC"
+	}
+	tzCache.Store(tz, true)
 	return tz
+}
+
+// isAlwaysUTC reports whether a zone is at offset zero for the whole year.
+func isAlwaysUTC(loc *time.Location) bool {
+	base := time.Date(time.Now().Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	for d := 0; d < 365; d += 14 {
+		if _, off := base.AddDate(0, 0, d).In(loc).Zone(); off != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// zoneOffsetIsWholeHour reports whether every UTC offset the zone uses across a
+// year is a whole number of hours. True for the overwhelming majority of zones;
+// false for the :30 and :45 ones (Asia/Kolkata, Pacific/Chatham,
+// Australia/Eucla, Asia/Kathmandu...).
+func zoneOffsetIsWholeHour(tz string) bool {
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return true // unknown zones resolve to UTC upstream
+	}
+	base := time.Date(time.Now().Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	for d := 0; d < 365; d += 14 {
+		if _, off := base.AddDate(0, 0, d).In(loc).Zone(); off%3600 != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // quoteTimezone renders a validated zone as a SQL string literal. Doubling any
@@ -785,9 +849,29 @@ func quoteTimezone(tz string) string {
 // the same span, for the intervals where a timezone-aware bucket is
 // expressible as a calendar truncation. Anything else (6h, 3d, sub-hour) has
 // no date_trunc equivalent and stays on epoch arithmetic.
-func truncUnitForSeconds(secs int, interval string) (string, bool) {
+func truncUnitForSeconds(secs int, interval string, tz string) (string, bool) {
 	switch secs {
 	case 3600:
+		// An hour bucket takes the calendar path ONLY when the zone's offset is
+		// not a whole number of hours (Asia/Kolkata +5:30, Pacific/Chatham
+		// +12:45). In a whole-hour zone a local hour boundary IS a UTC hour
+		// boundary, so epoch arithmetic yields byte-identical buckets —
+		// verified against DuckDB 1.4.3 — and it avoids a DST hazard the
+		// calendar path cannot:
+		//
+		// At a fall-back transition the local wall clock repeats an hour, so
+		// timezone(tz, ts) is not injective. 01:30 EDT and 01:30 EST truncate
+		// to the same wall time and convert back to one instant, so the two
+		// hours merge into a single bucket carrying 120 minutes while its
+		// neighbour disappears. Verified in DuckDB: America/New_York on
+		// 2024-11-03 produced 120 for 06:00Z and no 05:00Z bucket at all.
+		// Once a year, per DST zone, one bar reads double and one vanishes.
+		//
+		// Sub-hour-offset zones need the calendar path to get :30/:45
+		// boundaries at all, and of those only Pacific/Chatham observes DST.
+		if zoneOffsetIsWholeHour(tz) {
+			return "", false
+		}
 		return "hour", true
 	case 86400:
 		return "day", true
@@ -807,25 +891,15 @@ func truncUnitForSeconds(secs int, interval string) (string, bool) {
 }
 
 // ApplyMacros replaces Grafana macros in SQL query
-func ApplyMacros(sql string, timeRange backend.TimeRange) string {
-	return ApplyMacrosTZ(sql, timeRange, "")
-}
-
-// ApplyMacrosTZ is ApplyMacros with the dashboard's timezone. An empty or
-// unrecognised zone means UTC.
-func ApplyMacrosTZ(sql string, timeRange backend.TimeRange, tz string) string {
+// tz is the dashboard's IANA timezone; empty or unrecognised means UTC.
+func ApplyMacros(sql string, timeRange backend.TimeRange, tz string) string {
 	return applyMacrosWith(sql, timeRange.From, timeRange.To, timeRange.To.Sub(timeRange.From), tz)
 }
 
 // ApplyMacrosWithSplit replaces macros using the chunk's time range for
 // `$__timeFilter`/`$__timeFrom`/`$__timeTo`, but the ORIGINAL range for
 // `$__interval` so bucket sizes stay consistent across chunks.
-func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange backend.TimeRange) string {
-	return ApplyMacrosWithSplitTZ(sql, chunk, originalRange, "")
-}
-
-// ApplyMacrosWithSplitTZ is ApplyMacrosWithSplit with the dashboard's timezone.
-func ApplyMacrosWithSplitTZ(sql string, chunk backend.TimeRange, originalRange backend.TimeRange, tz string) string {
+func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange backend.TimeRange, tz string) string {
 	return applyMacrosWith(sql, chunk.From, chunk.To, originalRange.To.Sub(originalRange.From), tz)
 }
 
@@ -1026,7 +1100,7 @@ func expandTimeGroup(sql string, tz string) string {
 		// timezone, so a "UTC" dashboard would silently follow Arc's session
 		// setting rather than UTC.
 		if tz != "UTC" && secs >= 3600 {
-			if unit, ok := truncUnitForSeconds(secs, interval); ok {
+			if unit, ok := truncUnitForSeconds(secs, interval, tz); ok {
 				// timezone(tz, ts), not `ts AT TIME ZONE tz`. The infix form's
 				// direction depends on the operand's type, and which of
 				// TIMESTAMP/TIMESTAMPTZ it yields varies between DuckDB/ICU
