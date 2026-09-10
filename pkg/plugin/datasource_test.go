@@ -1798,3 +1798,59 @@ func TestNewArcInstance_ConcurrencyLimits(t *testing.T) {
 		})
 	}
 }
+
+// TestReplaceMacroOccurrences_AbsentMacroIsUntouched pins the OUTPUT contract:
+// an absent macro returns the input verbatim and never calls the rewriter.
+//
+// Note this passes with or without the early-out guard, because the walker is
+// byte-identical when it finds nothing. The guard is a performance property,
+// not a behavioural one, so it is pinned separately by
+// TestReplaceMacroOccurrences_AbsentMacroAllocatesNothing.
+func TestReplaceMacroOccurrences_AbsentMacroIsUntouched(t *testing.T) {
+	called := false
+	rewrite := func(string) (string, bool) { called = true; return "x", true }
+
+	for _, sql := range []string{
+		"SELECT * FROM t",
+		"SELECT * FROM t WHERE msg = 'a $__timeGroup( in a literal'",
+		"SELECT * FROM t -- $__timeGroup( in a comment",
+		"",
+		"   \n\t  ",
+	} {
+		if got := replaceMacroOccurrences(sql, "$__timeGroup(", rewrite); got != sql {
+			t.Errorf("absent macro should return the input verbatim:\n got %q\nwant %q", got, sql)
+		}
+	}
+	if called {
+		t.Error("rewrite must not be invoked when the macro is absent")
+	}
+
+	// The guard must not change behaviour when the macro IS present.
+	got := replaceMacroOccurrences("SELECT $__timeGroup(time) FROM t", "$__timeGroup(", rewrite)
+	if got != "SELECT x FROM t" {
+		t.Errorf("present macro should still expand, got %q", got)
+	}
+	if !called {
+		t.Error("rewrite should have been invoked for a present macro")
+	}
+}
+
+// TestReplaceMacroOccurrences_AbsentMacroAllocatesNothing is the guard's real
+// contract, and the only assertion that fails if the guard is removed.
+//
+// Without the early-out the walker calls strings.Builder.Grow(len(sql)) and
+// copies the statement byte by byte, so a query that does not use the macro
+// still pays a full allocation of its own size — on every macro, on every
+// query, and once per chunk when splitting is on.
+func TestReplaceMacroOccurrences_AbsentMacroAllocatesNothing(t *testing.T) {
+	sql := strings.Repeat("SELECT usage_user FROM cpu WHERE host = 'h01' ", 200)
+	rewrite := func(string) (string, bool) { return "x", true }
+
+	allocs := testing.AllocsPerRun(100, func() {
+		_ = replaceMacroOccurrences(sql, "$__timeGroup(", rewrite)
+	})
+	if allocs != 0 {
+		t.Errorf("an absent macro allocated %.0f time(s) per call; the early-out guard "+
+			"in replaceMacroOccurrences is missing or ineffective", allocs)
+	}
+}
