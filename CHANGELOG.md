@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.8] - 2026-09-10
+
+### Fixed
+- `$__interval` was not expanded inside string literals, so
+  `time_bucket('$__interval', time)` — the documented idiom, and the form the
+  Postgres, MySQL and Timescale datasources use — reached DuckDB as the
+  literal text `$__interval` and failed to parse. It now expands inside
+  literals as well. The parenthesised macros (`$__timeFilter()`,
+  `$__timeFrom()`, `$__timeGroup()`) still skip literals, so prose like
+  `WHERE msg = 'see $__timeFrom() docs'` is preserved.
+
 ## [1.3.7] - 2026-09-10
 
 ### Fixed

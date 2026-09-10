@@ -1160,7 +1160,6 @@ func TestApplyMacros_AllZeroArgMacrosLiteralSafe(t *testing.T) {
 	}{
 		{"timeFrom in literal", "WHERE msg = 'see $__timeFrom() docs'", "'see $__timeFrom() docs'"},
 		{"timeTo in literal", "WHERE msg = 'see $__timeTo() docs'", "'see $__timeTo() docs'"},
-		{"interval in literal", "WHERE msg = 'bucket $__interval here'", "'bucket $__interval here'"},
 		{"timeFilter in literal", "WHERE msg = 'has $__timeFilter(time)'", "'has $__timeFilter(time)'"},
 		{"timeGroup in literal", "WHERE msg = 'has $__timeGroup(time, ''1h'')'", "'has $__timeGroup(time, ''1h'')'"},
 	}
@@ -1171,6 +1170,24 @@ func TestApplyMacros_AllZeroArgMacrosLiteralSafe(t *testing.T) {
 				t.Errorf("macro inside literal was expanded — expected to find %q in: %s", c.preserved, result)
 			}
 		})
+	}
+}
+
+// $__interval is the deliberate exception to the rule above: it is documented
+// (here and by the Postgres/MySQL/Timescale datasources) as being written
+// inside quotes, so it MUST expand there or `time_bucket('$__interval', time)`
+// reaches DuckDB as the literal text "$__interval". The cost is that prose
+// containing the token is rewritten too — far rarer than the bucketing idiom,
+// and the substituted value is a bare word like "10 minutes" that cannot
+// break out of its quotes.
+func TestApplyMacros_IntervalExpandsEvenInsideLiterals(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	got := ApplyMacros("WHERE msg = 'bucket $__interval here'", tr, "")
+	if strings.Contains(got, "$__interval") {
+		t.Errorf("$__interval should expand even inside a literal, got: %s", got)
 	}
 }
 
@@ -1418,5 +1435,20 @@ func TestExpandTimeGroup_SevenDaysIsNotAWeek(t *testing.T) {
 	sql := "$__timeGroup(time, '7d')"
 	if got := expandTimeGroup(sql, "America/Costa_Rica"); got != sql {
 		t.Errorf("7d must stay unexpanded (it is not a Monday-anchored week), got: %s", got)
+	}
+}
+
+// Regression: $__interval is conventionally written inside quotes --
+// `time_bucket('$__interval', time)` -- but replaceLiteralAwareTokens skips
+// string literals, so it reached DuckDB as the literal text "$__interval"
+// and every such panel failed to parse.
+func TestApplyMacros_IntervalExpandsInsideLiterals(t *testing.T) {
+	tr := backend.TimeRange{From: time.Unix(0, 0).UTC(), To: time.Unix(3600, 0).UTC()}
+	got := ApplyMacros("SELECT time_bucket('$__interval', time) FROM t", tr, "UTC")
+	if strings.Contains(got, "$__interval") {
+		t.Errorf("$__interval left unexpanded inside quotes: %s", got)
+	}
+	if !strings.Contains(got, "time_bucket('10 seconds', time)") {
+		t.Errorf("expected the interval substituted inside the literal, got: %s", got)
 	}
 }

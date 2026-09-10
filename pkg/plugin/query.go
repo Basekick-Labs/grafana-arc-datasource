@@ -662,7 +662,14 @@ func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuratio
 	sql = expandTimeFilter(sql, filterFrom, filterTo)
 	sql = replaceLiteralAwareTokens(sql, "$__timeFrom()", fmt.Sprintf("'%s'", filterFrom.Format(time.RFC3339)))
 	sql = replaceLiteralAwareTokens(sql, "$__timeTo()", fmt.Sprintf("'%s'", filterTo.Format(time.RFC3339)))
-	sql = replaceLiteralAwareTokens(sql, "$__interval", calculateInterval(intervalDuration))
+	// $__interval expands INSIDE string literals as well. Unlike the
+	// parenthesised macros, its documented use (here and in the Postgres,
+	// MySQL and Timescale datasources) is inside quotes --
+	// `time_bucket('$__interval', time)` -- so the literal-skipping that
+	// protects `WHERE msg = 'see $__timeFrom()'` would leave the token
+	// unexpanded and hand DuckDB the string "$__interval". A bare word like
+	// "10 minutes" cannot break out of the quotes it lands in.
+	sql = strings.ReplaceAll(sql, "$__interval", calculateInterval(intervalDuration))
 	// $__timeGroup(column, interval) -> epoch-based bucketing
 	// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
 	// causing GROUP BY to produce per-second rows. Epoch math avoids this.
