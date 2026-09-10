@@ -192,20 +192,20 @@ export function ConfigEditor(props: Props) {
       <InlineField
         label="Allow Private IPs"
         labelWidth={LABEL_WIDTH}
-        tooltip="Permit the Arc URL to resolve to private/RFC1918 addresses (e.g. 10.x, 192.168.x). Off by default — enable when Arc is deployed on an internal corporate network. Loopback (localhost) is always permitted when configured directly."
+        tooltip="Permit the Arc URL to resolve to private/RFC1918 addresses (e.g. 10.x, 192.168.x, or a Docker service name). On by default, since self-hosted Arc usually runs on a private network. Turn it off to require a public address. Link-local and cloud-metadata addresses are always blocked."
       >
         <div className={styles.switchCell}>
-          <Switch value={jsonData.allowPrivateIPs ?? false} onChange={onAllowPrivateIPsChange} />
+          <Switch value={jsonData.allowPrivateIPs ?? true} onChange={onAllowPrivateIPsChange} />
         </div>
       </InlineField>
 
       <InlineField
         label="Allow Database Override"
         labelWidth={LABEL_WIDTH}
-        tooltip="Permit per-query 'database' field to override this datasource's default database. Off by default — without this, a dashboard editor could switch databases on a datasource configured for a single tenant. Enable only if the API key's authorization scope matches dashboard-editor permissions."
+        tooltip="Permit a per-query 'database' field to override this datasource's default. On by default, matching the per-query override this plugin has supported since 1.1.0. Turn it off when the API key spans more databases than dashboard editors should reach."
       >
         <div className={styles.switchCell}>
-          <Switch value={jsonData.allowDatabaseOverride ?? false} onChange={onAllowDatabaseOverrideChange} />
+          <Switch value={jsonData.allowDatabaseOverride ?? true} onChange={onAllowDatabaseOverrideChange} />
         </div>
       </InlineField>
     </div>

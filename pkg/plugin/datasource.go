@@ -25,15 +25,39 @@ import (
 
 // ArcDataSourceSettings contains Arc connection settings
 type ArcDataSourceSettings struct {
-	URL                   string `json:"url"`
-	Database              string `json:"database"`
-	Timeout               int    `json:"timeout"`               // seconds
-	Protocol              string `json:"protocol"`              // "arrow" (default), "msgpack", or "json" — wire format for query responses
-	UseArrow              *bool  `json:"useArrow"`              // legacy toggle superseded by Protocol; pointer so unset (fresh install) is distinguishable from explicit false
-	MaxConcurrency        int    `json:"maxConcurrency"`        // max parallel chunks for query splitting (default 4)
-	MaxResponseMB         int    `json:"maxResponseMB"`         // per-response body size cap in MiB (default 1024 — large analytical queries cross 256 MiB easily, R2-CR7)
-	AllowPrivateIPs       bool   `json:"allowPrivateIPs"`       // opt-in: permit Arc URL to resolve to RFC1918/private addresses (corporate intranets)
-	AllowDatabaseOverride bool   `json:"allowDatabaseOverride"` // opt-in: permit per-query `database` field to override the datasource default (R2-HI6 confused-deputy guard)
+	URL            string `json:"url"`
+	Database       string `json:"database"`
+	Timeout        int    `json:"timeout"`        // seconds
+	Protocol       string `json:"protocol"`       // "arrow" (default), "msgpack", or "json" — wire format for query responses
+	UseArrow       *bool  `json:"useArrow"`       // legacy toggle superseded by Protocol; pointer so unset (fresh install) is distinguishable from explicit false
+	MaxConcurrency int    `json:"maxConcurrency"` // max parallel chunks for query splitting (default 4)
+	MaxResponseMB  int    `json:"maxResponseMB"`  // per-response body size cap in MiB (default 1024 — large analytical queries cross 256 MiB easily, R2-CR7)
+	// AllowPrivateIPs permits the Arc URL to resolve to an RFC1918/CGNAT
+	// address. Pointer so an absent key (a datasource created before 1.3) is
+	// distinguishable from an explicit false: absent defaults to TRUE, because
+	// self-hosted Arc normally lives on a private network or a Docker DNS name
+	// like `http://arc:8000`, and defaulting it off in 1.3.2 broke every such
+	// datasource with "Arc URL resolves to a blocked address". Link-local and
+	// cloud-metadata addresses stay blocked regardless of this setting.
+	AllowPrivateIPs *bool `json:"allowPrivateIPs"`
+	// AllowDatabaseOverride permits a per-query `database` field to override
+	// the datasource default. Pointer for the same reason: the override was an
+	// advertised feature from 1.1.0, and gating it off by default in 1.3.2
+	// turned working panels into "per-query database override is not enabled".
+	// Absent defaults to TRUE for legacy instances; the ConfigEditor writes an
+	// explicit value for datasources created from 1.4.0 on.
+	AllowDatabaseOverride *bool `json:"allowDatabaseOverride"`
+}
+
+// boolOrDefault reads an optional setting: an absent key (nil) takes the
+// default, an explicit value wins. Used for settings whose safe default
+// differs between a datasource created before the setting existed and one
+// created after it — see AllowPrivateIPs and AllowDatabaseOverride.
+func boolOrDefault(v *bool, def bool) bool {
+	if v == nil {
+		return def
+	}
+	return *v
 }
 
 // Wire protocols for Arc query responses. Arrow is the fastest and the
@@ -261,7 +285,9 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	// blocked), and `AllowPrivateIPs` opens both loopback and RFC1918/CGNAT.
 	policy := dialPolicy{
 		allowLoopback: isLoopbackURL(dsSettings.URL),
-		allowPrivate:  dsSettings.AllowPrivateIPs,
+		// Absent key -> true. See the field comment: defaulting this off in
+		// 1.3.2 broke every self-hosted datasource on a private address.
+		allowPrivate: boolOrDefault(dsSettings.AllowPrivateIPs, true),
 	}
 	inst.client = newHTTPClient(
 		time.Duration(dsSettings.Timeout)*time.Second,
@@ -599,7 +625,7 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	// the cached *http.Client and apiKey while scoping the change to this
 	// one query.
 	if qm.Database != "" && qm.Database != settings.settings.Database {
-		if !settings.settings.AllowDatabaseOverride {
+		if !boolOrDefault(settings.settings.AllowDatabaseOverride, true) {
 			log.DefaultLogger.Warn("per-query database override rejected — not enabled in datasource settings",
 				"refId", qm.RefID, "requested", qm.Database, "configured", settings.settings.Database)
 			return backend.ErrDataResponse(backend.StatusBadRequest,

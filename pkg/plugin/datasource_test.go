@@ -1457,3 +1457,87 @@ func TestIntervalBucketTableOrdered(t *testing.T) {
 		}
 	}
 }
+
+// TestBoolOrDefault covers the tri-state the *bool settings encode: absent
+// (nil) means "this datasource predates the setting", which is NOT the same
+// as an explicit false.
+func TestBoolOrDefault(t *testing.T) {
+	tr, fa := true, false
+	cases := []struct {
+		name string
+		v    *bool
+		def  bool
+		want bool
+	}{
+		{"absent takes the default", nil, true, true},
+		{"absent takes a false default", nil, false, false},
+		{"explicit true overrides a false default", &tr, false, true},
+		{"explicit false overrides a true default", &fa, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := boolOrDefault(c.v, c.def); got != c.want {
+				t.Errorf("boolOrDefault(%v, %v) = %v, want %v", c.v, c.def, got, c.want)
+			}
+		})
+	}
+}
+
+// TestNewArcInstance_PrivateIPDefaultsPermissive pins the 1.3.2 regression
+// this reverses. A datasource created before the setting existed carries no
+// `allowPrivateIPs` key, and 1.3.2 read that as false — so every self-hosted
+// Arc on a Docker DNS name or an RFC1918 address failed to connect with
+// "Arc URL resolves to a blocked address". Three of six datasources in the
+// production snapshot were in exactly that state.
+func TestNewArcInstance_PrivateIPDefaultsPermissive(t *testing.T) {
+	// No allowPrivateIPs key at all — a pre-1.3 datasource.
+	jsonData, _ := jsonMarshal(map[string]any{"url": "http://arc:8000"})
+	inst, err := newArcInstance(t.Context(), backend.DataSourceInstanceSettings{
+		JSONData:                jsonData,
+		DecryptedSecureJSONData: map[string]string{"apiKey": "k"},
+	})
+	if err != nil {
+		t.Fatalf("legacy datasource should build: %v", err)
+	}
+	if got := boolOrDefault(inst.(*ArcInstanceSettings).settings.AllowPrivateIPs, true); !got {
+		t.Error("absent allowPrivateIPs must resolve to true; 1.3.2 read it as false and broke every private-network datasource")
+	}
+}
+
+// TestNewArcInstance_PrivateIPExplicitFalseHonoured — the permissive default
+// applies only to an ABSENT key. An admin who deliberately turns the setting
+// off must still get the strict dialer.
+func TestNewArcInstance_PrivateIPExplicitFalseHonoured(t *testing.T) {
+	jsonData, _ := jsonMarshal(map[string]any{
+		"url":             "https://arc.example.com",
+		"allowPrivateIPs": false,
+	})
+	inst, err := newArcInstance(t.Context(), backend.DataSourceInstanceSettings{
+		JSONData:                jsonData,
+		DecryptedSecureJSONData: map[string]string{"apiKey": "k"},
+	})
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if got := boolOrDefault(inst.(*ArcInstanceSettings).settings.AllowPrivateIPs, true); got {
+		t.Error("an explicit false must be honoured, not overridden by the legacy default")
+	}
+}
+
+// TestNewArcInstance_DatabaseOverrideDefaultsPermissive: the per-query
+// database override was an advertised feature from 1.1.0. Gating it off by
+// default in 1.3.2 turned working panels into a 400 telling the user to
+// enable a toggle they had never needed.
+func TestNewArcInstance_DatabaseOverrideDefaultsPermissive(t *testing.T) {
+	jsonData, _ := jsonMarshal(map[string]any{"url": "https://arc.example.com"})
+	inst, err := newArcInstance(t.Context(), backend.DataSourceInstanceSettings{
+		JSONData:                jsonData,
+		DecryptedSecureJSONData: map[string]string{"apiKey": "k"},
+	})
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if got := boolOrDefault(inst.(*ArcInstanceSettings).settings.AllowDatabaseOverride, true); !got {
+		t.Error("absent allowDatabaseOverride must resolve to true for legacy datasources")
+	}
+}
