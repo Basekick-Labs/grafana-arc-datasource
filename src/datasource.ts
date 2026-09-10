@@ -10,8 +10,8 @@ import {
 } from '@grafana/data';
 import { frameToMetricFindValue, DataSourceWithBackend, getTemplateSrv } from '@grafana/runtime';
 import { ArcQuery, ArcDataSourceOptions, defaultQuery } from './types';
-import { escapeLiteral, quoteLiteral } from './interpolation';
-import { lastValueFrom } from 'rxjs';
+import { escapeLiteral, quoteLiteral, resolveTimezone } from './interpolation';
+import { lastValueFrom, Observable } from 'rxjs';
 
 /**
  * Shapes a `metricFindQuery` argument can arrive as. Grafana's
@@ -55,7 +55,10 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     // target type explicitly so future maintainers see what shape is being
     // produced (was `as never`, which preserved no type info).
     const request = { ...(options ?? {}), targets: [target] } as unknown as DataQueryRequest<ArcQuery>;
-    return lastValueFrom(super.query(request)).then(this.toMetricFindValue);
+    // `this.query`, not `super.query`: the override stamps the dashboard
+    // timezone, so a variable query using $__timeGroup buckets the same way a
+    // panel query on the same dashboard does.
+    return lastValueFrom(this.query(request)).then(this.toMetricFindValue);
   }
 
   toMetricFindValue(rsp: DataQueryResponse): MetricFindValue[] {
@@ -135,6 +138,23 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
 
     return value;
   };
+
+  /**
+   * Stamps the dashboard's timezone onto every query before it reaches the
+   * backend, so `$__timeGroup` can bucket by local calendar days rather than
+   * UTC ones.
+   *
+   * Done here rather than in applyTemplateVariables because the timezone is a
+   * property of the REQUEST, not of an individual target — and because
+   * `request.timezone` is only available at this level.
+   */
+  query(request: DataQueryRequest<ArcQuery>): Observable<DataQueryResponse> {
+    const timezone = resolveTimezone(request.timezone);
+    return super.query({
+      ...request,
+      targets: request.targets.map((t) => ({ ...t, timezone })),
+    });
+  }
 
   applyTemplateVariables(query: ArcQuery, scopedVars: ScopedVars): ArcQuery {
     return {

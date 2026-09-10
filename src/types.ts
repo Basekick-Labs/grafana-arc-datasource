@@ -74,6 +74,13 @@ export interface ArcQuery extends DataQuery {
   rawSql?: string; // Postgres/MySQL/MSSQL/ClickHouse compatibility
   splitDuration?: string; // "off", "1h", "6h", "12h", "1d", "3d", "7d"
   database?: string; // Per-query database override (empty = use datasource default)
+  /**
+   * IANA name of the dashboard's timezone, resolved on the frontend (where
+   * Grafana's "browser" / "utc" / explicit setting is known) and sent to the
+   * backend so $__timeGroup can bucket by local calendar days. The backend
+   * falls back to UTC when this is absent or unrecognised.
+   */
+  timezone?: string;
 }
 
 /**

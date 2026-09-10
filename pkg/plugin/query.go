@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -741,16 +742,91 @@ func expandTimeFilter(sql string, from, to time.Time) string {
 	})
 }
 
+// tzCache memoises time.LoadLocation results. LoadLocation reads and parses a
+// zone file on every call, and validateTimezone runs once per macro expansion
+// — once per chunk when splitting is on.
+var tzCache sync.Map // string -> bool (known to tzdata)
+
+// validateTimezone returns an IANA zone name that is safe to interpolate, or
+// "UTC".
+//
+// The name reaches SQL, so it is never taken on trust: time.LoadLocation both
+// rejects unknown zones and constrains the value to something tzdata
+// recognises, and no SQL metacharacter survives that. An empty or unknown zone
+// degrades to UTC rather than failing the query — a bad timezone should not
+// black out a panel, and UTC is what the plugin did before this feature.
+func validateTimezone(tz string) string {
+	if tz == "" || tz == "UTC" {
+		return "UTC"
+	}
+	if known, ok := tzCache.Load(tz); ok {
+		if known.(bool) {
+			return tz
+		}
+		return "UTC"
+	}
+	_, err := time.LoadLocation(tz)
+	tzCache.Store(tz, err == nil)
+	if err != nil {
+		log.DefaultLogger.Warn("unknown timezone, bucketing in UTC instead", "timezone", tz)
+		return "UTC"
+	}
+	return tz
+}
+
+// quoteTimezone renders a validated zone as a SQL string literal. Doubling any
+// quote is belt-and-braces: validateTimezone has already excluded anything
+// tzdata does not know, and no such name contains a quote.
+func quoteTimezone(tz string) string {
+	return "'" + strings.ReplaceAll(tz, "'", "''") + "'"
+}
+
+// truncUnitForSeconds maps an interval to the date_trunc unit meaning exactly
+// the same span, for the intervals where a timezone-aware bucket is
+// expressible as a calendar truncation. Anything else (6h, 3d, sub-hour) has
+// no date_trunc equivalent and stays on epoch arithmetic.
+func truncUnitForSeconds(secs int, interval string) (string, bool) {
+	switch secs {
+	case 3600:
+		return "hour", true
+	case 86400:
+		return "day", true
+	case 7 * 86400:
+		// A week is only a calendar week when the author asked for one.
+		// date_trunc('week') anchors on Monday, so silently turning "7d" —
+		// which reads as "seven days wide, starting wherever the range does" —
+		// into Monday-anchored weeks would change the buckets under them.
+		lower := strings.ToLower(strings.TrimSpace(interval))
+		if strings.HasSuffix(lower, "w") || strings.Contains(lower, "week") {
+			return "week", true
+		}
+		return "", false
+	default:
+		return "", false
+	}
+}
+
 // ApplyMacros replaces Grafana macros in SQL query
 func ApplyMacros(sql string, timeRange backend.TimeRange) string {
-	return applyMacrosWith(sql, timeRange.From, timeRange.To, timeRange.To.Sub(timeRange.From))
+	return ApplyMacrosTZ(sql, timeRange, "")
+}
+
+// ApplyMacrosTZ is ApplyMacros with the dashboard's timezone. An empty or
+// unrecognised zone means UTC.
+func ApplyMacrosTZ(sql string, timeRange backend.TimeRange, tz string) string {
+	return applyMacrosWith(sql, timeRange.From, timeRange.To, timeRange.To.Sub(timeRange.From), tz)
 }
 
 // ApplyMacrosWithSplit replaces macros using the chunk's time range for
 // `$__timeFilter`/`$__timeFrom`/`$__timeTo`, but the ORIGINAL range for
 // `$__interval` so bucket sizes stay consistent across chunks.
 func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange backend.TimeRange) string {
-	return applyMacrosWith(sql, chunk.From, chunk.To, originalRange.To.Sub(originalRange.From))
+	return ApplyMacrosWithSplitTZ(sql, chunk, originalRange, "")
+}
+
+// ApplyMacrosWithSplitTZ is ApplyMacrosWithSplit with the dashboard's timezone.
+func ApplyMacrosWithSplitTZ(sql string, chunk backend.TimeRange, originalRange backend.TimeRange, tz string) string {
+	return applyMacrosWith(sql, chunk.From, chunk.To, originalRange.To.Sub(originalRange.From), tz)
 }
 
 // applyMacrosWith routes EVERY macro through literal-and-comment-aware
@@ -758,7 +834,8 @@ func ApplyMacrosWithSplit(sql string, chunk backend.TimeRange, originalRange bac
 // for `$__timeFrom()`, `$__timeTo()`, and `$__interval`, which rewrote macro
 // text inside string literals (`WHERE msg = 'see $__timeFrom()'` mangled the
 // literal). All five Grafana macros now share the same safety.
-func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuration time.Duration) string {
+func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuration time.Duration, tz string) string {
+	tz = validateTimezone(tz)
 	sql = expandTimeFilter(sql, filterFrom, filterTo)
 	sql = replaceLiteralAwareTokens(sql, "$__timeFrom()", fmt.Sprintf("'%s'", filterFrom.Format(time.RFC3339)))
 	sql = replaceLiteralAwareTokens(sql, "$__timeTo()", fmt.Sprintf("'%s'", filterTo.Format(time.RFC3339)))
@@ -773,7 +850,7 @@ func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuratio
 	// $__timeGroup(column, interval) -> epoch-based bucketing
 	// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
 	// causing GROUP BY to produce per-second rows. Epoch math avoids this.
-	sql = expandTimeGroup(sql)
+	sql = expandTimeGroup(sql, tz)
 	return sql
 }
 
@@ -893,7 +970,11 @@ func parseIntervalGrammar(interval string) (int, bool) {
 // Column argument is checked by validateColumnArg; unknown intervals and
 // arg-count mismatches are rejected (macro left un-expanded so Arc surfaces a
 // clear error) rather than silently defaulting.
-func expandTimeGroup(sql string) string {
+func expandTimeGroup(sql string, tz string) string {
+	// Validated here too: expandTimeGroup is called directly by tests and by
+	// any future macro path, and a bogus zone must degrade to UTC rather than
+	// reach SQL.
+	tz = validateTimezone(tz)
 	return replaceMacroOccurrences(sql, "$__timeGroup(", func(arg string) (string, bool) {
 		parts := strings.Split(arg, ",")
 		if len(parts) < 2 {
@@ -926,6 +1007,40 @@ func expandTimeGroup(sql string) string {
 		// to avoid floating-point precision loss that causes timestamps near hour
 		// boundaries (e.g. 05:59:59.999) to round up to the next bucket (06:00:00).
 		// DuckDB's / operator returns DOUBLE; // returns BIGINT.
+		//
+		// A bucket of an hour or more in a NON-UTC dashboard must align to
+		// local calendar boundaries, not UTC ones: with epoch arithmetic a
+		// "day" starts at 00:00 UTC, which in UTC-6 is 18:00 the previous
+		// evening, so every bar mixes two local days. date_trunc on the
+		// wall-clock time gets this right, including across DST transitions
+		// where a local day is not 86400 seconds long.
+		//
+		// Only whole calendar units (hour/day/week) have a date_trunc
+		// equivalent. 6h, 12h, 3d and every sub-hour size stay on the epoch
+		// path, which is correct for them in whole-hour zones and also avoids
+		// DuckDB's nanosecond-residual behaviour.
+		//
+		// UTC dashboards NEVER take this branch, so their SQL is byte-identical
+		// to every release before this feature. That matters twice over:
+		// date_trunc on a TIMESTAMPTZ truncates in the DuckDB session's
+		// timezone, so a "UTC" dashboard would silently follow Arc's session
+		// setting rather than UTC.
+		if tz != "UTC" && secs >= 3600 {
+			if unit, ok := truncUnitForSeconds(secs, interval); ok {
+				// timezone(tz, ts), not `ts AT TIME ZONE tz`. The infix form's
+				// direction depends on the operand's type, and which of
+				// TIMESTAMP/TIMESTAMPTZ it yields varies between DuckDB/ICU
+				// builds — on Arc's build the round trip converted forward
+				// twice and local midnight rendered as noon. The function form
+				// is explicit: the inner call takes the instant to wall-clock
+				// in tz, the outer reads that wall clock back as an instant.
+				// Verified against DuckDB 1.4.3 on Arc: a 05:59Z and a 06:01Z
+				// row land in different local days for America/Costa_Rica.
+				q := quoteTimezone(tz)
+				return fmt.Sprintf("timezone(%s, date_trunc('%s', timezone(%s, %s)))",
+					q, unit, q, column), true
+			}
+		}
 		return fmt.Sprintf("to_timestamp((epoch_ns(%s) // 1000000000 // %d) * %d)", column, secs, secs), true
 	})
 }
