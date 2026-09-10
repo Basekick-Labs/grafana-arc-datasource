@@ -91,7 +91,7 @@ Lives in `query.go`. The heuristic skips splitting when any of these appear:
 - Aggregations without time bucketing (collapsing to scalar, so chunked execution would change semantics)
 - Window functions, `UNION`, DuckDB-specific aggregates, `DISTINCT(`, `APPROX_COUNT_DISTINCT` (see [bd3bd7b], [4c912bb], [2e34aee])
 
-Before changing this heuristic, **read `stripStringLiterals` first** (introduced in the gemini-review fix-up [8b9c5f2]) — string-literal `count(` must not trigger the aggregation detector. When in doubt, add the failing query as a test case before changing the regex.
+Before changing this heuristic, **read `stripStringLiterals` first** (introduced in the review fix-up [8b9c5f2]) — string-literal `count(` must not trigger the aggregation detector. When in doubt, add the failing query as a test case before changing the regex.
 
 ### Arrow type handling
 
@@ -106,8 +106,8 @@ If you add a new Arrow type branch, default the fallback to **string**, not pani
 - Branch from `main`. Names: `feat/description`, `fix/description`.
 - Commit format: `feat(scope): description` / `fix(scope): description`. Scopes seen in history: `fields`, `query`, `arrow`, `frontend`, `backend`, `build`, `docs`.
 - PR description = Summary bullets + Test plan checklist (matches the existing PRs in this repo).
-- **PR review — gemini-code-assist:** post a comment containing `@gemini-code-assist` (no brackets, no `[bot]` suffix) on every PR. The `/gemini review` slash command also works. **Do NOT use `gh pr edit --add-reviewer 'gemini-code-assist[bot]'`** — verified in May 2026 to return `Could not resolve user with login`. The bot cannot be assigned via the reviewer API; trigger it via @-mention or slash command in a PR comment.
-- Address gemini findings in a **single fix-up commit** — multiple recent PRs (#6 chain, [4e4e14b], [12eb788], [ff18973]) demonstrate the pattern: gemini flags H/M/L items, one commit addresses them all, then re-review.
+- **PR review is internal.** The `gemini-code-assist` bot is retired — do not @-mention it, do not run `/gemini review`, and do not wait on it. The four-agent review below is the whole gate, not a cheap pre-pass before a budget reviewer.
+- Address all review findings in a **single fix-up commit** — the #6 chain ([4e4e14b], [12eb788], [ff18973]) shows what a stream of one-finding commits looks like, and it is what the single-commit rule exists to prevent.
 
 ## Planning & Review Process
 
@@ -126,7 +126,7 @@ Before finalizing a plan, use another agent to validate findings. If there is co
 
 ### Post-implementation review — four agents in parallel
 
-The bar is **"would gemini-code-assist or a sharp human reviewer flag this on the next PR pass?"** Past PRs in this repo have received line-level findings from gemini (string-literal handling in regexes, error-chain preservation, schema-safe merging, panic recovery, ORDER BY semantics). Internal review must catch those *before* gemini — internal review is the cheap pass; gemini is the budget reviewer that should land on a near-clean diff.
+The bar is **"would a sharp staff engineer flag this on the next PR pass?"** Past PRs in this repo have drawn line-level findings of exactly this shape: string-literal handling in regexes, error-chain preservation, schema-safe merging, panic recovery, ORDER BY semantics. Nothing catches these after internal review, so internal review is where they must be caught.
 
 Frame each agent as a **staff/principal engineer with deep expertise in Grafana plugin development, Apache Arrow internals, and SQL query semantics**. Include the directive in every prompt: *"Do a line-level pass — flag log-spam in loops, unbounded allocations, hot-path string concatenations, repeated parsing/marshalling, dead parameters, helpers placed in the wrong file. Don't be deferential. Output file:line for every finding."*
 
@@ -154,7 +154,7 @@ Run these **FOUR agents in parallel**:
    - Magic numbers extracted to named constants (chunk sizes, timeout defaults).
    - TS: no `any` without justification, no `as` casts that bypass narrowing, props typed exactly. React: no `useEffect` that should be a derived value.
 
-4. **Performance, observability, operational hygiene** (staff perf engineer lens — the **"gemini line-level pass"** agent; **do not skip this one**):
+4. **Performance, observability, operational hygiene** (staff perf engineer lens — the **line-level pass**; **do not skip this one**):
    - **Hot-path string concatenation** — flag every `out += x` in loops. Use `strings.Builder` in Go, array `join` in TS.
    - **Repeated parsing / marshalling** that should be cached (regexes, JSON templates).
    - **Map / slice allocations** with hardcoded undersized initial capacity. Pre-size when you know the row count.
@@ -168,9 +168,9 @@ Run these **FOUR agents in parallel**:
 
 ### Review loop discipline
 
-Address all internal-review findings in a **single follow-up commit** BEFORE asking gemini. Do not ship intermediate commits to gemini that internal review already caught. Each gemini round-trip costs context and time; aim for a clean first-pass.
+Address all review findings in a **single follow-up commit**, then verify and hand the PR over as ready to merge. Do not ship a stream of one-finding commits: the #6 chain (`Address Gemini review`, `Address architecture observations`, `Fix remaining PR review items`) is what that looks like, and it is the pattern this rule exists to prevent.
 
-If gemini flags items the internal review missed, **before fixing them**, spawn a fresh round of the four agents with explicit instructions to look for issues *of the same shape* gemini caught. This breaks the back-and-forth pattern. The PR history (#6 chain with `Address Gemini review`, `Address architecture observations`, `Fix remaining PR review items`) shows what happens without this discipline — multiple cleanup rounds that one internal pass could have caught.
+When a reviewer disputes a claim in the diff, **verify it yourself before acting**. In the 1.4.0 round a reviewer reported that `$__timeGroup(time, '$__interval')` was newly broken; running it against the previous tag showed identical output, so the finding was real as a hazard but wrong about the cause. Reviewers also assert things about upstream and about DuckDB that are worth a two-minute check — one such assertion, unverified, is what caused the 1.3.2 regression in the first place.
 
 ## Plugin-specific gotchas
 
@@ -188,7 +188,7 @@ These are real issues that hit recent PRs in this repo. Memorize them.
 
 6. **ORDER BY auto-addition is for time-series format only.** [5ac0662] — table format should preserve the user's row order. Adding ORDER BY to a table query that the user explicitly didn't sort will surprise them.
 
-7. **`@gemini-code-assist[bot]` cannot be added as a reviewer.** Use `@gemini-code-assist` in a PR comment or the `/gemini review` slash command. See "Git & PRs" above.
+7. **PR review is internal only.** The `gemini-code-assist` bot is retired; do not @-mention it or wait for it. See "Git & PRs" above.
 
 8. **Plugin signing is required for unsigned-plugin-restricted Grafana installs.** `npm run sign` runs `@grafana/sign-plugin`. The signature is environment-specific; a plugin signed for `private` distribution will not load in `community` mode. Don't commit signatures.
 
