@@ -192,9 +192,14 @@ GROUP BY 1
 ORDER BY 1
 ```
 
-Buckets of an hour or more align to local calendar boundaries (correctly
-across DST transitions); smaller buckets use epoch arithmetic, where the
-distinction does not arise.
+The `1h`, `1d` and `1w` buckets truncate in the dashboard's timezone, which
+stays correct across DST transitions. Every other interval — including `6h`
+and `12h`, which are not whole calendar units — buckets on fixed epoch
+arithmetic, where the distinction does not arise.
+
+Adopting `$__timeGroup` on a non-UTC dashboard also disables query splitting
+for that query: chunk boundaries are computed in UTC and would cut a local
+day in two.
 
 For expressions `$__timeGroup` doesn't cover, `$__timezone` expands to the
 dashboard's timezone as a quoted IANA name:
@@ -403,7 +408,7 @@ Benefits of the binary formats (Arrow, MessagePack) over JSON:
 
 1. **Keep the Arrow protocol**: Arrow is the default and the fastest transfer format; MessagePack is a close second, JSON the slowest
 2. **Optimize time ranges**: Smaller time ranges mean faster queries. Use Grafana's time picker to narrow down your analysis
-3. **Leverage $__timeGroup**: Bucket with `$__timeGroup(time, '$__interval')` to avoid returning millions of points. Grafana automatically adjusts `$__interval` based on your dashboard width
+3. **Leverage $__timeGroup**: Bucket with `$__timeGroup(time, '$__interval')` to avoid returning millions of points. `$__interval` is derived from the selected time range (not the panel width)
 4. **Index your time column**: Arc automatically indexes time columns, but ensure your queries filter by time first for optimal performance
 5. **Enable caching**: Configure Grafana query caching for frequently accessed data
 

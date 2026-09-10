@@ -732,6 +732,12 @@ var intervalSecondsTable = map[string]int{
 	"6h": 21600, "6 hours": 21600,
 	"12h": 43200, "12 hours": 43200,
 	"1d": 86400, "1 day": 86400,
+	// 1w buckets by CALENDAR week (date_trunc('week') anchors on Monday), so
+	// only the "week" spellings map here. "7d" is deliberately absent: it
+	// reads as "7 days wide", and silently turning it into Monday-anchored
+	// weeks would change results for anyone who wrote it. Without this entry
+	// truncUnitForSeconds' "week" case was unreachable dead code.
+	"1w": 604800, "1 week": 604800,
 }
 
 // intervalToSeconds converts a DuckDB interval string to seconds. Returns
@@ -805,12 +811,11 @@ func expandTimeGroup(sql string, tz string) string {
 		// gets this right, including across DST transitions where a local day
 		// is not 86400 seconds long.
 		//
-		// Sub-day buckets keep the epoch path: it sidesteps DuckDB's
-		// nanosecond-residual issue (see above), and for whole-hour-or-smaller
-		// buckets UTC and local alignment coincide for every zone with a
-		// whole-hour offset. Zones at :30/:45 offsets (India, Nepal, Chatham)
-		// are the exception, so anything from an hour up goes the local route
-		// too, leaving only sub-hour buckets on epoch math.
+		// Only whole calendar units (hour/day/week) can be expressed as a
+		// date_trunc; 6h and 12h have no equivalent and stay on the epoch
+		// path below, as do all sub-hour buckets. That is sound for sub-hour
+		// sizes in whole-hour zones, and the epoch path also sidesteps
+		// DuckDB's nanosecond-residual issue (see below).
 		if secs >= 3600 {
 			unit, ok := truncUnitForSeconds(secs)
 			if ok {

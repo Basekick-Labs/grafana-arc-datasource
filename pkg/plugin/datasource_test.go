@@ -1399,3 +1399,24 @@ func TestUsesLocalTimeBuckets(t *testing.T) {
 		}
 	}
 }
+
+// 1w must reach the calendar-week path; before it was absent from
+// intervalSecondsTable, making truncUnitForSeconds' "week" case dead code.
+// "7d" must NOT: date_trunc('week') anchors on Monday, so accepting it would
+// silently convert "7 days wide" into calendar weeks.
+func TestExpandTimeGroup_WeekBucketsLocally(t *testing.T) {
+	for _, iv := range []string{"1w", "1 week"} {
+		got := expandTimeGroup("$__timeGroup(time, '"+iv+"')", "America/Costa_Rica")
+		want := "timezone('America/Costa_Rica', date_trunc('week', timezone('America/Costa_Rica', time)))"
+		if got != want {
+			t.Errorf("interval %q: got %s, want %s", iv, got, want)
+		}
+	}
+}
+
+func TestExpandTimeGroup_SevenDaysIsNotAWeek(t *testing.T) {
+	sql := "$__timeGroup(time, '7d')"
+	if got := expandTimeGroup(sql, "America/Costa_Rica"); got != sql {
+		t.Errorf("7d must stay unexpanded (it is not a Monday-anchored week), got: %s", got)
+	}
+}

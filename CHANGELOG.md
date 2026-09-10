@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.6] - 2026-09-10
+
+### Added
+- `$__timeGroup` accepts `1w` / `1 week`, bucketing by calendar week in the
+  dashboard's timezone. The week case existed but was unreachable, since no
+  interval mapped to it. `7d` is deliberately not an alias: `date_trunc`
+  anchors weeks on Monday, so treating "7 days" as a calendar week would
+  silently change results.
+
+### Fixed
+- Documentation accuracy: only `1h`, `1d` and `1w` bucket in the dashboard's
+  timezone. `6h` and `12h` are not whole calendar units and bucket on epoch
+  arithmetic in UTC, contrary to the 1.3.3 note and the README's "an hour or
+  more". No behaviour change; the previous wording was simply wrong.
+- README no longer claims `$__interval` follows the panel width — it is
+  derived from the selected time range.
+
 ## [1.3.5] - 2026-09-10
 
 ### Fixed
