@@ -682,10 +682,15 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		splitting = false
 	}
 
-	// Auto-add ORDER BY time ASC is disabled until the substring-match bug is fixed
-	// (rewrites queries containing 'lifetime', 'runtime', 'timestamp' columns and
-	// injects ORDER BY against a column named 'time' that may not exist).
-	// Re-enable after C5 fix lands. See docs/progress/2026-05-14-signing-readiness.md.
+	// Time-series panels want points in chronological order. Appending the
+	// sort here lets Arc do it, instead of Grafana sorting in memory.
+	//
+	// Time-series format ONLY: a table panel must keep the row order the
+	// author asked for. OptimizeTimeSeriesQuery is conservative and returns
+	// the SQL untouched whenever the insertion point is not obvious.
+	if qm.Format == "time_series" {
+		qm.SQL = OptimizeTimeSeriesQuery(qm.SQL)
+	}
 
 	if !splitting {
 		// No splitting — execute as before

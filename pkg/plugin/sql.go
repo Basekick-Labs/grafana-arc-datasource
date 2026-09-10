@@ -137,20 +137,28 @@ func containsUnion(s strippedSQL) bool {
 	return unionRe.MatchString(s.stripped)
 }
 
-// hasTimeFilterMacro reports whether the SQL uses one of the time macros in
-// a position where the macro engine would expand it (i.e. outside string
-// literals and comments). A commented-out macro shouldn't keep splitting
-// enabled — the macro won't expand, so each chunk would re-run the full
-// query without a time filter.
+// hasTimeFilterMacro reports whether the SQL is BOUNDED by the chunk's time
+// range — the precondition for splitting it. Only macros that expand into a
+// time predicate count, and only outside string literals and comments (a
+// commented-out macro never expands, so each chunk would re-run the full
+// query).
 //
-// `$__timeTo` (e.g. `WHERE time < $__timeTo()`) is less common than the
-// other forms but still a valid signal that the query uses the chunk's end
-// time and is therefore safe to split (gemini 3244935459).
+// `$__timeFilter` emits both bounds by itself. `$__timeFrom()` and
+// `$__timeTo()` each emit one, so they bound a query only together: with just
+// a lower bound every chunk selects from its start to the end of the data, and
+// the chunks are nested supersets rather than a partition.
+//
+// `$__timeGroup` is deliberately NOT a signal. It buckets, it does not filter.
+// A query that groups by time but takes its range from a literal `WHERE time >
+// now() - INTERVAL 7 DAY` was split into N chunks by 1.3.2, each re-running
+// the same unfiltered query, and mergeFrames concatenated the results — so a
+// 30-day range at 1-day chunks returned every row 30 times and every "total"
+// stat was 30x too high.
 func hasTimeFilterMacro(s strippedSQL) bool {
-	return strings.Contains(s.stripped, "$__timeFilter") ||
-		strings.Contains(s.stripped, "$__timeFrom") ||
-		strings.Contains(s.stripped, "$__timeTo") ||
-		strings.Contains(s.stripped, "$__timeGroup")
+	if strings.Contains(s.stripped, "$__timeFilter") {
+		return true
+	}
+	return strings.Contains(s.stripped, "$__timeFrom") && strings.Contains(s.stripped, "$__timeTo")
 }
 
 // aggregationFnRe matches any SQL aggregation function call. Anchored at a

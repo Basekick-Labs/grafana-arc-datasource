@@ -1082,17 +1082,38 @@ func TestContainsLIMIT_WhitespaceFlavors(t *testing.T) {
 	}
 }
 
-// TestHasTimeFilterMacro_IncludesTimeTo locks in gemini 3244935459: a query
-// using `$__timeTo()` alone (e.g. `WHERE time < $__timeTo()`) must be
-// recognized as eligible for splitting since the macro engine expands it
-// to the chunk's end time.
-func TestHasTimeFilterMacro_IncludesTimeTo(t *testing.T) {
-	for _, sql := range []string{
-		"WHERE time < $__timeTo()",
+// TestHasTimeFilterMacro: only a query actually BOUNDED by the chunk range may
+// be split. A chunked query is re-run once per chunk and the frames are
+// concatenated, so if the SQL does not narrow to the chunk, every row comes
+// back once per chunk.
+func TestHasTimeFilterMacro(t *testing.T) {
+	eligible := []string{
+		"WHERE $__timeFilter(time)",
 		"WHERE time >= $__timeFrom() AND time < $__timeTo()",
-	} {
+		"SELECT $__timeGroup(time,'1h') t FROM x WHERE $__timeFilter(time) GROUP BY 1",
+	}
+	for _, sql := range eligible {
 		if !hasTimeFilterMacro(newStrippedSQL(sql)) {
-			t.Errorf("expected hasTimeFilterMacro=true for: %q", sql)
+			t.Errorf("expected splittable: %q", sql)
+		}
+	}
+
+	notEligible := []string{
+		// Buckets but does not filter: 1.3.2 split this, and each chunk
+		// re-ran the same unfiltered query, so every row was duplicated
+		// once per chunk.
+		"SELECT $__timeGroup(time,'1h') t, avg(v) FROM m WHERE time > now() - INTERVAL 3 DAY GROUP BY 1",
+		// One bound only: chunks become nested supersets, not a partition.
+		"WHERE time < $__timeTo()",
+		"WHERE time >= $__timeFrom()",
+		// No time macro at all.
+		"SELECT * FROM t WHERE host = 'a'",
+		// Commented out, so it never expands.
+		"SELECT * FROM t -- $__timeFilter(time)",
+	}
+	for _, sql := range notEligible {
+		if hasTimeFilterMacro(newStrippedSQL(sql)) {
+			t.Errorf("expected NOT splittable: %q", sql)
 		}
 	}
 }
@@ -1580,5 +1601,80 @@ func TestNewArcInstance_DatabaseOverrideDefaultsPermissive(t *testing.T) {
 	}
 	if got := boolOrDefault(inst.(*ArcInstanceSettings).settings.AllowDatabaseOverride, true); !got {
 		t.Error("absent allowDatabaseOverride must resolve to true for legacy datasources")
+	}
+}
+
+// TestOptimizeTimeSeriesQuery covers the auto-added ORDER BY. The feature was
+// advertised in 1.1.0, disabled during the 1.3.2 hardening because it matched
+// "time" as a substring (rewriting queries whose only "time" was inside
+// `lifetime` or `timestamp`, and sorting by a column that need not exist), and
+// is restored here with token matching.
+func TestOptimizeTimeSeriesQuery(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{
+			"appends when a bare time column is present",
+			"SELECT time, v FROM t WHERE x = 1",
+			"SELECT time, v FROM t WHERE x = 1 ORDER BY time ASC",
+		},
+		{
+			"inserts before LIMIT",
+			"SELECT time, v FROM t LIMIT 100",
+			"SELECT time, v FROM t ORDER BY time ASC LIMIT 100",
+		},
+		{
+			"inserts before OFFSET",
+			"SELECT time, v FROM t OFFSET 10",
+			"SELECT time, v FROM t ORDER BY time ASC OFFSET 10",
+		},
+		{
+			"strips a trailing semicolon before appending",
+			"SELECT time, v FROM t;",
+			"SELECT time, v FROM t ORDER BY time ASC",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := OptimizeTimeSeriesQuery(c.sql); got != c.want {
+				t.Errorf("OptimizeTimeSeriesQuery(%q)\n = %q\nwant %q", c.sql, got, c.want)
+			}
+		})
+	}
+
+	// Left untouched. Each of these is a case where appending would change
+	// results, fail to parse, or sort by a column that does not exist.
+	unchanged := []struct {
+		name string
+		sql  string
+	}{
+		{"already ordered", "SELECT time FROM t ORDER BY time DESC"},
+		{"already ordered, odd spacing", "SELECT time FROM t ORDER\n  BY v"},
+		{"no time column at all", "SELECT host, v FROM t"},
+		// The substring bug that got the feature disabled.
+		{"lifetime is not time", "SELECT lifetime FROM t"},
+		{"runtime is not time", "SELECT runtime, v FROM t"},
+		{"timestamp is not time", "SELECT timestamp FROM t"},
+		{"time_bucket is not a bare time column", "SELECT time_bucket('1h', ts) FROM t"},
+		{"uptime is not time", "SELECT MAX(uptime) FROM system"},
+		// Ambiguous or unsafe insertion points.
+		{"union has multiple branches", "SELECT time FROM a UNION ALL SELECT time FROM b"},
+		{"multi-statement", "SELECT time FROM a; SELECT time FROM b"},
+		{"time only inside a literal", "SELECT v FROM t WHERE msg = 'time to go'"},
+		{"time only inside a comment", "SELECT v FROM t -- order by time\n"},
+		// A dot-qualified reference is deliberately not a match: a bare
+		// `ORDER BY time` may be ambiguous when the column is only reachable
+		// as `t.time`, and guessing the alias is worse than not sorting.
+		{"dot-qualified time is left alone", "SELECT t.time FROM x t"},
+		{"empty", ""},
+	}
+	for _, c := range unchanged {
+		t.Run(c.name, func(t *testing.T) {
+			if got := OptimizeTimeSeriesQuery(c.sql); got != c.sql {
+				t.Errorf("OptimizeTimeSeriesQuery(%q) should be unchanged, got %q", c.sql, got)
+			}
+		})
 	}
 }

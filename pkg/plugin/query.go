@@ -925,43 +925,82 @@ func expandTimeGroup(sql string) string {
 	})
 }
 
-// OptimizeTimeSeriesQuery adds ORDER BY time ASC if missing for better performance
-// This eliminates the need for in-memory sorting, reducing query overhead significantly
-// Inserts ORDER BY before LIMIT/OFFSET clauses to maintain valid SQL syntax
+// timeColumnRe matches a bare `time` column reference: the word "time" not
+// glued to another identifier character. `lifetime`, `runtime`, `timestamp`
+// and `time_bucket` therefore do NOT match, which is what made the previous
+// substring check unusable — it appended `ORDER BY time ASC` to queries whose
+// only "time" was inside another column name, against a column that need not
+// exist.
+var timeColumnRe = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_."])time($|[^A-Za-z0-9_."])`)
+
+// orderByRe matches an ORDER BY the query already has, allowing any run of
+// whitespace between the two words.
+var orderByRe = regexp.MustCompile(`(?i)\border\s+by\b`)
+
+// limitOffsetRe finds the LIMIT/OFFSET tail an ORDER BY must precede.
+var limitOffsetRe = regexp.MustCompile(`(?i)\b(limit|offset)\b`)
+
+// OptimizeTimeSeriesQuery appends `ORDER BY time ASC` to a time-series query
+// that does not already order its rows, so Grafana receives points in
+// chronological order without an in-memory sort.
+//
+// Only for `format: time_series` — a table-format query must preserve the row
+// order the author asked for (see CLAUDE.md gotcha 6).
+//
+// Applied conservatively. The query must reference a bare `time` column
+// outside of literals and comments, must not already have an ORDER BY, and
+// must not be a multi-statement or set-operation query, where appending a
+// trailing clause would bind to the wrong branch. When in doubt it returns the
+// SQL untouched: a missing sort renders a zig-zag line, but a wrongly placed
+// ORDER BY fails the query outright.
 func OptimizeTimeSeriesQuery(sql string) string {
-	sqlLower := strings.ToLower(strings.TrimSpace(sql))
-
-	// Check if ORDER BY is already present
-	if strings.Contains(sqlLower, "order by") {
+	trimmed := strings.TrimRight(sql, " \t\n\r;")
+	if trimmed == "" {
 		return sql
 	}
 
-	// Check if this looks like a time series query (contains 'time' column)
-	if !strings.Contains(sqlLower, "time") {
+	// Inspect a literal- and comment-free view so an ORDER BY mentioned in a
+	// string, or a `time` inside a comment, does not drive the decision.
+	stripped := newStrippedSQL(trimmed)
+
+	if orderByRe.MatchString(stripped.stripped) {
+		return sql
+	}
+	if !timeColumnRe.MatchString(stripped.stripped) {
+		return sql
+	}
+	// A set operation has multiple branches; a trailing ORDER BY would apply
+	// to the whole result, which may not be what the author intended, and the
+	// branches may not even expose a `time` column.
+	if containsUnion(stripped) {
+		return sql
+	}
+	// Multi-statement input: appending to the last statement is not safe.
+	if strings.Contains(stripped.stripped, ";") {
 		return sql
 	}
 
-	// Find LIMIT or OFFSET clause position
-	sql = strings.TrimRight(sql, " \t\n\r;")
-
-	// Find the position where we should insert ORDER BY
-	// ORDER BY must come before LIMIT/OFFSET
-	limitPos := strings.LastIndex(sqlLower, " limit ")
-	offsetPos := strings.LastIndex(sqlLower, " offset ")
-
-	insertPos := len(sql) // Default: end of query
-
-	if limitPos != -1 && (offsetPos == -1 || limitPos < offsetPos) {
-		insertPos = limitPos
-	} else if offsetPos != -1 {
-		insertPos = offsetPos
+	// ORDER BY must precede LIMIT/OFFSET. Stripping removes literal bodies, so
+	// stripped offsets do NOT map back to the original — search the original
+	// text, and bail out if the two views disagree about whether a LIMIT
+	// exists, which means the only match was inside a literal or comment.
+	origLoc := limitOffsetRe.FindStringIndex(trimmed)
+	strippedHasLimit := limitOffsetRe.MatchString(stripped.stripped)
+	insertAt := len(trimmed)
+	switch {
+	case origLoc == nil && !strippedHasLimit:
+		// No LIMIT/OFFSET anywhere: append at the end.
+	case origLoc != nil && strippedHasLimit:
+		insertAt = origLoc[0]
+	default:
+		// A LIMIT appears in one view but not the other, so the match is
+		// inside a literal or comment and the real position is ambiguous.
+		return sql
 	}
-
-	// Insert ORDER BY at the correct position
-	if insertPos < len(sql) {
-		return sql[:insertPos] + " ORDER BY time ASC" + sql[insertPos:]
+	head := strings.TrimRight(trimmed[:insertAt], " \t\n\r")
+	tail := strings.TrimSpace(trimmed[insertAt:])
+	if tail == "" {
+		return head + " ORDER BY time ASC"
 	}
-
-	// No LIMIT/OFFSET, add at end
-	return sql + " ORDER BY time ASC"
+	return head + " ORDER BY time ASC " + tail
 }
