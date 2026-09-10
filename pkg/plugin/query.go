@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -381,18 +382,47 @@ func JSONToDataFrame(result map[string]interface{}) (*data.Frame, error) {
 	return frame, nil
 }
 
+// intervalBuckets maps a time-range ceiling to the aggregation bucket used for
+// ranges at or below it, ordered smallest first. One table, so the text form
+// ($__interval) and the millisecond form ($__interval_ms) cannot drift apart.
+var intervalBuckets = []struct {
+	upTo time.Duration
+	text string
+	size time.Duration
+}{
+	{upTo: 6 * time.Hour, text: "10 seconds", size: 10 * time.Second},
+	{upTo: 24 * time.Hour, text: "1 minute", size: time.Minute},
+	{upTo: 7 * 24 * time.Hour, text: "10 minutes", size: 10 * time.Minute},
+}
+
+// widestBucket applies to any range larger than the last intervalBuckets entry.
+var widestBucket = struct {
+	text string
+	size time.Duration
+}{text: "1 hour", size: time.Hour}
+
+// intervalBucket picks the aggregation bucket for a time range, in both the
+// text form DuckDB accepts and the duration behind it.
+func intervalBucket(duration time.Duration) (string, time.Duration) {
+	for _, b := range intervalBuckets {
+		if duration <= b.upTo {
+			return b.text, b.size
+		}
+	}
+	return widestBucket.text, widestBucket.size
+}
+
 // calculateInterval picks an appropriate aggregation interval for the given duration.
 func calculateInterval(duration time.Duration) string {
-	switch {
-	case duration > 7*24*time.Hour:
-		return "1 hour"
-	case duration > 24*time.Hour:
-		return "10 minutes"
-	case duration > 6*time.Hour:
-		return "1 minute"
-	default:
-		return "10 seconds"
-	}
+	text, _ := intervalBucket(duration)
+	return text
+}
+
+// intervalMilliseconds is calculateInterval's bucket in milliseconds, for
+// `$__interval_ms`.
+func intervalMilliseconds(duration time.Duration) int64 {
+	_, size := intervalBucket(duration)
+	return size.Milliseconds()
 }
 
 // replaceMacroOccurrences walks `sql` once and rewrites every occurrence of
@@ -472,6 +502,92 @@ func replaceMacroOccurrences(sql, macro string, rewrite func(arg string) (string
 			}
 			i = closeIdx + 1
 			continue
+		}
+		out.WriteByte(sql[i])
+		i++
+	}
+	return out.String()
+}
+
+// isMacroWordByte reports whether b can be part of a macro token's name.
+// Used to require a word boundary after a token so `$__interval` does not
+// match the prefix of `$__interval_ms` (or any future `$__interval*` macro).
+func isMacroWordByte(b byte) bool {
+	return b == '_' ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9')
+}
+
+// replaceIntervalToken replaces every whole-word occurrence of `token` with
+// `replacement`, skipping SQL comments but NOT string literals.
+//
+// It is the deliberate counterpart to replaceLiteralAwareTokens, for the one
+// macro family whose documented use is inside quotes:
+//
+//	time_bucket('$__interval', t)   INTERVAL '$__interval'
+//
+// Skipping literals there would leave the token intact and DuckDB fails with
+// "Could not convert string '$__interval' to INTERVAL". Comments are still
+// skipped, so `-- bucket $__interval` is preserved and the SQL shown in
+// Grafana's inspector still matches what the author wrote.
+//
+// The word-boundary check is what makes the replacement order irrelevant:
+// `$__interval` cannot consume the prefix of `$__interval_ms`, `$__intervalx`,
+// or any macro Grafana adds to this family later.
+func replaceIntervalToken(sql, token, replacement string) string {
+	if !strings.Contains(sql, token) {
+		return sql
+	}
+	var out strings.Builder
+	out.Grow(len(sql))
+	i := 0
+	for i < len(sql) {
+		// Line comment: -- ... \n
+		if sql[i] == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			end := strings.IndexByte(sql[i:], '\n')
+			if end < 0 {
+				out.WriteString(sql[i:])
+				return out.String()
+			}
+			out.WriteString(sql[i : i+end])
+			i += end
+			continue
+		}
+		// Block comment: /* ... */ (nested, as DuckDB and Postgres allow).
+		if sql[i] == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+			depth, j := 1, i+2
+			for j < len(sql)-1 {
+				if sql[j] == '/' && sql[j+1] == '*' {
+					depth++
+					j += 2
+					continue
+				}
+				if sql[j] == '*' && sql[j+1] == '/' {
+					depth--
+					j += 2
+					if depth == 0 {
+						break
+					}
+					continue
+				}
+				j++
+			}
+			if depth != 0 {
+				out.WriteString(sql[i:]) // unterminated; copy the rest verbatim
+				return out.String()
+			}
+			out.WriteString(sql[i:j])
+			i = j
+			continue
+		}
+		if strings.HasPrefix(sql[i:], token) {
+			next := i + len(token)
+			if next >= len(sql) || !isMacroWordByte(sql[next]) {
+				out.WriteString(replacement)
+				i = next
+				continue
+			}
 		}
 		out.WriteByte(sql[i])
 		i++
@@ -631,7 +747,14 @@ func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuratio
 	sql = expandTimeFilter(sql, filterFrom, filterTo)
 	sql = replaceLiteralAwareTokens(sql, "$__timeFrom()", fmt.Sprintf("'%s'", filterFrom.Format(time.RFC3339)))
 	sql = replaceLiteralAwareTokens(sql, "$__timeTo()", fmt.Sprintf("'%s'", filterTo.Format(time.RFC3339)))
-	sql = replaceLiteralAwareTokens(sql, "$__interval", calculateInterval(intervalDuration))
+	// The interval macros expand inside string literals, unlike the
+	// parenthesised macros above -- see replaceIntervalToken for why, and for
+	// why the order of these two lines does not matter. Only backend-only
+	// paths (alerting, recorded queries) see either token unexpanded; the
+	// frontend substitutes both before a panel query reaches us.
+	sql = replaceIntervalToken(sql, "$__interval_ms",
+		strconv.FormatInt(intervalMilliseconds(intervalDuration), 10))
+	sql = replaceIntervalToken(sql, "$__interval", calculateInterval(intervalDuration))
 	// $__timeGroup(column, interval) -> epoch-based bucketing
 	// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
 	// causing GROUP BY to produce per-second rows. Epoch math avoids this.

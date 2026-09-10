@@ -28,7 +28,7 @@ func newStrippedSQL(sql string) strippedSQL {
 // (e.g. `WHERE message = 'count(*) is high'`) or on commented-out keywords
 // (e.g. `-- LIMIT 10`).
 //
-// Single-quoted literals use SQL's escaped-quote convention (`''` inside).
+// Single-quoted literals use SQL's escaped-quote convention (`”` inside).
 // Double-quoted identifiers are NOT touched — DuckDB and Postgres use them
 // for column names that contain special characters, so keyword detection on
 // them is still desired.
@@ -113,6 +113,7 @@ func stripStringLiteralsAndComments(sql string) string {
 //   - Grafana template variable: `LIMIT $limit`
 //   - DuckDB positional / named parameter: `LIMIT ?` or `LIMIT :n`
 //   - subquery / expression: `LIMIT (SELECT max(n) FROM t)`
+//
 // Restricting to `\d` (the previous form) missed all but the first, so
 // splitting was enabled for `LIMIT $limit` queries and returned N×$limit
 // rows for a $limit-bound query (gemini round 4 finding 3244824396).

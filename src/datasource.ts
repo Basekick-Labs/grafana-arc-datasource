@@ -10,6 +10,7 @@ import {
 } from '@grafana/data';
 import { frameToMetricFindValue, DataSourceWithBackend, getTemplateSrv } from '@grafana/runtime';
 import { ArcQuery, ArcDataSourceOptions, defaultQuery } from './types';
+import { escapeLiteral, quoteLiteral } from './interpolation';
 import { lastValueFrom } from 'rxjs';
 
 /**
@@ -79,18 +80,42 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     return defaultQuery;
   }
 
-  quoteLiteral(value: string) {
-    return "'" + value.replace(/'/g, "''") + "'";
-  }
-
-  interpolateVariable = (value: string | string[] | number, _variable: VariableWithMultiSupport) => {
+  /**
+   * Formats a template-variable value for interpolation into SQL.
+   *
+   * This is a deliberate, verbatim match of Grafana's own SQL datasources
+   * (`packages/grafana-sql/src/datasource/SqlDatasource.ts`). Do not change it
+   * without diffing against that file first.
+   *
+   * The rule: quote ONLY when the variable is multi-value or has an "All"
+   * option; otherwise escape embedded quotes and leave the value bare. It
+   * looks asymmetric but both halves are load-bearing:
+   *
+   *   - Single-value variables are written inside the author's own quotes
+   *     (`WHERE host = '$server'`, `host ~ '^$server$'`). Adding a second pair
+   *     yields `''h01''` / `'^'h01'$'` — a parser error, not extra safety.
+   *   - Multi-value variables land where the author cannot pre-quote each
+   *     element (`WHERE cpu = $cpu`, `host IN ($hosts)`), so each element is
+   *     quoted here.
+   *
+   * A previous release (1.3.2, finding R2-HI5) quoted unconditionally on the
+   * premise that "the Postgres datasource quotes unconditionally". That
+   * premise is false — upstream has quoted only multi/All since the plugin was
+   * written — and acting on it broke every dashboard using the quoted idiom.
+   * Doubling embedded quotes is the half that actually prevents a URL-supplied
+   * value from terminating the literal and appending SQL; that is retained on
+   * both paths. A bare `= $var` remains injectable exactly as it is in
+   * Grafana's own Postgres/MySQL datasources, where Arc's API-key scope is the
+   * authorization boundary.
+   */
+  // `variable` is optional: Grafana routes its own built-in macros ($__interval,
+  // $__from, $__to) through this hook without a variable model.
+  interpolateVariable = (value: string | string[] | number, variable?: VariableWithMultiSupport) => {
     if (typeof value === 'string') {
-      // R2-HI5: always quote single-value strings. Previously this branch
-      // doubled embedded `'` but returned the value without surrounding
-      // quotes — `WHERE host = $foo` with `?var-foo=1 OR 1=1--` produced a
-      // URL-driven SQL injection with the API key's full scope. Matches the
-      // Postgres datasource which quotes unconditionally.
-      return this.quoteLiteral(value);
+      if (variable?.multi || variable?.includeAll) {
+        return quoteLiteral(value);
+      }
+      return escapeLiteral(value);
     }
 
     if (typeof value === 'number') {
@@ -98,7 +123,13 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     }
 
     if (Array.isArray(value)) {
-      const quotedValues = value.map((v) => this.quoteLiteral(v));
+      // An empty selection would otherwise join to "", producing `IN ()` —
+      // a DuckDB parser error rather than a query that matches nothing.
+      // NULL parses and matches nothing, which is what an empty set means.
+      if (value.length === 0) {
+        return 'NULL';
+      }
+      const quotedValues = value.map((v) => quoteLiteral(v));
       return quotedValues.join(',');
     }
 

@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Ships as **1.4.0**, together with the datasource-default restorations tracked
+in issue #12. Versions are bumped once, in the release PR, so `package.json`
+and `plugin.json` cannot drift apart across review rounds.
+
+### Fixed
+- Template variables are interpolated by Grafana's own rule again: a value is
+  quoted only when the variable is multi-value or has an "Include All" option,
+  and is otherwise escaped without adding quotes. Since 1.3.2 every
+  single-value variable was wrapped in quotes, so the standard idioms
+  `WHERE host = '$server'` and `host ~ '^$server$'` produced `''h01''` and
+  `'^'h01'$'` — both parser errors — and Grafana's own `$__interval` became
+  `INTERVAL ''30s''`.
+
+  The 1.3.2 change came from a security finding asserting that Grafana's
+  Postgres datasource quotes unconditionally. It does not, and never has:
+  upstream `SqlDatasource.interpolateVariable` quotes only multi/All values.
+  Embedded quotes are still doubled on both paths, which is the part that
+  actually keeps a URL-supplied value inside the literal it is placed in.
+
+- `$__interval` expands inside string literals again. Its documented form is
+  `time_bucket('$__interval', time)` / `INTERVAL '$__interval'`, and the
+  literal-skipping introduced in 1.3.2 left the token unexpanded, so DuckDB
+  rejected it with "Could not convert string '$__interval' to INTERVAL". The
+  parenthesised macros (`$__timeFilter`, `$__timeFrom()`, `$__timeTo()`,
+  `$__timeGroup`) still skip literals, since their expansions carry their own
+  quotes.
+
+- `$__interval_ms` is no longer clobbered. It shares a prefix with
+  `$__interval`, so a substring replacement rewrote it to `10 seconds_ms`.
+  Both tokens are now matched on a word boundary, which also leaves any
+  unrecognised `$__interval*` token untouched rather than corrupting it, and
+  makes the replacement order irrelevant. The interval macros skip SQL
+  comments, so query text shown in Grafana's inspector still matches what the
+  author wrote. Only backend-only paths (alerting, recorded queries) see
+  either token unexpanded.
+
+- A multi-value variable with nothing selected now interpolates as `NULL`
+  instead of an empty string, so `WHERE host IN ($hosts)` degrades to a query
+  matching no rows rather than `IN ()`, a parser error.
+
+### Note on 1.3.3 - 1.3.11
+Those releases were withdrawn. They attempted to patch the regression above
+without a verification loop against real dashboards, and each one fixed one
+query idiom while breaking another. Use 1.2.0 until this release ships.
+
 ## [1.3.2] - 2026-09-02
 
 ### Fixed
