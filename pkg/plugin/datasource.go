@@ -25,15 +25,45 @@ import (
 
 // ArcDataSourceSettings contains Arc connection settings
 type ArcDataSourceSettings struct {
-	URL                   string `json:"url"`
-	Database              string `json:"database"`
-	Timeout               int    `json:"timeout"`               // seconds
-	Protocol              string `json:"protocol"`              // "arrow" (default), "msgpack", or "json" — wire format for query responses
-	UseArrow              *bool  `json:"useArrow"`              // legacy toggle superseded by Protocol; pointer so unset (fresh install) is distinguishable from explicit false
-	MaxConcurrency        int    `json:"maxConcurrency"`        // max parallel chunks for query splitting (default 4)
-	MaxResponseMB         int    `json:"maxResponseMB"`         // per-response body size cap in MiB (default 1024 — large analytical queries cross 256 MiB easily, R2-CR7)
-	AllowPrivateIPs       bool   `json:"allowPrivateIPs"`       // opt-in: permit Arc URL to resolve to RFC1918/private addresses (corporate intranets)
-	AllowDatabaseOverride bool   `json:"allowDatabaseOverride"` // opt-in: permit per-query `database` field to override the datasource default (R2-HI6 confused-deputy guard)
+	URL            string `json:"url"`
+	Database       string `json:"database"`
+	Timeout        int    `json:"timeout"`        // seconds
+	Protocol       string `json:"protocol"`       // "arrow" (default), "msgpack", or "json" — wire format for query responses
+	UseArrow       *bool  `json:"useArrow"`       // legacy toggle superseded by Protocol; pointer so unset (fresh install) is distinguishable from explicit false
+	MaxConcurrency int    `json:"maxConcurrency"` // max parallel chunks WITHIN one split query (default 4)
+	// MaxInFlight bounds total simultaneous Arc requests for this datasource,
+	// across every panel and viewer. Separate from MaxConcurrency: that one
+	// shapes a single query's fan-out, while this one protects Arc and the
+	// plugin process. Collapsing them (1.3.2) meant a 12-panel dashboard
+	// queued behind 4 slots and panels timed out waiting their turn.
+	MaxInFlight   int `json:"maxInFlight"`   // default 32
+	MaxResponseMB int `json:"maxResponseMB"` // per-response body size cap in MiB (default 1024 — large analytical queries cross 256 MiB easily, R2-CR7)
+	// AllowPrivateIPs permits the Arc URL to resolve to an RFC1918/CGNAT
+	// address. Pointer so an absent key (a datasource created before 1.3) is
+	// distinguishable from an explicit false: absent defaults to TRUE, because
+	// self-hosted Arc normally lives on a private network or a Docker DNS name
+	// like `http://arc:8000`, and defaulting it off in 1.3.2 broke every such
+	// datasource with "Arc URL resolves to a blocked address". Link-local and
+	// cloud-metadata addresses stay blocked regardless of this setting.
+	AllowPrivateIPs *bool `json:"allowPrivateIPs"`
+	// AllowDatabaseOverride permits a per-query `database` field to override
+	// the datasource default. Pointer for the same reason: the override was an
+	// advertised feature from 1.1.0, and gating it off by default in 1.3.2
+	// turned working panels into "per-query database override is not enabled".
+	// Absent defaults to TRUE for legacy instances; the ConfigEditor writes an
+	// explicit value for datasources created from 1.4.0 on.
+	AllowDatabaseOverride *bool `json:"allowDatabaseOverride"`
+}
+
+// boolOrDefault reads an optional setting: an absent key (nil) takes the
+// default, an explicit value wins. Used for settings whose safe default
+// differs between a datasource created before the setting existed and one
+// created after it — see AllowPrivateIPs and AllowDatabaseOverride.
+func boolOrDefault(v *bool, def bool) bool {
+	if v == nil {
+		return def
+	}
+	return *v
 }
 
 // Wire protocols for Arc query responses. Arrow is the fastest and the
@@ -221,6 +251,17 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	if dsSettings.MaxConcurrency > MaxConcurrencyCap {
 		dsSettings.MaxConcurrency = MaxConcurrencyCap
 	}
+	if dsSettings.MaxInFlight <= 0 {
+		dsSettings.MaxInFlight = DefaultMaxInFlight
+	}
+	if dsSettings.MaxInFlight > MaxInFlightCap {
+		dsSettings.MaxInFlight = MaxInFlightCap
+	}
+	// A per-query fan-out wider than the instance-wide budget can never be
+	// realised, and would let one panel monopolise every slot.
+	if dsSettings.MaxConcurrency > dsSettings.MaxInFlight {
+		dsSettings.MaxConcurrency = dsSettings.MaxInFlight
+	}
 	// Per-response size cap (R2-CR7). 256 MiB (the original hardcoded value)
 	// was too low for 6M+ row analytical queries — Arc reports "Arrow IPC
 	// stream truncated after headers committed" because the plugin closes the
@@ -233,17 +274,28 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	if dsSettings.MaxResponseMB > MaxResponseMBCap {
 		dsSettings.MaxResponseMB = MaxResponseMBCap
 	}
-	// Protocol resolution. Existing datasources predate the selector and only
-	// carry the legacy UseArrow toggle: unset/true meant Arrow, explicit false
-	// meant JSON. An unknown value is a validation error rather than a silent
-	// fallback so a typo in provisioned YAML surfaces at Save & Test.
+	// Protocol resolution for datasources that predate the selector and carry
+	// only the legacy UseArrow toggle. An unknown value is a validation error
+	// rather than a silent fallback so a typo in provisioned YAML surfaces at
+	// Save & Test.
+	//
+	// An ABSENT useArrow key resolves to JSON, matching 1.2.0, where UseArrow
+	// was a plain bool whose zero value was false. 1.3.2 resolved the same
+	// datasource to Arrow, which silently changed two things: Arc's Arrow
+	// endpoint rejects `SHOW DATABASES` / `SHOW TABLES` (the variable-query
+	// examples in this plugin's own editor) with HTTP 400, and the two paths
+	// infer column types differently, so a VARCHAR of RFC3339 strings that was
+	// a time field under JSON became a string field under Arrow.
+	//
+	// New datasources get Arrow: the ConfigEditor writes `protocol` explicitly,
+	// so this branch only ever sees instances created before 1.3.
 	switch dsSettings.Protocol {
 	case ProtocolArrow, ProtocolMsgpack, ProtocolJSON:
 	case "":
-		if dsSettings.UseArrow != nil && !*dsSettings.UseArrow {
-			dsSettings.Protocol = ProtocolJSON
-		} else {
+		if dsSettings.UseArrow != nil && *dsSettings.UseArrow {
 			dsSettings.Protocol = ProtocolArrow
+		} else {
+			dsSettings.Protocol = ProtocolJSON
 		}
 	default:
 		return nil, fmt.Errorf("unknown protocol %q (use %q, %q, or %q)",
@@ -253,7 +305,7 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	inst := &ArcInstanceSettings{
 		settings:         dsSettings,
 		apiKey:           apiKey,
-		sem:              semaphore.NewWeighted(int64(dsSettings.MaxConcurrency)),
+		sem:              semaphore.NewWeighted(int64(dsSettings.MaxInFlight)),
 		maxResponseBytes: int64(dsSettings.MaxResponseMB) * 1024 * 1024,
 	}
 	// SSRF dial policy is two-axis (gemini 3244943519): a loopback URL only
@@ -261,11 +313,14 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	// blocked), and `AllowPrivateIPs` opens both loopback and RFC1918/CGNAT.
 	policy := dialPolicy{
 		allowLoopback: isLoopbackURL(dsSettings.URL),
-		allowPrivate:  dsSettings.AllowPrivateIPs,
+		// Absent key -> true. See the field comment: defaulting this off in
+		// 1.3.2 broke every self-hosted datasource on a private address.
+		allowPrivate: boolOrDefault(dsSettings.AllowPrivateIPs, true),
 	}
 	inst.client = newHTTPClient(
 		time.Duration(dsSettings.Timeout)*time.Second,
 		policy,
+		dsSettings.MaxInFlight,
 	)
 	return inst, nil
 }
@@ -542,6 +597,18 @@ func mergeFrames(frames []*data.Frame) *data.Frame {
 	if skipped > 0 {
 		log.DefaultLogger.Warn("mergeFrames skipped chunks with incompatible schema",
 			"skipped", skipped, "kept", len(frames)-skipped)
+		// Surface it on the panel too. Dropping a chunk silently leaves a
+		// partial series that looks like a gap in the data rather than a
+		// plugin decision, and the user has no way to tell the difference.
+		if merged.Meta == nil {
+			merged.Meta = &data.FrameMeta{}
+		}
+		merged.Meta.Notices = append(merged.Meta.Notices, data.Notice{
+			Severity: data.NoticeSeverityWarning,
+			Text: fmt.Sprintf(
+				"%d of %d query chunks returned a different set of columns and were dropped; this series is incomplete. Turn off query splitting for this panel to see the full range.",
+				skipped, len(frames)),
+		})
 	}
 
 	if additionalRows == 0 {
@@ -599,7 +666,7 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	// the cached *http.Client and apiKey while scoping the change to this
 	// one query.
 	if qm.Database != "" && qm.Database != settings.settings.Database {
-		if !settings.settings.AllowDatabaseOverride {
+		if !boolOrDefault(settings.settings.AllowDatabaseOverride, true) {
 			log.DefaultLogger.Warn("per-query database override rejected — not enabled in datasource settings",
 				"refId", qm.RefID, "requested", qm.Database, "configured", settings.settings.Database)
 			return backend.ErrDataResponse(backend.StatusBadRequest,
@@ -645,10 +712,23 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		splitting = false
 	}
 
-	// Auto-add ORDER BY time ASC is disabled until the substring-match bug is fixed
-	// (rewrites queries containing 'lifetime', 'runtime', 'timestamp' columns and
-	// injects ORDER BY against a column named 'time' that may not exist).
-	// Re-enable after C5 fix lands. See docs/progress/2026-05-14-signing-readiness.md.
+	// Time-series panels want points in chronological order. Appending the
+	// sort here lets Arc do it, instead of Grafana sorting in memory.
+	//
+	// Time-series format ONLY: a table panel must keep the row order the
+	// author asked for. OptimizeTimeSeriesQuery is conservative and returns
+	// the SQL untouched whenever the insertion point is not obvious.
+	if qm.Format == "time_series" {
+		// Reuse the strippedSQL computed above rather than stripping again.
+		// The trailing-`;` trim has to happen before stripping, so the views
+		// only match when the SQL has no trailing semicolon or whitespace;
+		// otherwise fall back to the standalone entry point.
+		if trimmed := strings.TrimRight(qm.SQL, " \t\n\r;"); trimmed == qm.SQL {
+			qm.SQL = optimizeTimeSeriesQuery(trimmed, stripped, qm.SQL)
+		} else {
+			qm.SQL = OptimizeTimeSeriesQuery(qm.SQL)
+		}
+	}
 
 	if !splitting {
 		// No splitting — execute as before
@@ -708,7 +788,7 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	}
 
 	if err := g.Wait(); err != nil {
-		return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserError(qm.RefID, err))
+		return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserErrorSQL(qm.RefID, qm.SQL, err))
 	}
 
 	orderedFrames := make([]*data.Frame, 0, len(chunks))
@@ -769,7 +849,7 @@ func (d *ArcDatasource) querySingle(ctx context.Context, settings *ArcInstanceSe
 
 	frame, err := executeProtocolQuery(ctx, settings, sql)
 	if err != nil {
-		return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserError(qm.RefID, err))
+		return backend.ErrDataResponse(backend.StatusInternal, sanitizeUserErrorSQL(qm.RefID, sql, err))
 	}
 
 	// Time the frame preparation (conversion)

@@ -27,13 +27,19 @@ const DefaultMaxResponseMB = 1024
 // memory profile.
 const MaxResponseMBCap = 8192
 
+// DefaultMaxInFlight bounds simultaneous Arc requests per datasource across
+// every panel and viewer. 32 keeps a busy dashboard responsive while still
+// protecting Arc; 1.3.2 used MaxConcurrency (default 4) for both, so a
+// 12-panel dashboard served requests four at a time.
+const DefaultMaxInFlight = 32
+
+// MaxInFlightCap bounds MaxInFlight. Beyond this, file-descriptor pressure and
+// TLS-handshake storms against Arc become the limiting factor.
+const MaxInFlightCap = 128
+
 // MaxConcurrencyCap is the upper bound on user-configurable parallel chunk fanout.
 // Higher values risk file-descriptor pressure and TLS-handshake storms against Arc.
 const MaxConcurrencyCap = 32
-
-// columnNameRe matches a SQL column or qualified column reference (table.col).
-// Used to validate macro arguments before interpolating them into SQL.
-var columnNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*$`)
 
 // databaseNameRe matches a permitted Arc database name. Conservative on purpose —
 // the name flows into an HTTP header and into SQL identifier contexts.
@@ -43,11 +49,63 @@ var databaseNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // a private, loopback, or link-local address. Surfaces in errors.Is for callers.
 var errBlockedAddr = errors.New("destination address is not permitted")
 
-// validateColumnArg returns an error if name doesn't look like a safe SQL column
-// reference. Used by macro expanders before interpolating column arguments.
+// columnArgUnsafe matches the characters that could let a macro's column
+// argument escape the SQL the macro generates.
+//
+// The argument is interpolated as an EXPRESSION, never inside a quoted
+// literal — `%s >= '<from>'` and `epoch_ns(%s) // n` — so the risk is a single
+// quote (which would open a literal and swallow the timestamp that follows),
+// a statement separator, or a comment introducer that would comment out the
+// rest of the generated predicate.
+//
+// A double quote is NOT unsafe here: DuckDB uses it for quoted identifiers,
+// `"time"` and `t."time"` are ordinary column references, and it cannot
+// terminate the single-quoted literals this macro emits.
+var columnArgUnsafe = regexp.MustCompile(`[';]|--|/\*`)
+
+// validateColumnArg returns an error if a macro's column argument contains
+// something that could break out of the SQL the macro generates.
+//
+// Deliberately permissive: it rejects dangerous characters rather than
+// requiring a bare identifier. 1.3.2 required `^[A-Za-z_][A-Za-z0-9_.]*$`,
+// which rejected every ordinary DuckDB column expression -- a quoted
+// identifier `"time"`, a qualified-and-quoted `t."time"`, a cast
+// `time::TIMESTAMP`, a non-ASCII column name -- and left the macro unexpanded,
+// so Arc received a literal `$__timeFilter(...)` and failed to parse.
+//
+// The permissiveness costs nothing here: the SQL the user types is forwarded
+// to Arc verbatim anyway, so Arc's API-key scope, not this regex, is the
+// authorization boundary. What this guard is actually for is making sure the
+// text WE generate around the argument stays well-formed.
 func validateColumnArg(name string) error {
-	if !columnNameRe.MatchString(name) {
-		return fmt.Errorf("invalid column argument %q: must match %s", name, columnNameRe.String())
+	if strings.TrimSpace(name) == "" {
+		return errors.New("empty column argument")
+	}
+	if columnArgUnsafe.MatchString(name) {
+		return errors.New("column argument contains an unsafe character (quote, semicolon, or comment marker)")
+	}
+	// Parentheses must balance, and must never close more than they opened.
+	// Without this, `$__timeFilter(time) OR (1=1)` parses as the argument
+	// `time) OR (1=1`, which closes the macro's own paren and appends a
+	// disjunction: the emitted predicate becomes
+	//   time >= '<from>' AND time < '<to>' OR (1=1)
+	// and since AND binds tighter than OR the time filter is neutralised and
+	// the panel returns the whole table. Under query splitting each chunk then
+	// returns that whole table, and the merge duplicates every row per chunk.
+	depth := 0
+	for i := 0; i < len(name); i++ {
+		switch name[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth < 0 {
+				return errors.New("column argument closes more parentheses than it opens")
+			}
+		}
+	}
+	if depth != 0 {
+		return errors.New("column argument has unbalanced parentheses")
 	}
 	return nil
 }
@@ -220,11 +278,31 @@ func isLoopbackURL(raw string) bool {
 // regardless. Previously these two were collapsed into one bool, which meant
 // a loopback URL would also open RFC1918 redirects (gemini round 5 finding
 // 3244943519).
-func newHTTPClient(timeout time.Duration, policy dialPolicy) *http.Client {
+func newHTTPClient(timeout time.Duration, policy dialPolicy, maxInFlight int) *http.Client {
+	if maxInFlight <= 0 {
+		maxInFlight = DefaultMaxInFlight
+	}
 	transport := &http.Transport{
-		DialContext:           safeDialContext(policy),
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
+		// Honour HTTP_PROXY / HTTPS_PROXY / NO_PROXY. The custom transport
+		// added in 1.3.2 omitted this, so a Grafana behind a corporate egress
+		// proxy silently stopped reaching a cloud-hosted Arc — http.Transport
+		// defaults to no proxy, unlike http.DefaultTransport.
+		Proxy:       http.ProxyFromEnvironment,
+		DialContext: safeDialContext(policy),
+		// This transport serves ONE host (the datasource's Arc URL), so all
+		// three limits are sized from the same budget.
+		//
+		// MaxIdleConnsPerHost is the load-bearing one: it defaults to 2, and
+		// without it a 32-way fan-out returns 2 connections to the pool and
+		// CLOSES the other 30, so the next refresh re-dials nearly everything
+		// and pays a TLS handshake for each. Raising IdleConnTimeout without
+		// this only keeps those 2 connections alive longer.
+		MaxIdleConns:        maxInFlight,
+		MaxIdleConnsPerHost: maxInFlight,
+		MaxConnsPerHost:     maxInFlight,
+		// A dashboard refreshing every 1-5 minutes re-dialled on every refresh
+		// at 90s, paying a TLS handshake each time.
+		IdleConnTimeout:       5 * time.Minute,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
@@ -251,7 +329,82 @@ func newHTTPClient(timeout time.Duration, policy dialPolicy) *http.Client {
 //
 // The full error is logged server-side for operator diagnostics; the returned
 // string keeps the high-level category but strips identifiers and paths.
+// duckdbUserErrorPrefixes are the DuckDB error types that describe a defect in
+// the SQL the user wrote, rather than anything about the server. Each names
+// the user's own text back to them and carries no schema they did not already
+// reference, no file path, and no query plan.
+// duckdbUserErrorPrefixes lists the DuckDB error types whose text contains
+// NOTHING but the user's own SQL. Membership was decided by running each
+// error type against DuckDB 1.4.3 and reading what it actually emits, not by
+// how the name sounds:
+//
+//	Parser Error: "syntax error at or near \"h01\"" — quotes the user's text.
+//	Syntax Error: same shape.
+//
+// Deliberately EXCLUDED, because each leaks something the dashboard viewer
+// never referenced and may not be entitled to see:
+//
+//	Catalog Error:    names tables and schemas.
+//	Binder Error:     appends `Candidate bindings: "secret_salary"` — a list
+//	                  of real column names from the table.
+//	Conversion Error: echoes the offending ROW VALUE, e.g. Could not convert
+//	                  string 'secret-value-xyz' to INT32.
+//	Type Error:       can carry column names from the failing expression.
+//
+// Those stay summarised; their full text is in the server log.
+var duckdbUserErrorPrefixes = []string{
+	"Parser Error",
+	"Syntax Error",
+}
+
+// userFixableArcError returns the DuckDB detail from an Arc error message when
+// that detail describes a mistake in the user's SQL. The returned string keeps
+// the "Arc error (HTTP n):" prefix so the origin stays visible.
+// isUserFixableArcError reports whether an Arc error message describes a
+// mistake in the user's own SQL, and so may be shown to them verbatim.
+//
+// Matches on the message BODY's prefix rather than with strings.Contains: a
+// composite diagnostic such as "Internal Error: ... Parser Error: ..." would
+// otherwise pass through wholesale, carrying the internal half with it.
+func isUserFixableArcError(msg string) bool {
+	body := msg
+	if i := strings.Index(body, "): "); i >= 0 {
+		body = body[i+3:]
+	}
+	// Arc prefixes its own context, e.g. "arrow query failed: Parser Error:".
+	if i := strings.Index(body, "query failed: "); i >= 0 {
+		body = body[i+len("query failed: "):]
+	}
+	for _, prefix := range duckdbUserErrorPrefixes {
+		if strings.HasPrefix(body, prefix+":") {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeUserErrorSQL is sanitizeUserError plus the expanded SQL in the
+// server-side log line.
+//
+// The panel deliberately never shows the SQL, but an operator reading the log
+// needs it: without it the log says a query failed and not which one, so
+// diagnosing a macro or interpolation problem means reconstructing the query
+// by hand. That reconstruction is what produced four wrong diagnoses during
+// the 1.3.x regression.
+func sanitizeUserErrorSQL(refID, sql string, err error) string {
+	// Capped like every other logged payload: a macro-expanded query with a
+	// large IN (...) list from a multi-value variable can be megabytes, and a
+	// broken panel refreshing every few seconds writes it each time.
+	return sanitizeUserErrorWith(refID, err, "sql", truncateForLog(sql))
+}
+
 func sanitizeUserError(refID string, err error) string {
+	return sanitizeUserErrorWith(refID, err)
+}
+
+// sanitizeUserErrorWith is the shared implementation. `extra` is appended to
+// the server-side log line as key/value pairs and never reaches the user.
+func sanitizeUserErrorWith(refID string, err error, extra ...any) string {
 	// User-initiated cancellation is benign — Grafana cancels the in-flight
 	// request when the user edits a query, changes the dashboard, or
 	// navigates away. Logging at Error level on every panel edit would
@@ -260,7 +413,8 @@ func sanitizeUserError(refID string, err error) string {
 		log.DefaultLogger.Debug("Arc query canceled by client", "refId", refID)
 		return "Query canceled"
 	}
-	log.DefaultLogger.Error("Arc query failed", "refId", refID, "error", err.Error())
+	fields := append([]any{"refId", refID, "error", err.Error()}, extra...)
+	log.DefaultLogger.Error("Arc query failed", fields...)
 	msg := err.Error()
 	// Typed-error matching first (preferred). String contains is a fallback
 	// for paths that don't have a typed sentinel yet.
@@ -280,8 +434,19 @@ func sanitizeUserError(refID string, err error) string {
 	case strings.Contains(msg, "no such host"):
 		return "Cannot connect to Arc — hostname not found."
 	case strings.HasPrefix(msg, "Arc error (HTTP "):
-		// Preserve the HTTP status (already a category, not a detail) but drop
-		// the server-supplied message body.
+		// A DuckDB error naming the user's own mistake — a parser error, an
+		// unknown column, a missing table — belongs in the panel. Hiding it
+		// forces the dashboard author to hunt through the Grafana server log
+		// for something they could fix in the editor, which is exactly what
+		// made the 1.3.x regression take a day to diagnose instead of minutes.
+		//
+		// Classified by DuckDB's error TYPE, not by HTTP status: Arc reports a
+		// parser error as 500, so a status-based rule would hide the very
+		// errors that matter most. Anything not on the allowlist stays
+		// summarised, and the full text is in the log line above.
+		if isUserFixableArcError(msg) {
+			return msg
+		}
 		end := strings.Index(msg, "):")
 		if end > 0 {
 			return msg[:end+1] + " query failed (see server logs for detail)"

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -705,7 +706,7 @@ func findMatchingParen(sql string, openIdx int) int {
 }
 
 // expandTimeFilter replaces $__timeFilter(column) with column >= 'from' AND column < 'to'.
-// Column arguments are validated against columnNameRe — anything else is left
+// Column arguments are checked by validateColumnArg — anything unsafe is left
 // un-expanded so Arc surfaces a clear error rather than the macro silently
 // injecting attacker-controlled SQL. Macros inside string literals or comments
 // are not expanded.
@@ -722,7 +723,10 @@ func expandTimeFilter(sql string, from, to time.Time) string {
 			log.DefaultLogger.Warn("$__timeFilter rejected unsafe column argument", "column", column, "error", err.Error())
 			return "", false
 		}
-		return fmt.Sprintf("%s >= '%s' AND %s < '%s'", column, fromStr, column, toStr), true
+		// Parenthesised on both sides: validateColumnArg already rejects an
+		// unbalanced argument, and wrapping makes a break-out structurally
+		// impossible rather than merely rejected. Costs nothing semantically.
+		return fmt.Sprintf("(%s) >= '%s' AND (%s) < '%s'", column, fromStr, column, toStr), true
 	})
 }
 
@@ -807,41 +811,75 @@ func parseJSONTimestamp(v interface{}, detectedLayout string) (time.Time, bool) 
 	}
 }
 
-// intervalSecondsTable maps DuckDB-compatible interval strings to seconds.
-// Package-level so the lookup is O(1) per macro call instead of a 13-arm
-// switch. Both short and long forms are accepted ("1m" and "1 minute").
-var intervalSecondsTable = map[string]int{
-	"1s": 1, "1 second": 1,
-	"5s": 5, "5 seconds": 5,
-	"10s": 10, "10 seconds": 10,
-	"30s": 30, "30 seconds": 30,
-	"1m": 60, "1 minute": 60,
-	"5m": 300, "5 minutes": 300,
-	"10m": 600, "10 minutes": 600,
-	"15m": 900, "15 minutes": 900,
-	"30m": 1800, "30 minutes": 1800,
-	"1h": 3600, "1 hour": 3600,
-	"6h": 21600, "6 hours": 21600,
-	"12h": 43200, "12 hours": 43200,
-	"1d": 86400, "1 day": 86400,
+// intervalUnitSeconds maps an interval unit, and its accepted spellings, to
+// its length in seconds. Months and years are deliberately absent: they are
+// not fixed-length, so epoch division cannot express them.
+var intervalUnitSeconds = map[string]int{
+	"s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+	"m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+	"h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+	"d": 86400, "day": 86400, "days": 86400,
+	"w": 604800, "week": 604800, "weeks": 604800,
 }
 
-// intervalToSeconds converts a DuckDB interval string to seconds. Returns
-// (seconds, true) on a hit and (0, false) on an unknown interval — caller
-// is responsible for deciding fallback behavior. Before this signature the
-// function silently defaulted unknown input to 3600s, masking typos like
-// '1minutes' as a one-hour bucket.
+// intervalPattern matches "<n><unit>" and "<n> <unit>", e.g. 30s, 2 minutes,
+// 500ms. Anchored, so anything with trailing junk is rejected rather than
+// silently truncated.
+var intervalPattern = regexp.MustCompile(`^(\d+)\s*([a-zA-Z]+)$`)
+
+// intervalToSeconds converts a DuckDB interval string to whole seconds.
+// Returns (seconds, true) on success and (0, false) when the input is not an
+// interval this plugin can bucket by.
+//
+// Parses the general `<n><unit>` grammar rather than consulting a fixed table.
+// The table form (added in 1.3.2) accepted only 13 literal strings, which
+// excluded most of what Grafana's own `$__interval` produces — 20s, 2m, 2h,
+// 3h, 2d are all routine — and an unlisted value left the whole
+// `$__timeGroup` macro unexpanded, so Arc received a literal `$` and failed to
+// parse. 1.2.0 accepted anything by silently defaulting to one hour, which
+// hid typos; parsing gets the coverage without the silence.
+//
+// Sub-second intervals (500ms) parse to 0 seconds and are rejected: epoch
+// division by zero is meaningless, and a sub-second bucket is not something
+// the epoch-seconds path can express.
 func intervalToSeconds(interval string) (int, bool) {
-	if secs, ok := intervalSecondsTable[strings.TrimSpace(interval)]; ok {
-		return secs, true
+	return parseIntervalGrammar(strings.TrimSpace(interval))
+}
+
+// parseIntervalGrammar parses the `<n><unit>` / `<n> <unit>` interval grammar.
+func parseIntervalGrammar(interval string) (int, bool) {
+	m := intervalPattern.FindStringSubmatch(interval)
+	if m == nil {
+		return 0, false
 	}
-	return 0, false
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	unit, ok := intervalUnitSeconds[strings.ToLower(m[2])]
+	if !ok {
+		return 0, false
+	}
+	// Bound before multiplying, so the product cannot overflow. A bucket wider
+	// than a month is never a useful time-series aggregation, and an absurd
+	// one (`9223372036854775807s`) would otherwise collapse every row into a
+	// single bucket at the epoch — a silently meaningless chart rather than an
+	// error.
+	const maxIntervalSeconds = 31 * 86400
+	if n > int64(maxIntervalSeconds) {
+		return 0, false
+	}
+	secs := int(n) * unit
+	if secs <= 0 || secs > maxIntervalSeconds {
+		return 0, false
+	}
+	return secs, true
 }
 
 // expandTimeGroup replaces $__timeGroup(column, interval) with epoch-based bucketing SQL.
 // DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
 // causing GROUP BY to produce per-second rows. Epoch math avoids this.
-// Column argument is validated against columnNameRe; unknown intervals and
+// Column argument is checked by validateColumnArg; unknown intervals and
 // arg-count mismatches are rejected (macro left un-expanded so Arc surfaces a
 // clear error) rather than silently defaulting.
 func expandTimeGroup(sql string) string {
@@ -852,10 +890,14 @@ func expandTimeGroup(sql string) string {
 			return "", false
 		}
 		if len(parts) > 2 {
-			// Extra args silently ignored before; now warn loudly.
-			log.DefaultLogger.Warn("$__timeGroup ignored extra arguments — expected $__timeGroup(column, interval)",
+			// Postgres and Timescale accept a third "fill" argument
+			// ($__timeGroup(time, '5m', 0)), so dashboards migrated from those
+			// datasources carry it. This plugin does not fill gaps — Grafana's
+			// own "Connect null values" / "Fill" panel options do — so the
+			// argument is ignored rather than rejected. Rejecting it (1.3.2)
+			// left the whole macro unexpanded and broke every migrated panel.
+			log.DefaultLogger.Debug("$__timeGroup ignoring extra arguments — this plugin does not fill gaps; use the panel's fill option",
 				"found", arg, "extra_count", len(parts)-2)
-			return "", false
 		}
 		column := strings.TrimSpace(parts[0])
 		if err := validateColumnArg(column); err != nil {
@@ -877,43 +919,142 @@ func expandTimeGroup(sql string) string {
 	})
 }
 
-// OptimizeTimeSeriesQuery adds ORDER BY time ASC if missing for better performance
-// This eliminates the need for in-memory sorting, reducing query overhead significantly
-// Inserts ORDER BY before LIMIT/OFFSET clauses to maintain valid SQL syntax
+// timeColumnRe matches a bare `time` column reference: the word "time" not
+// glued to another identifier character and not inside a double-quoted
+// identifier. `lifetime`, `runtime`, `timestamp` and `time_bucket` therefore
+// do NOT match, which is what made the previous substring check unusable — it
+// appended `ORDER BY time ASC` to queries whose only "time" was part of
+// another column name, sorting by a column that need not exist.
+var timeColumnRe = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_."])time($|[^A-Za-z0-9_."])`)
+
+// orderByRe matches an ORDER BY the query already has, allowing any run of
+// whitespace between the two words.
+var orderByRe = regexp.MustCompile(`(?i)\border\s+by\b`)
+
+// tailClauseRe matches a row-limiting clause an appended ORDER BY must
+// precede. FETCH is included so `FETCH FIRST n ROWS ONLY` is recognised and
+// the query declined, rather than having ORDER BY appended after it (a hard
+// parse error).
+//
+// A real clause is followed by its argument — a number, a parameter, or (for
+// FETCH) the word FIRST/NEXT. Requiring that excludes `SELECT time, limit FROM
+// t` and `SELECT time, "limit" FROM t`, where the word is a column name:
+// DuckDB accepts both, and treating either as a clause boundary splices the
+// ORDER BY into the middle of the select list. A LIMIT whose argument is
+// something else entirely (an expression, a template variable) simply does not
+// match, and the query is then declined rather than rewritten — the safe
+// direction.
+var tailClauseRe = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_."])(limit|offset)\s+(\d+|\$\w+|\?|:\w+)|(^|[^A-Za-z0-9_."])(fetch)\s+(first|next)\b`)
+
+// OptimizeTimeSeriesQuery appends `ORDER BY time ASC` to a time-series query
+// that does not already order its rows, so Grafana receives points in
+// chronological order without sorting them in memory.
+//
+// Only for `format: time_series` — a table panel must keep the row order the
+// author asked for (CLAUDE.md gotcha 6).
+//
+// Deliberately conservative, because this rewrites SQL the user wrote. A
+// missing sort renders a zig-zag line, which is merely ugly; a misplaced
+// ORDER BY either fails the query or, worse, silently changes WHICH ROWS a
+// LIMIT selects. This feature was disabled during the 1.3.2 hardening for
+// exactly that class of defect, so every ambiguous shape is declined:
+//
+//   - an existing ORDER BY, or no bare `time` column;
+//   - any parenthesis — a subquery or CTE can bind a trailing clause to the
+//     wrong SELECT, and inserting before a nested LIMIT changes which rows
+//     that LIMIT returns (a silent wrong answer, the worst outcome here);
+//   - a set operation or a multi-statement input;
+//   - `FETCH`, or more than one LIMIT/OFFSET token, or `limit`/`offset` used
+//     as an identifier — all cases where the insertion point is ambiguous;
+//   - a last line that opens a `--` comment, which would swallow the clause.
 func OptimizeTimeSeriesQuery(sql string) string {
-	sqlLower := strings.ToLower(strings.TrimSpace(sql))
-
-	// Check if ORDER BY is already present
-	if strings.Contains(sqlLower, "order by") {
+	trimmed := strings.TrimRight(sql, " \t\n\r;")
+	if trimmed == "" {
 		return sql
 	}
+	return optimizeTimeSeriesQuery(trimmed, newStrippedSQL(trimmed), sql)
+}
 
-	// Check if this looks like a time series query (contains 'time' column)
-	if !strings.Contains(sqlLower, "time") {
-		return sql
+// optimizeTimeSeriesQuery is the implementation, taking a strippedSQL the
+// caller may already have computed. `original` is returned unchanged whenever
+// the rewrite is declined, so the caller's exact input survives.
+//
+// Every keyword test is gated behind a cheap `strings.Contains` on the
+// uppercased view: a `(?i)` regex cannot use Go's literal-prefix scan, so a
+// MISS costs a full NFA walk of the query (~40µs on 4KB) — and a miss is the
+// common case here, since most queries have neither ORDER BY nor LIMIT.
+func optimizeTimeSeriesQuery(trimmed string, stripped strippedSQL, original string) string {
+	if strings.Contains(stripped.upper, "ORDER") && orderByRe.MatchString(stripped.stripped) {
+		return original
+	}
+	if !strings.Contains(stripped.upper, "TIME") || !timeColumnRe.MatchString(stripped.stripped) {
+		return original
+	}
+	// Blunt on purpose: distinguishing a safe parenthesis from one that nests
+	// a LIMIT is more machinery than this optimisation is worth.
+	if strings.ContainsAny(stripped.stripped, "();") || containsUnion(stripped) {
+		return original
 	}
 
-	// Find LIMIT or OFFSET clause position
-	sql = strings.TrimRight(sql, " \t\n\r;")
-
-	// Find the position where we should insert ORDER BY
-	// ORDER BY must come before LIMIT/OFFSET
-	limitPos := strings.LastIndex(sqlLower, " limit ")
-	offsetPos := strings.LastIndex(sqlLower, " offset ")
-
-	insertPos := len(sql) // Default: end of query
-
-	if limitPos != -1 && (offsetPos == -1 || limitPos < offsetPos) {
-		insertPos = limitPos
-	} else if offsetPos != -1 {
-		insertPos = offsetPos
+	var matches [][]int
+	if strings.Contains(stripped.upper, "LIMIT") ||
+		strings.Contains(stripped.upper, "OFFSET") ||
+		strings.Contains(stripped.upper, "FETCH") {
+		matches = tailClauseRe.FindAllStringIndex(stripped.stripped, -1)
+	}
+	switch {
+	case len(matches) > 1:
+		return original
+	case len(matches) == 1 && strings.Contains(strings.ToUpper(stripped.stripped[matches[0][0]:matches[0][1]]), "FETCH"):
+		return original
+	case len(matches) == 0:
+		if endsInLineComment(trimmed) {
+			return original
+		}
+		return trimmed + " ORDER BY time ASC"
 	}
 
-	// Insert ORDER BY at the correct position
-	if insertPos < len(sql) {
-		return sql[:insertPos] + " ORDER BY time ASC" + sql[insertPos:]
+	// Exactly one LIMIT/OFFSET. Stripping removes literal bodies, so stripped
+	// offsets do not map onto the original — find it again there, and require
+	// the same single unambiguous match.
+	origMatches := tailClauseRe.FindAllStringIndex(trimmed, -1)
+	if len(origMatches) != 1 {
+		return original
 	}
+	// The match may include a leading separator character; cut at the keyword
+	// itself so the separator stays with the head.
+	at := origMatches[0][0]
+	for at < len(trimmed) && !isASCIILetter(trimmed[at]) {
+		at++
+	}
+	head := strings.TrimRight(trimmed[:at], " \t\n\r")
+	if endsInLineComment(head) {
+		return original
+	}
+	return head + " ORDER BY time ASC " + strings.TrimSpace(trimmed[at:])
+}
 
-	// No LIMIT/OFFSET, add at end
-	return sql + " ORDER BY time ASC"
+// isASCIILetter reports whether b is an unaccented ASCII letter.
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// endsInLineComment reports whether the last line of sql opens a `--` comment
+// with no newline after it, so appended text would be commented out.
+func endsInLineComment(sql string) bool {
+	lastLine := sql[strings.LastIndexByte(sql, '\n')+1:]
+	inLiteral := false
+	for i := 0; i < len(lastLine); i++ {
+		switch {
+		case lastLine[i] == '\'':
+			if inLiteral && i+1 < len(lastLine) && lastLine[i+1] == '\'' {
+				i++ // escaped quote inside a literal
+				continue
+			}
+			inLiteral = !inLiteral
+		case !inLiteral && lastLine[i] == '-' && i+1 < len(lastLine) && lastLine[i+1] == '-':
+			return true
+		}
+	}
+	return false
 }

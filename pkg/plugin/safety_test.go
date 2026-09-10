@@ -9,6 +9,11 @@ import (
 	"testing"
 )
 
+// TestValidateColumnArg: the guard rejects characters that would let the
+// argument break out of the SQL the macro generates, and accepts everything
+// else. 1.3.2 required a bare identifier, which rejected ordinary DuckDB
+// column expressions and left the macro unexpanded — Arc then received a
+// literal `$__timeFilter(...)` and failed to parse.
 func TestValidateColumnArg(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -19,13 +24,23 @@ func TestValidateColumnArg(t *testing.T) {
 		{"qualified", "events.time", false},
 		{"underscored", "_time", false},
 		{"camel", "createdAt", false},
+		// Valid DuckDB column expressions that 1.3.2 rejected.
+		{"quoted identifier", `"time"`, false},
+		{"qualified quoted identifier", `t."time"`, false},
+		{"cast", "time::TIMESTAMP", false},
+		{"function call", "epoch_ms(time)", false},
+		{"unicode column name", "τime", false},
+		{"spaced expression", "time col", false},
+		// Still rejected: anything that could terminate or comment out the
+		// surrounding generated SQL.
 		{"empty", "", true},
-		{"space", "time col", true},
+		{"whitespace only", "   ", true},
 		{"injection", "time) OR 1=1 --", true},
 		{"semicolon", "time;DROP", true},
 		{"quote", "time'", true},
-		{"paren", "time(x)", true},
-		{"unicode", "τime", true},
+		{"double quote alone is a quoted identifier, not a threat", `time"x`, false},
+		{"a single quote is, since the macro emits '<timestamp>' literals", `time" OR '1'='1`, true},
+		{"block comment", "time/*x*/", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateColumnArg(tc.input)
@@ -322,5 +337,71 @@ func TestIsLoopbackURL(t *testing.T) {
 				t.Errorf("isLoopbackURL(%q) = %v, want %v", tc.input, got, tc.loopback)
 			}
 		})
+	}
+}
+
+// TestSanitizeUserError_PassesThroughClientErrors: a 4xx from Arc is a verdict
+// on the SQL the dashboard author just wrote — a parser error, an unknown
+// column, a missing table. Hiding it behind "see server logs" makes a mistake
+// that is fixable in the editor require access to the Grafana server log,
+// which is what made the 1.3.x regression so slow to diagnose. 5xx describes
+// the server's internals and stays summarised.
+func TestSanitizeUserError_PassesThroughClientErrors(t *testing.T) {
+	// Arc reports a DuckDB parser error as HTTP 500, so classification is by
+	// DuckDB error TYPE, not by status.
+	for _, msg := range []string{
+		`Arc error (HTTP 500): arrow query failed: Parser Error: syntax error at or near "h01"`,
+		`Arc error (HTTP 500): Syntax Error: unexpected token`,
+	} {
+		got := sanitizeUserError("A", errors.New(msg))
+		if got != msg {
+			t.Errorf("a user-fixable SQL error should reach the panel verbatim:\n got %q\nwant %q", got, msg)
+		}
+	}
+
+	// Everything else stays summarised. Verified against DuckDB 1.4.3: each of
+	// these error types emits something the viewer never referenced —
+	// candidate column names, a table name, or an actual row value.
+	for _, msg := range []string{
+		"Arc error (HTTP 500): internal storage failure at /var/lib/arc/hot/x.parquet",
+		"Arc error (HTTP 503): upstream unavailable",
+		"Arc error (HTTP 500): Catalog Error: Table with name 'secret_prices' does not exist!",
+		`Arc error (HTTP 500): Binder Error: Referenced column "x" not found in FROM clause! Candidate bindings: "secret_salary"`,
+		"Arc error (HTTP 500): Conversion Error: Could not convert string 'secret-value-xyz' to INT32",
+	} {
+		got := sanitizeUserError("A", errors.New(msg))
+		if strings.Contains(got, "/var/lib") || strings.Contains(got, "upstream") ||
+			strings.Contains(got, "secret_prices") || strings.Contains(got, "secret_salary") ||
+			strings.Contains(got, "secret-value-xyz") {
+			t.Errorf("server detail leaked: %q", got)
+		}
+		if !strings.Contains(got, "see server logs") {
+			t.Errorf("expected a summarised message, got %q", got)
+		}
+	}
+}
+
+func TestIsUserFixableArcError(t *testing.T) {
+	cases := []struct {
+		msg string
+		ok  bool
+	}{
+		{"Arc error (HTTP 500): Parser Error: syntax error", true},
+		{"Arc error (HTTP 500): Syntax Error: unexpected token", true},
+		{"Arc error (HTTP 500): Binder Error: column not found", false},
+		{"Arc error (HTTP 500): Catalog Error: Table missing", false},
+		{"Arc error (HTTP 500): Conversion Error: bad cast", false},
+		{"Arc error (HTTP 500): IO Error: /var/lib/arc/x.parquet missing", false},
+		{"Arc error (HTTP 503): upstream unavailable", false},
+		{"Arc error (HTTP 500): out of memory", false},
+		{"Arc error (HTTP 500): arrow query failed: Parser Error: syntax error", true},
+		// A composite diagnostic must NOT pass through: the internal half
+		// would ride along with the user-fixable half.
+		{"Arc error (HTTP 500): Internal Error: disk at /var/lib/arc. Parser Error: x", false},
+	}
+	for _, c := range cases {
+		if ok := isUserFixableArcError(c.msg); ok != c.ok {
+			t.Errorf("isUserFixableArcError(%q) = %v, want %v", c.msg, ok, c.ok)
+		}
 	}
 }

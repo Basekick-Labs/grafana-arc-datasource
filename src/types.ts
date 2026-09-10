@@ -24,7 +24,14 @@ export interface ArcDataSourceOptions extends DataSourceJsonData {
    * protocol changes so a plugin downgrade still honors the selection.
    */
   useArrow?: boolean;
+  /** Max parallel chunks WITHIN one split query. Default 4. */
   maxConcurrency?: number;
+  /**
+   * Max simultaneous Arc requests for this datasource, across every panel and
+   * viewer. Default 32. Distinct from maxConcurrency, which shapes a single
+   * query's fan-out; this one protects Arc and the plugin process.
+   */
+  maxInFlight?: number;
   /**
    * Per-response body size cap in MiB. Default 1024 MiB. Defense-in-depth
    * against runaway queries that would OOM the plugin process. Raise this
@@ -34,17 +41,18 @@ export interface ArcDataSourceOptions extends DataSourceJsonData {
   maxResponseMB?: number;
   /**
    * Permit the configured Arc URL to resolve to a private/RFC1918 address.
-   * Off by default — the SSRF guard blocks private ranges to protect Grafana
-   * installs where datasource creators are not fully trusted. Enable when
-   * Arc is deployed on an internal corporate network.
+   * On by default: self-hosted Arc usually runs on a private network or a
+   * Docker service name. Turn it off to require a public address, on installs
+   * where datasource creators are not fully trusted. Link-local and
+   * cloud-metadata addresses are blocked either way.
    */
   allowPrivateIPs?: boolean;
   /**
-   * Permit per-query `database` field to override the datasource default.
-   * Off by default — without this, a dashboard editor could switch databases
-   * on a datasource the admin configured for a single tenant (confused-deputy
-   * if the Arc API key has cross-database scope). Enable only when the API
-   * key's authorization scope matches the dashboard-editor's authorization.
+   * Permit a per-query `database` field to override the datasource default.
+   * On by default, matching the per-query override this plugin has supported
+   * since 1.1.0. Turn it off when the Arc API key spans more databases than
+   * dashboard editors should reach, since an editor could otherwise point a
+   * panel at a database the admin did not configure.
    */
   allowDatabaseOverride?: boolean;
 }

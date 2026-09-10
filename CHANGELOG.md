@@ -11,6 +11,36 @@ Ships as **1.4.0**, together with the datasource-default restorations tracked
 in issue #12. Versions are bumped once, in the release PR, so `package.json`
 and `plugin.json` cannot drift apart across review rounds.
 
+### Changed
+- Several defaults introduced by the 1.3.2 hardening are restored to what
+  1.2.0 did, because they rejected input that had been valid. Each is still
+  configurable; only the default changed.
+
+  - **Private/RFC1918 Arc URLs are permitted again.** Self-hosted Arc usually
+    runs on a private network or a Docker service name like
+    `http://arc:8000`, and blocking those by default meant the datasource
+    could not connect at all. An explicit "Allow Private IPs" setting is still
+    honoured; link-local and cloud-metadata addresses remain blocked.
+  - **The per-query database override works again** without first enabling a
+    toggle. It has been an advertised feature since 1.1.0.
+  - **A datasource with no protocol recorded resolves to JSON**, as in 1.2.0.
+    Resolving it to Arrow broke `SHOW DATABASES` / `SHOW TABLES` variable
+    queries, which Arc's Arrow endpoint rejects, and changed column type
+    inference. New datasources still default to Arrow.
+  - **`$__timeGroup` accepts any `<n><unit>` interval**, not 13 fixed strings.
+    Grafana's own `$__interval` routinely produces `20s`, `2m` and `2h`, none
+    of which were accepted, so the macro was left unexpanded and Arc received
+    a literal `$`.
+  - **Macro column arguments accept expressions**: `"time"`, `t."time"`,
+    `time::TIMESTAMP`, a function call, a non-ASCII name. Only characters that
+    could break out of the generated SQL are refused.
+  - **`$__timeGroup` tolerates the Postgres/Timescale fill argument** instead
+    of rejecting the whole macro, so migrated dashboards keep working.
+  - **Concurrency is two settings.** "Max Concurrency" (default 4) shapes one
+    query's chunk fan-out; the new "Max In Flight" (default 32) bounds the
+    datasource across all panels. Using one number for both meant a 12-panel
+    dashboard served requests four at a time.
+
 ### Fixed
 - Template variables are interpolated by Grafana's own rule again: a value is
   quoted only when the variable is multi-value or has an "Include All" option,
@@ -46,6 +76,30 @@ and `plugin.json` cannot drift apart across review rounds.
 - A multi-value variable with nothing selected now interpolates as `NULL`
   instead of an empty string, so `WHERE host IN ($hosts)` degrades to a query
   matching no rows rather than `IN ()`, a parser error.
+
+- Query splitting no longer runs on queries it cannot safely split. A query
+  that buckets with `$__timeGroup` but takes its range from a literal `WHERE`
+  was split into chunks that each re-ran the same unfiltered query, so every
+  row came back once per chunk and every total was inflated. Splitting now
+  requires `$__timeFilter`, or both `$__timeFrom()` and `$__timeTo()`.
+- `ORDER BY time ASC` is added again for time-series queries that lack one. It
+  was advertised in 1.1.0 and silently disabled in 1.3.2 because it matched
+  "time" as a substring, rewriting queries whose only "time" was inside
+  `lifetime` or `timestamp`. Table-format queries keep the author's row order.
+- DuckDB parser and syntax errors reach the panel again instead of "query
+  failed (see server logs for detail)". They quote the author's own SQL back
+  at them, so hiding them meant reading the server log to find a mistake that
+  was fixable in the editor. Every other DuckDB error type stays summarised:
+  catalog errors name tables, binder errors append a list of candidate column
+  names, and conversion errors echo an actual row value, none of which a
+  dashboard viewer should learn from a failed panel. The failing SQL is now on
+  the error-level log line for operators.
+- `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` are honoured again; the custom
+  transport added in 1.3.2 ignored them, so Grafana behind an egress proxy
+  could not reach a cloud-hosted Arc. Idle connections are also kept for five
+  minutes rather than 90 seconds, so a refreshing dashboard stops re-dialling.
+- A query chunk dropped for a schema mismatch now raises a panel notice rather
+  than silently returning a partial series.
 
 ### Note on 1.3.3 - 1.3.11
 Those releases were withdrawn. They attempted to patch the regression above

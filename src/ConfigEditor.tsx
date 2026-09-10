@@ -23,8 +23,23 @@ export function ConfigEditor(props: Props) {
   const { jsonData, secureJsonFields, secureJsonData } = options;
   const styles = useStyles2(getStyles);
 
+  // True only for a datasource that has never been configured: no URL, and
+  // neither protocol key. Used to decide whether a default should be stamped
+  // in (new) or inherited from 1.2.x behaviour (existing).
+  const isNewDatasource = !jsonData.url && jsonData.protocol === undefined && jsonData.useArrow === undefined;
+
   const onURLChange = (event: ChangeEvent<HTMLInputElement>) => {
-    onOptionsChange({ ...options, jsonData: { ...jsonData, url: event.target.value } });
+    // Stamp the protocol on a brand-new datasource as soon as it gains a URL.
+    // Without this, a datasource created without touching the Protocol radio
+    // would save no `protocol` key, and the backend would then resolve it as a
+    // pre-1.3 instance and fall back to JSON — the opposite of what the editor
+    // displayed. Existing datasources keep whatever they already have.
+    const next = { ...jsonData, url: event.target.value };
+    if (isNewDatasource) {
+      next.protocol = 'arrow';
+      next.useArrow = true;
+    }
+    onOptionsChange({ ...options, jsonData: next });
   };
 
   const onDatabaseChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -41,7 +56,7 @@ export function ConfigEditor(props: Props) {
   // onBlur: clamp to the field's minimum + apply the default if the
   //   user left the input empty or below 1. Persists the final value.
   const handleNumericChange =
-    (key: 'timeout' | 'maxConcurrency' | 'maxResponseMB') =>
+    (key: 'timeout' | 'maxConcurrency' | 'maxResponseMB' | 'maxInFlight') =>
     (event: ChangeEvent<HTMLInputElement>) => {
       const parsed = parseInt(event.target.value, 10);
       const next = isNaN(parsed) ? undefined : parsed;
@@ -49,7 +64,7 @@ export function ConfigEditor(props: Props) {
     };
 
   const handleNumericBlur =
-    (key: 'timeout' | 'maxConcurrency' | 'maxResponseMB', fallback: number) =>
+    (key: 'timeout' | 'maxConcurrency' | 'maxResponseMB' | 'maxInFlight', fallback: number) =>
     () => {
       const current = jsonData[key];
       if (current === undefined || current === null || current < 1) {
@@ -61,14 +76,22 @@ export function ConfigEditor(props: Props) {
   const onTimeoutBlur = handleNumericBlur('timeout', 30);
   const onMaxConcurrencyChange = handleNumericChange('maxConcurrency');
   const onMaxConcurrencyBlur = handleNumericBlur('maxConcurrency', 4);
+  const onMaxInFlightChange = handleNumericChange('maxInFlight');
+  const onMaxInFlightBlur = handleNumericBlur('maxInFlight', 32);
   const onMaxResponseMBChange = handleNumericChange('maxResponseMB');
   const onMaxResponseMBBlur = handleNumericBlur('maxResponseMB', 1024);
 
   // Resolve the effective protocol the same way the backend does: explicit
-  // `protocol` wins; otherwise the legacy useArrow toggle (false meant JSON).
+  // `protocol` wins; otherwise the legacy `useArrow` toggle, where anything
+  // but an explicit true means JSON — that was 1.2.0's behaviour, since
+  // UseArrow was a plain bool defaulting to false.
+  //
+  // A brand-new datasource has neither key and no URL yet, and should start on
+  // Arrow (the fastest protocol) rather than inheriting the legacy fallback.
   // `||` rather than `??` so a provisioned empty string also falls through
-  // to the legacy resolution instead of leaving no radio selected.
-  const effectiveProtocol: ArcProtocol = jsonData.protocol || (jsonData.useArrow === false ? 'json' : 'arrow');
+  // instead of leaving no radio selected.
+  const effectiveProtocol: ArcProtocol =
+    jsonData.protocol || (isNewDatasource || jsonData.useArrow === true ? 'arrow' : 'json');
 
   const onProtocolChange = (value: ArcProtocol) => {
     // Also write the legacy useArrow toggle so a plugin downgrade keeps the
@@ -154,7 +177,7 @@ export function ConfigEditor(props: Props) {
       <InlineField
         label="Max Concurrency"
         labelWidth={LABEL_WIDTH}
-        tooltip="Maximum parallel chunks for query splitting. Each Grafana panel can spawn up to this many concurrent Arc requests. Lower values reduce Arc load in multi-user deployments."
+        tooltip="Maximum parallel chunks within a single split query. Bounded by Max In Flight."
       >
         <Input
           width={INPUT_WIDTH}
@@ -163,6 +186,21 @@ export function ConfigEditor(props: Props) {
           placeholder="4"
           onChange={onMaxConcurrencyChange}
           onBlur={onMaxConcurrencyBlur}
+        />
+      </InlineField>
+
+      <InlineField
+        label="Max In Flight"
+        labelWidth={LABEL_WIDTH}
+        tooltip="Maximum simultaneous Arc requests for this datasource, across every panel and viewer. Lower it to reduce load on Arc; raise it if a busy dashboard's panels queue behind each other."
+      >
+        <Input
+          width={INPUT_WIDTH}
+          type="number"
+          value={jsonData.maxInFlight ?? ''}
+          placeholder="32"
+          onChange={onMaxInFlightChange}
+          onBlur={onMaxInFlightBlur}
         />
       </InlineField>
 
@@ -192,20 +230,20 @@ export function ConfigEditor(props: Props) {
       <InlineField
         label="Allow Private IPs"
         labelWidth={LABEL_WIDTH}
-        tooltip="Permit the Arc URL to resolve to private/RFC1918 addresses (e.g. 10.x, 192.168.x). Off by default — enable when Arc is deployed on an internal corporate network. Loopback (localhost) is always permitted when configured directly."
+        tooltip="Permit the Arc URL to resolve to private/RFC1918 addresses (e.g. 10.x, 192.168.x, or a Docker service name). On by default, since self-hosted Arc usually runs on a private network. Turn it off to require a public address. Link-local and cloud-metadata addresses are always blocked."
       >
         <div className={styles.switchCell}>
-          <Switch value={jsonData.allowPrivateIPs ?? false} onChange={onAllowPrivateIPsChange} />
+          <Switch value={jsonData.allowPrivateIPs ?? true} onChange={onAllowPrivateIPsChange} />
         </div>
       </InlineField>
 
       <InlineField
         label="Allow Database Override"
         labelWidth={LABEL_WIDTH}
-        tooltip="Permit per-query 'database' field to override this datasource's default database. Off by default — without this, a dashboard editor could switch databases on a datasource configured for a single tenant. Enable only if the API key's authorization scope matches dashboard-editor permissions."
+        tooltip="Permit a per-query 'database' field to override this datasource's default. On by default, matching the per-query override this plugin has supported since 1.1.0. Turn it off when the API key spans more databases than dashboard editors should reach."
       >
         <div className={styles.switchCell}>
-          <Switch value={jsonData.allowDatabaseOverride ?? false} onChange={onAllowDatabaseOverrideChange} />
+          <Switch value={jsonData.allowDatabaseOverride ?? true} onChange={onAllowDatabaseOverrideChange} />
         </div>
       </InlineField>
     </div>

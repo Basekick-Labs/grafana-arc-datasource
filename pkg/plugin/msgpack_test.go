@@ -484,6 +484,14 @@ func TestQueryMsgpack_ServerErrorSurfaced(t *testing.T) {
 	}
 }
 
+// TestNewArcInstance_ProtocolResolution pins the legacy-datasource fallback.
+//
+// On 1.2.0 `UseArrow` was a plain bool, so a datasource whose jsonData had no
+// `useArrow` key ran the JSON path. 1.3.2 resolved that same datasource to
+// Arrow, which broke `SHOW DATABASES` / `SHOW TABLES` variable queries (Arc's
+// Arrow endpoint rejects them) and changed column type inference. Datasources
+// created from 1.4.0 on carry an explicit `protocol`, so this fallback only
+// applies to instances created before the selector existed.
 func TestNewArcInstance_ProtocolResolution(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -491,7 +499,7 @@ func TestNewArcInstance_ProtocolResolution(t *testing.T) {
 		want     string
 		wantErr  bool
 	}{
-		{name: "default is arrow", settings: map[string]any{}, want: ProtocolArrow},
+		{name: "absent keys fall back to json, as in 1.2.0", settings: map[string]any{}, want: ProtocolJSON},
 		{name: "explicit msgpack", settings: map[string]any{"protocol": "msgpack"}, want: ProtocolMsgpack},
 		{name: "explicit json", settings: map[string]any{"protocol": "json"}, want: ProtocolJSON},
 		{name: "legacy useArrow false maps to json", settings: map[string]any{"useArrow": false}, want: ProtocolJSON},
