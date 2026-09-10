@@ -33,6 +33,10 @@ export default defineConfig([
       'playwright/.auth/',
       '**/.idea',
       '**/.eslintcache',
+      // Local-only verification stack: holds unpacked release bundles
+      // (minified JS) that are not this repo's source. Untracked, but eslint
+      // walks the working directory, not the index.
+      'devstack-local/',
     ],
   },
   ...baseConfig,

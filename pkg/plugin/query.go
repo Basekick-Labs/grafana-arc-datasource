@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -395,6 +396,22 @@ func calculateInterval(duration time.Duration) string {
 	}
 }
 
+// intervalMilliseconds returns the same bucket calculateInterval picks, in
+// milliseconds, for `$__interval_ms`. Derived from one shared switch so the
+// two macros can never disagree about the bucket size for a given range.
+func intervalMilliseconds(duration time.Duration) int64 {
+	switch {
+	case duration > 7*24*time.Hour:
+		return time.Hour.Milliseconds()
+	case duration > 24*time.Hour:
+		return (10 * time.Minute).Milliseconds()
+	case duration > 6*time.Hour:
+		return time.Minute.Milliseconds()
+	default:
+		return (10 * time.Second).Milliseconds()
+	}
+}
+
 // replaceMacroOccurrences walks `sql` once and rewrites every occurrence of
 // `macro` that lives outside string literals and comments. For each in-scope
 // occurrence the inner argument (between the macro's opening paren and the
@@ -631,7 +648,22 @@ func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuratio
 	sql = expandTimeFilter(sql, filterFrom, filterTo)
 	sql = replaceLiteralAwareTokens(sql, "$__timeFrom()", fmt.Sprintf("'%s'", filterFrom.Format(time.RFC3339)))
 	sql = replaceLiteralAwareTokens(sql, "$__timeTo()", fmt.Sprintf("'%s'", filterTo.Format(time.RFC3339)))
-	sql = replaceLiteralAwareTokens(sql, "$__interval", calculateInterval(intervalDuration))
+	// $__interval_ms must be replaced BEFORE $__interval: it has the shorter
+	// token as a prefix, so replacing $__interval first would rewrite
+	// `$__interval_ms` into `10 minutes_ms`. Only backend-only paths (alerting,
+	// recorded queries) ever see these raw — the frontend substitutes both
+	// before the query reaches us.
+	sql = strings.ReplaceAll(sql, "$__interval_ms",
+		strconv.FormatInt(intervalMilliseconds(intervalDuration), 10))
+	// Unlike the parenthesised macros, $__interval expands INSIDE string
+	// literals. Its documented use — here and in the Postgres, MySQL and
+	// Timescale datasources — is inside quotes: `time_bucket('$__interval', t)`
+	// and `INTERVAL '$__interval'`. Literal-skipping would leave the token
+	// unexpanded and hand DuckDB the string "$__interval", which fails with
+	// `Conversion Error: Could not convert string '$__interval' to INTERVAL`.
+	// A bare interval like "10 minutes" cannot break out of the quotes it
+	// lands in, so expanding inside literals is safe here.
+	sql = strings.ReplaceAll(sql, "$__interval", calculateInterval(intervalDuration))
 	// $__timeGroup(column, interval) -> epoch-based bucketing
 	// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
 	// causing GROUP BY to produce per-second rows. Epoch math avoids this.

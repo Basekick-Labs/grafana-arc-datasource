@@ -1139,12 +1139,14 @@ func TestContainsUnion_WhitespaceFlavors(t *testing.T) {
 	}
 }
 
-// TestApplyMacros_AllZeroArgMacrosLiteralSafe locks in R2-CR5: every macro
-// MUST be skipped when inside a string literal — not just $__timeFilter.
-// The previous fix only routed $__timeFilter through the literal-aware
-// walker; $__timeFrom(), $__timeTo(), and $__interval still used
-// strings.ReplaceAll which mangled literal content.
-func TestApplyMacros_AllZeroArgMacrosLiteralSafe(t *testing.T) {
+// TestApplyMacros_ParenthesisedMacrosLiteralSafe locks in R2-CR5 for the
+// macros whose expansions are self-quoting: $__timeFrom(), $__timeTo(),
+// $__timeFilter() and $__timeGroup() must be skipped inside a string literal,
+// so prose like `WHERE msg = 'see $__timeFrom() docs'` survives intact.
+//
+// $__interval is deliberately NOT in this list — see
+// TestApplyMacros_IntervalExpandsInsideLiteral for why.
+func TestApplyMacros_ParenthesisedMacrosLiteralSafe(t *testing.T) {
 	tr := backend.TimeRange{
 		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
@@ -1158,7 +1160,6 @@ func TestApplyMacros_AllZeroArgMacrosLiteralSafe(t *testing.T) {
 	}{
 		{"timeFrom in literal", "WHERE msg = 'see $__timeFrom() docs'", "'see $__timeFrom() docs'"},
 		{"timeTo in literal", "WHERE msg = 'see $__timeTo() docs'", "'see $__timeTo() docs'"},
-		{"interval in literal", "WHERE msg = 'bucket $__interval here'", "'bucket $__interval here'"},
 		{"timeFilter in literal", "WHERE msg = 'has $__timeFilter(time)'", "'has $__timeFilter(time)'"},
 		{"timeGroup in literal", "WHERE msg = 'has $__timeGroup(time, ''1h'')'", "'has $__timeGroup(time, ''1h'')'"},
 	}
@@ -1296,3 +1297,89 @@ func expect(t *testing.T, got, want time.Time, label string) {
 	}
 }
 
+
+// TestApplyMacros_IntervalExpandsInsideLiteral is the deliberate exception to
+// the literal-skipping rule proven by TestApplyMacros_ParenthesisedMacrosLiteralSafe.
+//
+// Unlike the parenthesised macros, whose expansions are self-quoting, the
+// documented use of $__interval — here and in the Postgres, MySQL and
+// Timescale datasources — is INSIDE quotes:
+//
+//	time_bucket('$__interval', time)
+//	time_bucket(INTERVAL '$__interval', time)
+//
+// 16 panels of the production "System Monitoring ARC v2" dashboard use one of
+// those two forms. Skipping literals leaves the token unexpanded and DuckDB
+// fails with `Conversion Error: Could not convert string '$__interval' to
+// INTERVAL` (reproduced against live Arc, 2026-09-10). Only backend-only paths
+// (alerting, recorded queries) reach this code with the token intact; the
+// frontend substitutes it for panel queries.
+func TestApplyMacros_IntervalExpandsInsideLiteral(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	cases := []struct {
+		name string
+		sql  string
+	}{
+		{"bare quotes", "SELECT time_bucket('$__interval', time) FROM t"},
+		{"INTERVAL keyword", "SELECT time_bucket(INTERVAL '$__interval', time) FROM t"},
+		{"outside a literal", "SELECT $__interval FROM t"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			result := ApplyMacros(c.sql, tr)
+			if strings.Contains(result, "$__interval") {
+				t.Errorf("$__interval was not expanded: %s", result)
+			}
+			if !strings.Contains(result, "10 seconds") {
+				t.Errorf("expected the calculated interval in: %s", result)
+			}
+		})
+	}
+}
+
+// TestApplyMacros_IntervalMsNotClobbered guards the replacement ORDER.
+// "$__interval" is a prefix of "$__interval_ms", so replacing the shorter
+// token first rewrites `$__interval_ms` into `10 seconds_ms` — valid-looking
+// output that fails at the database.
+func TestApplyMacros_IntervalMsNotClobbered(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
+	result := ApplyMacros("SELECT $__interval_ms AS ms, '$__interval' AS txt FROM t", tr)
+	if strings.Contains(result, "_ms") {
+		t.Errorf("$__interval_ms was clobbered by the $__interval replacement: %s", result)
+	}
+	if !strings.Contains(result, "10000") {
+		t.Errorf("expected $__interval_ms to expand to 10000 (10s): %s", result)
+	}
+	if !strings.Contains(result, "'10 seconds'") {
+		t.Errorf("expected $__interval to expand inside the literal: %s", result)
+	}
+}
+
+// TestIntervalMillisecondsMatchesCalculateInterval keeps the two macros
+// consistent: $__interval_ms must be the same bucket as $__interval, in ms.
+func TestIntervalMillisecondsMatchesCalculateInterval(t *testing.T) {
+	cases := []struct {
+		duration time.Duration
+		text     string
+		ms       int64
+	}{
+		{30 * time.Minute, "10 seconds", 10000},
+		{8 * time.Hour, "1 minute", 60000},
+		{48 * time.Hour, "10 minutes", 600000},
+		{30 * 24 * time.Hour, "1 hour", 3600000},
+	}
+	for _, c := range cases {
+		if got := calculateInterval(c.duration); got != c.text {
+			t.Errorf("calculateInterval(%s) = %q, want %q", c.duration, got, c.text)
+		}
+		if got := intervalMilliseconds(c.duration); got != c.ms {
+			t.Errorf("intervalMilliseconds(%s) = %d, want %d", c.duration, got, c.ms)
+		}
+	}
+}
