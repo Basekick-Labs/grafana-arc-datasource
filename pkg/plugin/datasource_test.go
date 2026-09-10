@@ -415,8 +415,8 @@ func TestContainsLIMIT(t *testing.T) {
 		{"SELECT * FROM t Limit 10", true},
 		{"SELECT * FROM t WHERE x > 1", false},
 		{"SELECT * FROM t ORDER BY time", false},
-		{"SELECT limited FROM t", false},                            // "limited" is not " LIMIT "
-		{"SELECT * FROM t WHERE name = 'THE LIMIT 10'", false},      // LIMIT inside string literal
+		{"SELECT limited FROM t", false},                                // "limited" is not " LIMIT "
+		{"SELECT * FROM t WHERE name = 'THE LIMIT 10'", false},          // LIMIT inside string literal
 		{"SELECT * FROM t WHERE desc = 'NO LIMIT ' ORDER BY id", false}, // LIMIT inside string literal with trailing space
 	}
 	for _, c := range cases {
@@ -624,10 +624,10 @@ func TestApplyMacros_Interval(t *testing.T) {
 		hours    int
 		expected string
 	}{
-		{2, "10 seconds"},    // < 6h
-		{12, "1 minute"},     // > 6h, < 24h
-		{48, "10 minutes"},   // > 24h, < 7d
-		{200, "1 hour"},      // > 7d
+		{2, "10 seconds"},  // < 6h
+		{12, "1 minute"},   // > 6h, < 24h
+		{48, "10 minutes"}, // > 24h, < 7d
+		{200, "1 hour"},    // > 7d
 	}
 	for _, c := range cases {
 		tr := backend.TimeRange{
@@ -1020,9 +1020,9 @@ func TestContainsLIMIT_WhitespaceFlavors(t *testing.T) {
 		"SELECT * FROM t\tLIMIT 10",
 		"SELECT * FROM t WHERE x=1\n  LIMIT 10",
 		// Argument variations (gemini 3244824396)
-		"SELECT * FROM t LIMIT $limit",         // Grafana template variable
-		"SELECT * FROM t LIMIT ?",              // DuckDB positional param
-		"SELECT * FROM t LIMIT :n",             // DuckDB named param
+		"SELECT * FROM t LIMIT $limit", // Grafana template variable
+		"SELECT * FROM t LIMIT ?",      // DuckDB positional param
+		"SELECT * FROM t LIMIT :n",     // DuckDB named param
 		"SELECT * FROM t LIMIT (SELECT max(n) FROM cap)",
 	} {
 		if !containsLIMIT(newStrippedSQL(sql)) {
@@ -1033,7 +1033,7 @@ func TestContainsLIMIT_WhitespaceFlavors(t *testing.T) {
 		"SELECT * FROM t",
 		"SELECT limited FROM t",
 		"SELECT * FROM t WHERE name = 'NO LIMIT'",
-		"SELECT * FROM t -- LIMIT 10",          // commented out
+		"SELECT * FROM t -- LIMIT 10", // commented out
 	} {
 		if containsLIMIT(newStrippedSQL(sql)) {
 			t.Errorf("unexpected LIMIT match for: %q", sql)

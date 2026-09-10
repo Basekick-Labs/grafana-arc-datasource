@@ -95,18 +95,18 @@ func TestIsBlockedIP_Strict(t *testing.T) {
 		blocked bool
 	}{
 		// Should be blocked when allowPrivate=false
-		{"127.0.0.1", true},      // loopback
-		{"::1", true},            // loopback v6
-		{"10.0.0.1", true},       // RFC1918
-		{"172.16.0.1", true},     // RFC1918
-		{"192.168.1.1", true},    // RFC1918
+		{"127.0.0.1", true},       // loopback
+		{"::1", true},             // loopback v6
+		{"10.0.0.1", true},        // RFC1918
+		{"172.16.0.1", true},      // RFC1918
+		{"192.168.1.1", true},     // RFC1918
 		{"169.254.169.254", true}, // AWS/GCP metadata, link-local
-		{"100.64.0.1", true},     // CGNAT
-		{"100.127.0.1", true},    // CGNAT end
-		{"0.0.0.0", true},        // unspecified
-		{"224.0.0.1", true},      // multicast
-		{"fc00::1", true},        // ULA v6 (RFC4193, IsPrivate)
-		{"fe80::1", true},        // link-local v6
+		{"100.64.0.1", true},      // CGNAT
+		{"100.127.0.1", true},     // CGNAT end
+		{"0.0.0.0", true},         // unspecified
+		{"224.0.0.1", true},       // multicast
+		{"fc00::1", true},         // ULA v6 (RFC4193, IsPrivate)
+		{"fe80::1", true},         // link-local v6
 
 		// Should NOT be blocked
 		{"8.8.8.8", false},

@@ -50,11 +50,11 @@ const (
 type ArcQuery struct {
 	RefID         string `json:"refId"`
 	SQL           string `json:"sql"`
-	RawSQL        string `json:"rawSql"`        // Postgres/MySQL/MSSQL/ClickHouse compatibility
-	Database      string `json:"database"`       // Per-query database override (empty = use datasource default)
-	Format        string `json:"format"`         // "time_series" or "table"
+	RawSQL        string `json:"rawSql"`   // Postgres/MySQL/MSSQL/ClickHouse compatibility
+	Database      string `json:"database"` // Per-query database override (empty = use datasource default)
+	Format        string `json:"format"`   // "time_series" or "table"
 	MaxDataPoints int64  `json:"maxDataPoints"`
-	SplitDuration string `json:"splitDuration"`  // "auto" (default), "off", or explicit: "1h", "6h", "12h", "1d", "3d", "7d"
+	SplitDuration string `json:"splitDuration"` // "auto" (default), "off", or explicit: "1h", "6h", "12h", "1d", "3d", "7d"
 }
 
 // ArcInstanceSettings is the cached, parsed view of a datasource instance.
@@ -407,7 +407,9 @@ func parseSplitDuration(s string, tr backend.TimeRange) (time.Duration, bool) {
 // Alignment ensures common aggregation intervals (1h, 10m, etc.) never span a
 // chunk boundary, which would produce incorrect partial aggregations.
 // Example with 6h chunks, range 14:30–02:30:
-//   [14:30, 18:00), [18:00, 00:00), [00:00, 02:30)
+//
+//	[14:30, 18:00), [18:00, 00:00), [00:00, 02:30)
+//
 // All internal boundaries land on 6h multiples from epoch.
 func splitTimeRange(from, to time.Time, chunkSize time.Duration) []backend.TimeRange {
 	// Truncates to whole seconds — sub-second chunk sizes are not supported,
