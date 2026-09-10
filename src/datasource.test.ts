@@ -52,12 +52,10 @@ describe('interpolateVariable', () => {
 
   describe('single-value variables (the author supplies the quotes)', () => {
     it('does not add surrounding quotes', () => {
-      // WHERE host = '$server' -> WHERE host = 'h01'
-      expect(ds.interpolateVariable('h01', single)).toBe('h01');
-    });
-
-    it('keeps a regex-anchored value usable: host ~ \'^$server$\'', () => {
-      // The 1.3.2 rule produced '^'h01'$' here. 13 production panels use this.
+      // The author writes the quotes, so the value must arrive bare:
+      //   WHERE host = '$server'   -> WHERE host = 'h01'
+      //   WHERE host ~ '^$server$' -> WHERE host ~ '^h01$'
+      // The 1.3.2 rule produced ''h01'' and '^'h01'$', both parser errors.
       expect(ds.interpolateVariable('h01', single)).toBe('h01');
     });
 
@@ -84,6 +82,13 @@ describe('interpolateVariable', () => {
     it('escapes embedded quotes when quoting', () => {
       expect(ds.interpolateVariable("O'Brien", multi)).toBe("'O''Brien'");
     });
+
+    it('renders an empty selection as NULL, not an empty IN list', () => {
+      // Joining an empty array yields "", so `WHERE host IN ($hosts)` would
+      // become `IN ()` — a DuckDB parser error. NULL parses and matches
+      // nothing, which is what selecting nothing means.
+      expect(ds.interpolateVariable([], multi)).toBe('NULL');
+    });
   });
 
   describe('non-string values', () => {
@@ -98,14 +103,14 @@ describe('interpolateVariable', () => {
     // `INTERVAL '$__interval'` becomes INTERVAL '10 seconds' rather than the
     // 1.3.2 output INTERVAL ''10 seconds''.
     it('leaves an interval value bare so it works inside the author quotes', () => {
-            const builtin = { name: '__interval', multi: false, includeAll: false } as any;
+      const builtin = { name: '__interval', multi: false, includeAll: false } as any;
       expect(ds.interpolateVariable('10 seconds', builtin)).toBe('10 seconds');
     });
   });
 
   describe('missing variable metadata', () => {
     it('treats an undefined variable as single-value', () => {
-            expect(ds.interpolateVariable('h01', undefined as any)).toBe('h01');
+      expect(ds.interpolateVariable('h01', undefined as any)).toBe('h01');
     });
   });
 });

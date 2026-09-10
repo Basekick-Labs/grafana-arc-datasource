@@ -47,7 +47,6 @@ describe('production dashboard idioms', () => {
 
   it("host ~ '^$server$' keeps the regex anchors adjacent to the value", () => {
     // The 1.3.2 rule produced '^'h01'$' here, which is a parser error.
-    // 13 panels use this form.
     expect(`WHERE host ~ '^${escapeLiteral(SERVER)}$'`).toBe(`WHERE host ~ '^${SERVER}$'`);
   });
 

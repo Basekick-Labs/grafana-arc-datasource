@@ -12,9 +12,16 @@
  * literal the query author opened. The surrounding quotes belong to the
  * author (`WHERE host = '$server'`), and adding a second pair here produces
  * `''value''` — a parser error, not extra safety.
+ *
+ * Limitation: doubling is sufficient for DuckDB's standard string literals,
+ * where a backslash is an ordinary character, but NOT inside an `E'...'`
+ * escape-string literal, where `\'` consumes one quote and lets the next one
+ * close the string. `WHERE host = E'$server'` is therefore unsafe with any
+ * variable, and no idiom in this plugin's docs or tests uses that form.
+ * Grafana's own Postgres datasource has the same gap. Use a standard literal.
  */
 export function escapeLiteral(value: string): string {
-  return String(value).replace(/'/g, "''");
+  return value.replace(/'/g, "''");
 }
 
 /**

@@ -1297,23 +1297,22 @@ func expect(t *testing.T, got, want time.Time, label string) {
 	}
 }
 
-
 // TestApplyMacros_IntervalExpandsInsideLiteral is the deliberate exception to
 // the literal-skipping rule proven by TestApplyMacros_ParenthesisedMacrosLiteralSafe.
 //
 // Unlike the parenthesised macros, whose expansions are self-quoting, the
-// documented use of $__interval — here and in the Postgres, MySQL and
-// Timescale datasources — is INSIDE quotes:
+// documented use of $__interval -- here and in the Postgres, MySQL and
+// Timescale datasources -- is INSIDE quotes:
 //
 //	time_bucket('$__interval', time)
 //	time_bucket(INTERVAL '$__interval', time)
 //
-// 16 panels of the production "System Monitoring ARC v2" dashboard use one of
-// those two forms. Skipping literals leaves the token unexpanded and DuckDB
-// fails with `Conversion Error: Could not convert string '$__interval' to
-// INTERVAL` (reproduced against live Arc, 2026-09-10). Only backend-only paths
-// (alerting, recorded queries) reach this code with the token intact; the
-// frontend substitutes it for panel queries.
+// Production dashboards use both forms. Skipping literals leaves the token
+// unexpanded and DuckDB fails with `Conversion Error: Could not convert string
+// '$__interval' to INTERVAL`.
+//
+// Asserts the exact output, not just that the token vanished: the interval has
+// to land in the right place, with the author's quotes intact, exactly once.
 func TestApplyMacros_IntervalExpandsInsideLiteral(t *testing.T) {
 	tr := backend.TimeRange{
 		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
@@ -1322,64 +1321,139 @@ func TestApplyMacros_IntervalExpandsInsideLiteral(t *testing.T) {
 	cases := []struct {
 		name string
 		sql  string
+		want string
 	}{
-		{"bare quotes", "SELECT time_bucket('$__interval', time) FROM t"},
-		{"INTERVAL keyword", "SELECT time_bucket(INTERVAL '$__interval', time) FROM t"},
-		{"outside a literal", "SELECT $__interval FROM t"},
+		{
+			"bare quotes",
+			"SELECT time_bucket('$__interval', time) FROM t",
+			"SELECT time_bucket('10 seconds', time) FROM t",
+		},
+		{
+			"INTERVAL keyword",
+			"SELECT time_bucket(INTERVAL '$__interval', time) FROM t",
+			"SELECT time_bucket(INTERVAL '10 seconds', time) FROM t",
+		},
+		{
+			"outside a literal",
+			"SELECT $__interval FROM t",
+			"SELECT 10 seconds FROM t",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			result := ApplyMacros(c.sql, tr)
-			if strings.Contains(result, "$__interval") {
-				t.Errorf("$__interval was not expanded: %s", result)
-			}
-			if !strings.Contains(result, "10 seconds") {
-				t.Errorf("expected the calculated interval in: %s", result)
+			if got := ApplyMacros(c.sql, tr); got != c.want {
+				t.Errorf("ApplyMacros() =\n  %s\nwant\n  %s", got, c.want)
 			}
 		})
 	}
 }
 
-// TestApplyMacros_IntervalMsNotClobbered guards the replacement ORDER.
-// "$__interval" is a prefix of "$__interval_ms", so replacing the shorter
-// token first rewrites `$__interval_ms` into `10 seconds_ms` — valid-looking
-// output that fails at the database.
-func TestApplyMacros_IntervalMsNotClobbered(t *testing.T) {
+// TestApplyMacros_IntervalTokenBoundaries pins the word-boundary rule in
+// replaceIntervalToken. "$__interval" is a prefix of "$__interval_ms" and of
+// anything else in that family, so a plain substring replacement rewrites
+// `$__interval_ms` to `10 seconds_ms` -- valid-looking SQL that fails at the
+// database. The boundary check is also what makes the replacement ORDER of the
+// two tokens irrelevant.
+//
+// Unknown `$__interval*` tokens are left untouched rather than mangled, so a
+// macro Grafana adds to this family later degrades to a clear error instead of
+// silently corrupt SQL.
+func TestApplyMacros_IntervalTokenBoundaries(t *testing.T) {
 	tr := backend.TimeRange{
 		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
 	}
-	result := ApplyMacros("SELECT $__interval_ms AS ms, '$__interval' AS txt FROM t", tr)
-	if strings.Contains(result, "_ms") {
-		t.Errorf("$__interval_ms was clobbered by the $__interval replacement: %s", result)
+	cases := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{"both tokens", "SELECT $__interval_ms, '$__interval' FROM t", "SELECT 10000, '10 seconds' FROM t"},
+		{"ms alone", "SELECT $__interval_ms FROM t", "SELECT 10000 FROM t"},
+		{"unknown suffix", "SELECT $__intervalx FROM t", "SELECT $__intervalx FROM t"},
+		{"unknown ms suffix", "SELECT $__interval_msx FROM t", "SELECT $__interval_msx FROM t"},
+		{"camel suffix", "SELECT $__intervalMs FROM t", "SELECT $__intervalMs FROM t"},
+		{"column named after the macro", "SELECT $__interval_from FROM t", "SELECT $__interval_from FROM t"},
 	}
-	if !strings.Contains(result, "10000") {
-		t.Errorf("expected $__interval_ms to expand to 10000 (10s): %s", result)
-	}
-	if !strings.Contains(result, "'10 seconds'") {
-		t.Errorf("expected $__interval to expand inside the literal: %s", result)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ApplyMacros(c.sql, tr); got != c.want {
+				t.Errorf("ApplyMacros() = %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 
-// TestIntervalMillisecondsMatchesCalculateInterval keeps the two macros
-// consistent: $__interval_ms must be the same bucket as $__interval, in ms.
-func TestIntervalMillisecondsMatchesCalculateInterval(t *testing.T) {
+// TestApplyMacros_IntervalSkipsComments: the interval macros expand inside
+// string literals by design, but a comment is not code. Rewriting it would
+// make the SQL shown in Grafana's inspector differ from what the author wrote,
+// for no benefit.
+func TestApplyMacros_IntervalSkipsComments(t *testing.T) {
+	tr := backend.TimeRange{
+		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
+		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
+	}
 	cases := []struct {
-		duration time.Duration
-		text     string
-		ms       int64
+		name string
+		sql  string
+		want string
 	}{
-		{30 * time.Minute, "10 seconds", 10000},
-		{8 * time.Hour, "1 minute", 60000},
-		{48 * time.Hour, "10 minutes", 600000},
-		{30 * 24 * time.Hour, "1 hour", 3600000},
+		{"line comment", "SELECT 1 -- bucket $__interval here\nFROM t", "SELECT 1 -- bucket $__interval here\nFROM t"},
+		{"block comment", "SELECT /* $__interval */ 1 FROM t", "SELECT /* $__interval */ 1 FROM t"},
+		{"code after a comment still expands", "-- $__interval\nSELECT '$__interval' FROM t", "-- $__interval\nSELECT '10 seconds' FROM t"},
 	}
 	for _, c := range cases {
-		if got := calculateInterval(c.duration); got != c.text {
-			t.Errorf("calculateInterval(%s) = %q, want %q", c.duration, got, c.text)
+		t.Run(c.name, func(t *testing.T) {
+			if got := ApplyMacros(c.sql, tr); got != c.want {
+				t.Errorf("ApplyMacros() = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestIntervalBucketConsistency checks that $__interval and $__interval_ms
+// always describe the SAME bucket, at every BOUNDARY of the table -- not just
+// at comfortable mid-range values, where a drifted threshold still passes.
+//
+// The two macros now share intervalBucket, so this guards the table itself:
+// each entry's text form must parse back to its duration.
+func TestIntervalBucketConsistency(t *testing.T) {
+	// Every threshold, and one nanosecond either side of it.
+	var durations []time.Duration
+	for _, b := range intervalBuckets {
+		durations = append(durations, b.upTo-time.Nanosecond, b.upTo, b.upTo+time.Nanosecond)
+	}
+	durations = append(durations, 0, time.Nanosecond, 365*24*time.Hour)
+
+	// The text form DuckDB accepts, mapped to the duration it denotes.
+	textToDuration := map[string]time.Duration{
+		"10 seconds": 10 * time.Second,
+		"1 minute":   time.Minute,
+		"10 minutes": 10 * time.Minute,
+		"1 hour":     time.Hour,
+	}
+
+	for _, d := range durations {
+		text := calculateInterval(d)
+		want, ok := textToDuration[text]
+		if !ok {
+			t.Fatalf("calculateInterval(%v) = %q, which is not a known interval string", d, text)
 		}
-		if got := intervalMilliseconds(c.duration); got != c.ms {
-			t.Errorf("intervalMilliseconds(%s) = %d, want %d", c.duration, got, c.ms)
+		if got := intervalMilliseconds(d); got != want.Milliseconds() {
+			t.Errorf("range %v: $__interval is %q (%d ms) but $__interval_ms is %d ms",
+				d, text, want.Milliseconds(), got)
+		}
+	}
+}
+
+// TestIntervalBucketTableOrdered guards the table's invariant: intervalBucket
+// returns the first entry whose ceiling the duration fits under, so the
+// ceilings must ascend or a bucket becomes unreachable.
+func TestIntervalBucketTableOrdered(t *testing.T) {
+	for i := 1; i < len(intervalBuckets); i++ {
+		if intervalBuckets[i].upTo <= intervalBuckets[i-1].upTo {
+			t.Errorf("intervalBuckets[%d].upTo (%v) does not exceed [%d] (%v): the later entry is unreachable",
+				i, intervalBuckets[i].upTo, i-1, intervalBuckets[i-1].upTo)
 		}
 	}
 }

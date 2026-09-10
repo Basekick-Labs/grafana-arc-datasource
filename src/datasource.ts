@@ -80,10 +80,6 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     return defaultQuery;
   }
 
-  quoteLiteral(value: string) {
-    return quoteLiteral(value);
-  }
-
   /**
    * Formats a template-variable value for interpolation into SQL.
    *
@@ -112,10 +108,12 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
    * Grafana's own Postgres/MySQL datasources, where Arc's API-key scope is the
    * authorization boundary.
    */
-  interpolateVariable = (value: string | string[] | number, variable: VariableWithMultiSupport) => {
+  // `variable` is optional: Grafana routes its own built-in macros ($__interval,
+  // $__from, $__to) through this hook without a variable model.
+  interpolateVariable = (value: string | string[] | number, variable?: VariableWithMultiSupport) => {
     if (typeof value === 'string') {
       if (variable?.multi || variable?.includeAll) {
-        return this.quoteLiteral(value);
+        return quoteLiteral(value);
       }
       return escapeLiteral(value);
     }
@@ -125,7 +123,13 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     }
 
     if (Array.isArray(value)) {
-      const quotedValues = value.map((v) => this.quoteLiteral(v));
+      // An empty selection would otherwise join to "", producing `IN ()` —
+      // a DuckDB parser error rather than a query that matches nothing.
+      // NULL parses and matches nothing, which is what an empty set means.
+      if (value.length === 0) {
+        return 'NULL';
+      }
+      const quotedValues = value.map((v) => quoteLiteral(v));
       return quotedValues.join(',');
     }
 

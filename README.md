@@ -222,9 +222,16 @@ The practical consequences:
   so `INTERVAL '$__interval'` is correct.
 
 Embedded single quotes are always doubled, so a value cannot terminate the
-literal it is placed in. A variable used **without** quotes (`WHERE host =
-$server`) is interpolated as-is — identical to Grafana's SQL datasources, and
-the reason Arc's API key should be scoped to what the dashboard's viewers are
+literal it is placed in. Two cases are outside that guarantee, both identical
+to Grafana's built-in SQL datasources:
+
+- A variable used **without** quotes (`WHERE host = $server`) is interpolated
+  as-is.
+- A variable inside a DuckDB **escape-string** literal (`WHERE host =
+  E'$server'`), where a backslash in the value can consume the closing quote.
+  Use a standard `'...'` literal instead.
+
+Both are reasons to scope Arc's API key to what the dashboard's viewers are
 allowed to read.
 
 ### Alerting

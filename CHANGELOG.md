@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Ships as **1.4.0**, together with the datasource-default restorations tracked
+in issue #12. Versions are bumped once, in the release PR, so `package.json`
+and `plugin.json` cannot drift apart across review rounds.
+
 ### Fixed
 - Template variables are interpolated by Grafana's own rule again: a value is
   quoted only when the variable is multi-value or has an "Include All" option,
@@ -31,9 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quotes.
 
 - `$__interval_ms` is no longer clobbered. It shares a prefix with
-  `$__interval`, and the previous replacement order rewrote it to
-  `10 seconds_ms`. Only backend-only paths (alerting, recorded queries) see
+  `$__interval`, so a substring replacement rewrote it to `10 seconds_ms`.
+  Both tokens are now matched on a word boundary, which also leaves any
+  unrecognised `$__interval*` token untouched rather than corrupting it, and
+  makes the replacement order irrelevant. The interval macros skip SQL
+  comments, so query text shown in Grafana's inspector still matches what the
+  author wrote. Only backend-only paths (alerting, recorded queries) see
   either token unexpanded.
+
+- A multi-value variable with nothing selected now interpolates as `NULL`
+  instead of an empty string, so `WHERE host IN ($hosts)` degrades to a query
+  matching no rows rather than `IN ()`, a parser error.
 
 ### Note on 1.3.3 - 1.3.11
 Those releases were withdrawn. They attempted to patch the regression above
