@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
+	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
 )
 
@@ -313,11 +315,11 @@ func TestSplitTimeRange_BoundaryNoDuplicates(t *testing.T) {
 
 	// Chunk 1 should use: time < '...11:00:00Z' (exclusive end)
 	boundaryStr := boundaryTime.Format(time.RFC3339)
-	if !strings.Contains(chunk1SQL, "time < '"+boundaryStr+"'") {
+	if !strings.Contains(chunk1SQL, "(time) < '"+boundaryStr+"'") {
 		t.Errorf("chunk 1 should exclude boundary with <: %s", chunk1SQL)
 	}
 	// Chunk 2 should use: time >= '...11:00:00Z' (inclusive start)
-	if !strings.Contains(chunk2SQL, "time >= '"+boundaryStr+"'") {
+	if !strings.Contains(chunk2SQL, "(time) >= '"+boundaryStr+"'") {
 		t.Errorf("chunk 2 should include boundary with >=: %s", chunk2SQL)
 	}
 }
@@ -592,8 +594,11 @@ func TestIntervalToSeconds(t *testing.T) {
 	// Still rejected: not an interval, or not one epoch division can express.
 	for _, input := range []string{
 		"nonsense", "", "h", "1", "-5m", "0s",
-		"500ms",   // sub-second: rounds to a zero-length bucket
-		"1 month", // not a fixed number of seconds
+		"500ms",                // sub-second: rounds to a zero-length bucket
+		"9223372036854775807s", // would overflow, and is meaningless anyway
+		"3000000000s",          // ~95 years: wider than any useful bucket
+		"400d",                 // over the one-month ceiling
+		"1 month",              // not a fixed number of seconds
 		"1 year",
 		"1h ; DROP TABLE t",
 	} {
@@ -632,10 +637,10 @@ func TestApplyMacros_TimeFilter_CustomColumn(t *testing.T) {
 	if strings.Contains(result, "$__timeFilter") {
 		t.Errorf("macro not expanded: %s", result)
 	}
-	if !strings.Contains(result, "created_at >= '2026-02-18T10:00:00Z'") {
+	if !strings.Contains(result, "(created_at) >= '2026-02-18T10:00:00Z'") {
 		t.Errorf("expected custom column in filter: %s", result)
 	}
-	if !strings.Contains(result, "created_at < '2026-02-18T11:00:00Z'") {
+	if !strings.Contains(result, "(created_at) < '2026-02-18T11:00:00Z'") {
 		t.Errorf("expected custom column in end filter: %s", result)
 	}
 }
@@ -676,10 +681,10 @@ func TestApplyMacros_TimeFilter_MultipleOccurrences(t *testing.T) {
 	if strings.Contains(result, "$__timeFilter") {
 		t.Fatalf("expected both macros expanded, got: %s", result)
 	}
-	if !strings.Contains(result, "t1 >= '2026-02-18T10:00:00Z'") {
+	if !strings.Contains(result, "(t1) >= '2026-02-18T10:00:00Z'") {
 		t.Errorf("expected t1 filter: %s", result)
 	}
-	if !strings.Contains(result, "t2 >= '2026-02-18T10:00:00Z'") {
+	if !strings.Contains(result, "(t2) >= '2026-02-18T10:00:00Z'") {
 		t.Errorf("expected t2 filter: %s", result)
 	}
 	// Count expansions: each $__timeFilter produces exactly two `>= '...'` /
@@ -709,7 +714,7 @@ func TestApplyMacros_TimeFilter_RejectsUnsafeColumn(t *testing.T) {
 	}
 	// Second (safe) macro must still expand — proves the rejection branch
 	// advances searchFrom correctly rather than spinning or skipping ahead.
-	if !strings.Contains(result, "t2 >= '2026-02-18T10:00:00Z'") {
+	if !strings.Contains(result, "(t2) >= '2026-02-18T10:00:00Z'") {
 		t.Errorf("valid macro after rejection must still expand: %s", result)
 	}
 }
@@ -734,7 +739,7 @@ func TestApplyMacros_NotExpandedInsideStringLiteral(t *testing.T) {
 	if strings.Count(result, "$__timeFilter(") != 1 {
 		t.Errorf("expected exactly one un-expanded $__timeFilter (the one inside the literal), got: %s", result)
 	}
-	if !strings.Contains(result, "time >= '2026-02-18T10:00:00Z'") {
+	if !strings.Contains(result, "(time) >= '2026-02-18T10:00:00Z'") {
 		t.Errorf("expected outer macro to expand: %s", result)
 	}
 }
@@ -809,8 +814,8 @@ func TestApplyMacros_TimeFilter_NestedParens(t *testing.T) {
 	case result := <-done:
 		// The full nested expression must be used as the column, on both
 		// sides of the generated range predicate.
-		if strings.Count(result, "COALESCE(t1, t2) >= '") != 1 ||
-			strings.Count(result, "COALESCE(t1, t2) < '") != 1 {
+		if strings.Count(result, "(COALESCE(t1, t2)) >= '") != 1 ||
+			strings.Count(result, "(COALESCE(t1, t2)) < '") != 1 {
 			t.Errorf("nested-paren column should expand on both bounds: %s", result)
 		}
 		if strings.Contains(result, "$__timeFilter") {
@@ -1532,6 +1537,25 @@ func TestIntervalBucketTableOrdered(t *testing.T) {
 	}
 }
 
+// probeDial exercises the instance's real dialer against an address, so a test
+// asserts on the wiring rather than on a setting it just supplied. Any error
+// other than errBlockedAddr (connection refused, timeout) means the policy
+// permitted the address and the dial merely failed, which is what we want to
+// distinguish.
+func probeDial(inst instancemgmt.Instance, addr string) error {
+	transport, ok := inst.(*ArcInstanceSettings).client.Transport.(*http.Transport)
+	if !ok {
+		return errors.New("unexpected transport type")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := transport.DialContext(ctx, "tcp", addr)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	return err
+}
+
 // TestBoolOrDefault covers the tri-state the *bool settings encode: absent
 // (nil) means "this datasource predates the setting", which is NOT the same
 // as an explicit false.
@@ -1573,8 +1597,11 @@ func TestNewArcInstance_PrivateIPDefaultsPermissive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("legacy datasource should build: %v", err)
 	}
-	if got := boolOrDefault(inst.(*ArcInstanceSettings).settings.AllowPrivateIPs, true); !got {
-		t.Error("absent allowPrivateIPs must resolve to true; 1.3.2 read it as false and broke every private-network datasource")
+	// Assert on the DIALER, not by re-running boolOrDefault — that would only
+	// restate TestBoolOrDefault and would still pass if the wiring regressed.
+	// A private address must actually be dialable.
+	if err := probeDial(inst, "10.0.0.5:8000"); err != nil && errors.Is(err, errBlockedAddr) {
+		t.Errorf("absent allowPrivateIPs must permit a private address; got %v", err)
 	}
 }
 
@@ -1593,8 +1620,8 @@ func TestNewArcInstance_PrivateIPExplicitFalseHonoured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	if got := boolOrDefault(inst.(*ArcInstanceSettings).settings.AllowPrivateIPs, true); got {
-		t.Error("an explicit false must be honoured, not overridden by the legacy default")
+	if err := probeDial(inst, "10.0.0.5:8000"); !errors.Is(err, errBlockedAddr) {
+		t.Errorf("an explicit false must still block a private address; got %v", err)
 	}
 }
 
@@ -1611,7 +1638,7 @@ func TestNewArcInstance_DatabaseOverrideDefaultsPermissive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
 	}
-	if got := boolOrDefault(inst.(*ArcInstanceSettings).settings.AllowDatabaseOverride, true); !got {
+	if !boolOrDefault(inst.(*ArcInstanceSettings).settings.AllowDatabaseOverride, true) {
 		t.Error("absent allowDatabaseOverride must resolve to true for legacy datasources")
 	}
 }
@@ -1647,6 +1674,25 @@ func TestOptimizeTimeSeriesQuery(t *testing.T) {
 			"SELECT time, v FROM t;",
 			"SELECT time, v FROM t ORDER BY time ASC",
 		},
+		{
+			// A quoted identifier is not a clause; the real LIMIT is.
+			"quoted limit column with a real LIMIT is left alone",
+			`SELECT time, "limit" FROM t`,
+			`SELECT time, "limit" FROM t ORDER BY time ASC`,
+		},
+		{
+			// The quoted identifier is not a clause, so the real LIMIT is
+			// still found and the ORDER BY goes in front of it. Verified
+			// valid against DuckDB 1.4.3.
+			"quoted limit column alongside a real LIMIT",
+			`SELECT time, "limit" FROM t LIMIT 5`,
+			`SELECT time, "limit" FROM t ORDER BY time ASC LIMIT 5`,
+		},
+		{
+			"comment after the LIMIT is preserved",
+			"SELECT time FROM t LIMIT 10 -- note",
+			"SELECT time FROM t ORDER BY time ASC LIMIT 10 -- note",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1676,6 +1722,16 @@ func TestOptimizeTimeSeriesQuery(t *testing.T) {
 		{"multi-statement", "SELECT time FROM a; SELECT time FROM b"},
 		{"time only inside a literal", "SELECT v FROM t WHERE msg = 'time to go'"},
 		{"time only inside a comment", "SELECT v FROM t -- order by time\n"},
+		// Every case below silently produced wrong results or a parse error
+		// before the guards were added. A nested LIMIT is the worst: inserting
+		// ORDER BY ahead of it changes WHICH rows survive the LIMIT, so the
+		// panel shows a different dataset and nothing errors.
+		{"LIMIT inside a derived table", "SELECT time, v FROM (SELECT time, v FROM t LIMIT 10) x"},
+		{"LIMIT inside a CTE", "WITH c AS (SELECT time FROM t LIMIT 5) SELECT time FROM c"},
+		{"LIMIT inside a subquery predicate", "SELECT time FROM t WHERE v IN (SELECT y FROM z LIMIT 5)"},
+		{"FETCH FIRST has no place for a trailing ORDER BY", "SELECT time FROM t FETCH FIRST 5 ROWS ONLY"},
+		{"trailing line comment would swallow the clause", "SELECT time FROM t -- note"},
+		{"two LIMIT tokens are ambiguous", "SELECT time FROM t LIMIT 5 OFFSET 5 LIMIT 3"},
 		// A dot-qualified reference is deliberately not a match: a bare
 		// `ORDER BY time` may be ambiguous when the column is only reachable
 		// as `t.time`, and guessing the alias is worse than not sorting.
@@ -1728,6 +1784,17 @@ func TestNewArcInstance_ConcurrencyLimits(t *testing.T) {
 			if got.MaxInFlight != c.wantInFlight {
 				t.Errorf("MaxInFlight = %d, want %d", got.MaxInFlight, c.wantInFlight)
 			}
+			// The behavioural change is that the SEMAPHORE is sized by
+			// MaxInFlight, not MaxConcurrency. Asserting only on the parsed
+			// struct would still pass if that wiring were reverted.
+			sem := inst.(*ArcInstanceSettings).sem
+			if !sem.TryAcquire(int64(c.wantInFlight)) {
+				t.Fatalf("semaphore should admit %d concurrent requests", c.wantInFlight)
+			}
+			if sem.TryAcquire(1) {
+				t.Errorf("semaphore admitted more than MaxInFlight (%d)", c.wantInFlight)
+			}
+			sem.Release(int64(c.wantInFlight))
 		})
 	}
 }

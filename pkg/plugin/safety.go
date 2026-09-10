@@ -82,7 +82,30 @@ func validateColumnArg(name string) error {
 		return errors.New("empty column argument")
 	}
 	if columnArgUnsafe.MatchString(name) {
-		return fmt.Errorf("column argument contains an unsafe character (quote, semicolon, or comment marker)")
+		return errors.New("column argument contains an unsafe character (quote, semicolon, or comment marker)")
+	}
+	// Parentheses must balance, and must never close more than they opened.
+	// Without this, `$__timeFilter(time) OR (1=1)` parses as the argument
+	// `time) OR (1=1`, which closes the macro's own paren and appends a
+	// disjunction: the emitted predicate becomes
+	//   time >= '<from>' AND time < '<to>' OR (1=1)
+	// and since AND binds tighter than OR the time filter is neutralised and
+	// the panel returns the whole table. Under query splitting each chunk then
+	// returns that whole table, and the merge duplicates every row per chunk.
+	depth := 0
+	for i := 0; i < len(name); i++ {
+		switch name[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth < 0 {
+				return errors.New("column argument closes more parentheses than it opens")
+			}
+		}
+	}
+	if depth != 0 {
+		return errors.New("column argument has unbalanced parentheses")
 	}
 	return nil
 }
@@ -255,16 +278,28 @@ func isLoopbackURL(raw string) bool {
 // regardless. Previously these two were collapsed into one bool, which meant
 // a loopback URL would also open RFC1918 redirects (gemini round 5 finding
 // 3244943519).
-func newHTTPClient(timeout time.Duration, policy dialPolicy) *http.Client {
+func newHTTPClient(timeout time.Duration, policy dialPolicy, maxInFlight int) *http.Client {
+	if maxInFlight <= 0 {
+		maxInFlight = DefaultMaxInFlight
+	}
 	transport := &http.Transport{
 		// Honour HTTP_PROXY / HTTPS_PROXY / NO_PROXY. The custom transport
 		// added in 1.3.2 omitted this, so a Grafana behind a corporate egress
 		// proxy silently stopped reaching a cloud-hosted Arc — http.Transport
 		// defaults to no proxy, unlike http.DefaultTransport.
-		Proxy:           http.ProxyFromEnvironment,
-		DialContext:     safeDialContext(policy),
-		MaxIdleConns:    100,
-		MaxConnsPerHost: MaxInFlightCap,
+		Proxy:       http.ProxyFromEnvironment,
+		DialContext: safeDialContext(policy),
+		// This transport serves ONE host (the datasource's Arc URL), so all
+		// three limits are sized from the same budget.
+		//
+		// MaxIdleConnsPerHost is the load-bearing one: it defaults to 2, and
+		// without it a 32-way fan-out returns 2 connections to the pool and
+		// CLOSES the other 30, so the next refresh re-dials nearly everything
+		// and pays a TLS handshake for each. Raising IdleConnTimeout without
+		// this only keeps those 2 connections alive longer.
+		MaxIdleConns:        maxInFlight,
+		MaxIdleConnsPerHost: maxInFlight,
+		MaxConnsPerHost:     maxInFlight,
 		// A dashboard refreshing every 1-5 minutes re-dialled on every refresh
 		// at 90s, paying a TLS handshake each time.
 		IdleConnTimeout:       5 * time.Minute,
@@ -325,13 +360,27 @@ var duckdbUserErrorPrefixes = []string{
 // userFixableArcError returns the DuckDB detail from an Arc error message when
 // that detail describes a mistake in the user's SQL. The returned string keeps
 // the "Arc error (HTTP n):" prefix so the origin stays visible.
-func userFixableArcError(msg string) (string, bool) {
+// isUserFixableArcError reports whether an Arc error message describes a
+// mistake in the user's own SQL, and so may be shown to them verbatim.
+//
+// Matches on the message BODY's prefix rather than with strings.Contains: a
+// composite diagnostic such as "Internal Error: ... Parser Error: ..." would
+// otherwise pass through wholesale, carrying the internal half with it.
+func isUserFixableArcError(msg string) bool {
+	body := msg
+	if i := strings.Index(body, "): "); i >= 0 {
+		body = body[i+3:]
+	}
+	// Arc prefixes its own context, e.g. "arrow query failed: Parser Error:".
+	if i := strings.Index(body, "query failed: "); i >= 0 {
+		body = body[i+len("query failed: "):]
+	}
 	for _, prefix := range duckdbUserErrorPrefixes {
-		if strings.Contains(msg, prefix+":") {
-			return msg, true
+		if strings.HasPrefix(body, prefix+":") {
+			return true
 		}
 	}
-	return "", false
+	return false
 }
 
 // sanitizeUserErrorSQL is sanitizeUserError plus the expanded SQL in the
@@ -343,7 +392,10 @@ func userFixableArcError(msg string) (string, bool) {
 // by hand. That reconstruction is what produced four wrong diagnoses during
 // the 1.3.x regression.
 func sanitizeUserErrorSQL(refID, sql string, err error) string {
-	return sanitizeUserErrorWith(refID, err, "sql", sql)
+	// Capped like every other logged payload: a macro-expanded query with a
+	// large IN (...) list from a multi-value variable can be megabytes, and a
+	// broken panel refreshing every few seconds writes it each time.
+	return sanitizeUserErrorWith(refID, err, "sql", truncateForLog(sql))
 }
 
 func sanitizeUserError(refID string, err error) string {
@@ -392,8 +444,8 @@ func sanitizeUserErrorWith(refID string, err error, extra ...any) string {
 		// parser error as 500, so a status-based rule would hide the very
 		// errors that matter most. Anything not on the allowlist stays
 		// summarised, and the full text is in the log line above.
-		if detail, ok := userFixableArcError(msg); ok {
-			return detail
+		if isUserFixableArcError(msg) {
+			return msg
 		}
 		end := strings.Index(msg, "):")
 		if end > 0 {

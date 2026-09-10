@@ -381,7 +381,7 @@ func TestSanitizeUserError_PassesThroughClientErrors(t *testing.T) {
 	}
 }
 
-func TestUserFixableArcError(t *testing.T) {
+func TestIsUserFixableArcError(t *testing.T) {
 	cases := []struct {
 		msg string
 		ok  bool
@@ -394,10 +394,14 @@ func TestUserFixableArcError(t *testing.T) {
 		{"Arc error (HTTP 500): IO Error: /var/lib/arc/x.parquet missing", false},
 		{"Arc error (HTTP 503): upstream unavailable", false},
 		{"Arc error (HTTP 500): out of memory", false},
+		{"Arc error (HTTP 500): arrow query failed: Parser Error: syntax error", true},
+		// A composite diagnostic must NOT pass through: the internal half
+		// would ride along with the user-fixable half.
+		{"Arc error (HTTP 500): Internal Error: disk at /var/lib/arc. Parser Error: x", false},
 	}
 	for _, c := range cases {
-		if _, ok := userFixableArcError(c.msg); ok != c.ok {
-			t.Errorf("userFixableArcError(%q) = %v, want %v", c.msg, ok, c.ok)
+		if ok := isUserFixableArcError(c.msg); ok != c.ok {
+			t.Errorf("isUserFixableArcError(%q) = %v, want %v", c.msg, ok, c.ok)
 		}
 	}
 }

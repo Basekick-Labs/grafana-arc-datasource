@@ -320,6 +320,7 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 	inst.client = newHTTPClient(
 		time.Duration(dsSettings.Timeout)*time.Second,
 		policy,
+		dsSettings.MaxInFlight,
 	)
 	return inst, nil
 }
@@ -718,7 +719,15 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	// author asked for. OptimizeTimeSeriesQuery is conservative and returns
 	// the SQL untouched whenever the insertion point is not obvious.
 	if qm.Format == "time_series" {
-		qm.SQL = OptimizeTimeSeriesQuery(qm.SQL)
+		// Reuse the strippedSQL computed above rather than stripping again.
+		// The trailing-`;` trim has to happen before stripping, so the views
+		// only match when the SQL has no trailing semicolon or whitespace;
+		// otherwise fall back to the standalone entry point.
+		if trimmed := strings.TrimRight(qm.SQL, " \t\n\r;"); trimmed == qm.SQL {
+			qm.SQL = optimizeTimeSeriesQuery(trimmed, stripped, qm.SQL)
+		} else {
+			qm.SQL = OptimizeTimeSeriesQuery(qm.SQL)
+		}
 	}
 
 	if !splitting {
