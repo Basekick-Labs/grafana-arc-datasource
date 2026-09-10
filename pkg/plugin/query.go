@@ -438,6 +438,17 @@ func intervalMilliseconds(duration time.Duration) int64 {
 // `WHERE message = 'count of $__timeFilter(time)'` would have its literal
 // content rewritten.
 func replaceMacroOccurrences(sql, macro string, rewrite func(arg string) (string, bool)) string {
+	// Nothing to rewrite: skip the walk entirely. Without this the function
+	// still copies the whole statement byte by byte and allocates a builder
+	// the size of the query, for every query that does not use the macro —
+	// which is most of them, since a dashboard typically uses one or two of
+	// the five. `strings.Contains` is a SIMD-accelerated scan, so the check
+	// costs a fraction of the walk it avoids.
+	//
+	// replaceLiteralAwareTokens has always had this guard; this one did not.
+	if !strings.Contains(sql, macro) {
+		return sql
+	}
 	var out strings.Builder
 	out.Grow(len(sql))
 	i := 0
