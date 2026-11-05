@@ -16,6 +16,8 @@ import { escapeLiteral, quoteLiteral, resolveTimezone } from './interpolation';
 import { resolveMode } from './builder/mode';
 import { builderFormat, rawSingle, VariableUseError } from './builder/interpolate';
 import { MEASUREMENT_RE, valuesSQL, variableName } from './builder/generate';
+import { VariableBuilder, resolveVariableMode, toVariableQuery } from './builder/variableQuery';
+import { kindOf } from './builder/columns';
 import { lastValueFrom, Observable } from 'rxjs';
 
 /** The backend's database-name rule (pkg/plugin/safety.go databaseNameRe). */
@@ -71,6 +73,10 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
    * `rawSql`).
    */
   async metricFindQuery(query: VariableQueryInput, options?: LegacyMetricFindQueryOptions): Promise<MetricFindValue[]> {
+    const vq = toVariableQuery(query);
+    if (vq.builder && resolveVariableMode(vq) === 'builder') {
+      return this.builderVariableValues(vq.builder, options);
+    }
     const sqlQuery = extractVariableSQL(query);
 
     const target: ArcQuery = {
@@ -91,6 +97,57 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     // panel query on the same dashboard does.
     const rsp = await lastValueFrom(this.query(request));
     return this.toMetricFindValue(SHOW_TABLES_RE.test(sqlQuery) ? tableNameFirst(rsp) : rsp);
+  }
+
+  /**
+   * A builder variable's values. Databases, measurements and columns come
+   * from the metadata routes: they work on every protocol and fall back to
+   * the configured database for a key that cannot list them all. Values run
+   * as builder SQL, so a chained variable becomes a quoted literal.
+   */
+  private async builderVariableValues(
+    b: VariableBuilder,
+    options?: LegacyMetricFindQueryOptions
+  ): Promise<MetricFindValue[]> {
+    const scopedVars = options?.scopedVars ?? {};
+    const db = b.database ? interpolateName(b.database, scopedVars, 'database', DATABASE_RE) : '';
+    const texts = (names: string[]) => names.map((text) => ({ text }));
+    switch (b.kind) {
+      case 'databases':
+        return texts((await this.getDatabases()).databases);
+      case 'measurements':
+        return texts(await this.getMeasurements(db));
+      case 'columns': {
+        const m = interpolateName(b.measurement ?? '', scopedVars, 'measurement', MEASUREMENT_RE);
+        const res = await this.getColumns(db, m);
+        return texts(
+          (res.columns ?? [])
+            .filter((c) => c.name !== 'time')
+            .filter((c) => b.textOnly === false || ['string', 'boolean'].includes(kindOf(c.type)))
+            .map((c) => c.name)
+        );
+      }
+      case 'values': {
+        if (!b.sql) {
+          return [];
+        }
+        const target: ArcQuery = {
+          refId: 'metricFindQuery',
+          sql: b.sql,
+          format: 'table',
+          splitDuration: 'off',
+          editorMode: 'builder',
+          builder: { ...emptyBuilder(), measurement: b.measurement, sql: b.sql },
+          ...(b.database ? { database: b.database } : {}),
+        };
+        const request = { ...(options ?? {}), targets: [target] } as unknown as DataQueryRequest<ArcQuery>;
+        const rsp = await lastValueFrom(this.query(request));
+        if (rsp.errors?.length) {
+          throw new Error(rsp.errors[0].message ?? 'variable query failed');
+        }
+        return this.toMetricFindValue(rsp);
+      }
+    }
   }
 
   toMetricFindValue(rsp: DataQueryResponse): MetricFindValue[] {

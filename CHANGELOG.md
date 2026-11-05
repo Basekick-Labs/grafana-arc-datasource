@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- A variable query builder: tag values (filtered, chained to other
+  variables), tag keys, measurements and databases. Tag keys, measurements
+  and databases come from the metadata routes, so they work on every
+  protocol and with a key limited to one database; tag values run as
+  builder SQL, so a chained single-value variable becomes a quoted literal.
+  Existing variables open in Code, unchanged.
 - Query builder: `fill()` beside GROUP BY time (none, null, previous,
   linear or a number, through `$__timeGroup`'s fill argument), and filters
   joined by OR as well as AND. AND binds tighter, every OR is kept inside
