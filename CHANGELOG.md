@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default) now says so. Arc refuses it in validation, and on the Arrow
   endpoint the panel showed only "query failed (see server logs for detail)".
   The usual cause is a variable with many values selected.
+- A query Arc refuses for lack of access (HTTP 401 or 403) now says so: the
+  key is not valid, or its role may not read that database. It showed only
+  "query failed (see server logs for detail)". The message does not name the
+  refused database or measurement.
 - A `$` variable in the per-query database override is now interpolated. It
   used to be sent literally and refused.
 - Results Arc cuts short no longer render as complete (Arc#726). Arc reports

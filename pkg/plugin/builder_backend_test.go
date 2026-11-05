@@ -178,3 +178,21 @@ func TestExplainLongSQL(t *testing.T) {
 		}
 	}
 }
+
+// A key scoped by Arc RBAC to one database, querying another: the panel says
+// what happened without echoing the names Arc refused.
+func TestSanitizeExplainsAccessDenied(t *testing.T) {
+	for _, status := range []int{401, 403} {
+		err := &arcHTTPError{Status: status, Msg: "Arc error (HTTP 403): access denied: no read permission for other.secret"}
+		shown := sanitizeUserErrorSQL("A", "SELECT 1", err)
+		if !strings.Contains(shown, "refused access") || !strings.Contains(shown, "permissions") {
+			t.Errorf("HTTP %d: %q", status, shown)
+		}
+		if strings.Contains(shown, "secret") || strings.Contains(shown, "other") {
+			t.Errorf("HTTP %d leaked the refused names: %q", status, shown)
+		}
+	}
+	if shown := sanitizeUserError("A", &arcHTTPError{Status: 500, Msg: "Arc error (HTTP 500): boom"}); strings.Contains(shown, "refused access") {
+		t.Errorf("500 explained as access: %q", shown)
+	}
+}
