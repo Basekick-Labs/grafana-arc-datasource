@@ -133,18 +133,30 @@ func queryJSON(ctx context.Context, settings *ArcInstanceSettings, sql string) (
 		return nil, fmt.Errorf("failed to convert response to DataFrame: %w", err)
 	}
 
-	frame.Meta = &data.FrameMeta{
-		ExecutedQueryString: sql,
-		Custom: map[string]interface{}{
-			"executionTime": duration.Milliseconds(),
-		},
-	}
+	setQueryMeta(frame, sql, duration.Milliseconds())
 
 	return frame, nil
 }
 
-// JSONToDataFrame converts Arc JSON response to Grafana DataFrame
+// JSONToDataFrame converts Arc JSON response to Grafana DataFrame. A result
+// Arc reports as truncated is an error; one its row cap stopped renders with a
+// warning notice (see completeness.go).
 func JSONToDataFrame(result map[string]interface{}) (*data.Frame, error) {
+	capped, rowCap, err := jsonCompleteness(result)
+	if err != nil {
+		return nil, err
+	}
+	frame, err := jsonToFrame(result)
+	if err != nil {
+		return nil, err
+	}
+	if capped {
+		addNotice(frame, rowCapNotice(rowCap))
+	}
+	return frame, nil
+}
+
+func jsonToFrame(result map[string]interface{}) (*data.Frame, error) {
 	// Extract column names from Arc response
 	// Arc returns: {"columns": ["col1", "col2", ...], "data": [[row1], [row2], ...], "rows": N}
 	columnsInterface, ok := result["columns"]

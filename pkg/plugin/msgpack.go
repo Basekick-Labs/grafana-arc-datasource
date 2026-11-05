@@ -43,12 +43,7 @@ func queryMsgpack(ctx context.Context, settings *ArcInstanceSettings, sql string
 		"fields", len(frame.Fields),
 	)
 
-	frame.Meta = &data.FrameMeta{
-		ExecutedQueryString: sql,
-		Custom: map[string]interface{}{
-			"executionTime": duration.Milliseconds(),
-		},
-	}
+	setQueryMeta(frame, sql, duration.Milliseconds())
 
 	return frame, nil
 }
@@ -64,6 +59,8 @@ func queryMsgpack(ctx context.Context, settings *ArcInstanceSettings, sql string
 //	  "row_count":         uint
 //	  "execution_time_ms": uint
 //	  "timestamp":         string
+//	  "rows_capped":       bool          // optional (Arc#724): a row cap stopped the query
+//	  "row_cap":           uint          // optional, paired with rows_capped
 //	}
 //
 // Key order is fixed by the server (columns and types always precede data),
@@ -88,6 +85,13 @@ func MsgpackToDataFrame(r io.Reader, maxElems int64) (*data.Frame, error) {
 	var columns, types []string
 	var fields []*data.Field
 	sawData := false
+	// Completeness (see completeness.go). Arc's msgpack writer materializes
+	// the result, so a failure is a clean error status and it never sends
+	// truncated; it is read anyway so a server that does cannot pass for
+	// complete.
+	var truncated, capped bool
+	var truncationReason string
+	var rowCap int64
 
 	for i := 0; i < mapLen; i++ {
 		key, err := dec.DecodeString()
@@ -152,6 +156,32 @@ func MsgpackToDataFrame(r io.Reader, maxElems int64) (*data.Frame, error) {
 				return nil, fmt.Errorf("invalid error field: %w", err)
 			}
 			return nil, fmt.Errorf("arc error: %s", truncateForLog(msg))
+		case "truncated":
+			if truncated, err = dec.DecodeBool(); err != nil {
+				return nil, fmt.Errorf("invalid truncated field: %w", err)
+			}
+		case "truncation_reason":
+			isNil, err := nextIsNil(dec)
+			if err != nil {
+				return nil, fmt.Errorf("invalid truncation_reason field: %w", err)
+			}
+			if isNil {
+				continue
+			}
+			if truncationReason, err = dec.DecodeString(); err != nil {
+				return nil, fmt.Errorf("invalid truncation_reason field: %w", err)
+			}
+		case "rows_capped":
+			if capped, err = dec.DecodeBool(); err != nil {
+				return nil, fmt.Errorf("invalid rows_capped field: %w", err)
+			}
+		case "row_cap":
+			// The cap only words the notice: an odd value still caps.
+			n, err := dec.DecodeInt64()
+			if err != nil {
+				return nil, fmt.Errorf("invalid row_cap field: %w", err)
+			}
+			rowCap = n
 		default:
 			// success / row_count / execution_time_ms / timestamp / profile /
 			// future additions — not needed to build the frame.
@@ -167,7 +197,14 @@ func MsgpackToDataFrame(r io.Reader, maxElems int64) (*data.Frame, error) {
 		return nil, fmt.Errorf("malformed envelope: no data field")
 	}
 
-	return data.NewFrame("", fields...), nil
+	if truncated {
+		return nil, truncatedError(truncationReason)
+	}
+	frame := data.NewFrame("", fields...)
+	if capped {
+		addNotice(frame, rowCapNotice(rowCap))
+	}
+	return frame, nil
 }
 
 // checkedLen decodes an array-length header and validates it before any
