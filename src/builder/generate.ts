@@ -226,6 +226,49 @@ function validateFilter(f: Filter, i: number, errors: FieldError[]) {
   }
 }
 
+const FILL_RE = /^(null|previous|linear)$/;
+
+/**
+ * The WHERE clause: the time filter, then the user's filters. AND binds
+ * tighter than OR, as in InfluxQL and SQL; with any OR, each AND-group is
+ * parenthesised and the whole predicate wrapped, so an OR can never escape
+ * the time filter.
+ */
+export function whereSQL(filters: Filter[]): string {
+  const groups = andGroups(filters).map((g) => g.map((i) => filterSQL(filters[i])));
+  if (groups.length === 0) {
+    return '$__timeFilter(time)';
+  }
+  if (groups.length === 1) {
+    return ['$__timeFilter(time)', ...groups[0]].join(' AND ');
+  }
+  const ors = groups.map((g) => (g.length > 1 ? `(${g.join(' AND ')})` : g[0]));
+  return `$__timeFilter(time) AND (${ors.join(' OR ')})`;
+}
+
+/** Filter indexes by AND-group: a filter joined by OR starts a new group. */
+export function andGroups(filters: Filter[]): number[][] {
+  const groups: number[][] = [];
+  filters.forEach((f, i) => {
+    if (i === 0 || f.connector === 'OR') {
+      groups.push([i]);
+    } else {
+      groups[groups.length - 1].push(i);
+    }
+  });
+  return groups;
+}
+
+/**
+ * The filters a value lookup for filter i applies: the others in its own
+ * AND-group. A filter in another OR branch does not narrow which values
+ * this one can match.
+ */
+export function lookupFilters(filters: Filter[], i: number): Filter[] {
+  const group = andGroups(filters).find((g) => g.includes(i)) ?? [];
+  return group.filter((j) => j !== i).map((j) => ({ ...filters[j], connector: undefined }));
+}
+
 /**
  * Generates the SQL for a builder state, or explains why it cannot.
  * Never throws; never consults the schema.
@@ -287,6 +330,19 @@ export function generate(b: BuilderQuery, format: Format): GenerateResult {
       message: `"${timeGroup.interval}" is not an interval (use e.g. 10s, 5m, 1h, 1d)`,
     });
   }
+  const fill = timeGroup?.fill;
+  if (fill !== undefined && !FILL_RE.test(fill) && !isNumberLexeme(fill)) {
+    errors.push({
+      field: 'groupBy.time.fill',
+      message: `"${fill}" is not a fill: use null, previous, linear or a number`,
+    });
+  }
+  if (fill !== undefined && fill !== 'null' && b.select.some((s) => s.transform)) {
+    errors.push({
+      field: 'groupBy.time.fill',
+      message: 'With a transformation, fill can only be null: filling before or after it changes the rates',
+    });
+  }
   if (aggregated && format === 'time_series' && !timeGroup) {
     errors.push({ field: 'groupBy.time', message: 'An aggregated time series needs GROUP BY time' });
   }
@@ -311,7 +367,7 @@ export function generate(b: BuilderQuery, format: Format): GenerateResult {
   }
 
   const from = measurementVar !== undefined ? quoteIdent('${' + measurementVar + ':raw}') : quoteIdent(m);
-  const where = ['$__timeFilter(time)', ...b.where.map(filterSQL)].join(' AND ');
+  const where = whereSQL(b.where);
   const tagCols = tags.map(quoteIdent);
   const limitSQL = limit ? `\nLIMIT ${limit}` : '';
   const interval = timeGroup
@@ -320,8 +376,10 @@ export function generate(b: BuilderQuery, format: Format): GenerateResult {
       : quoteString(timeGroup.interval.trim())
     : '';
 
+  // Fill is the backend's: it fills time series only, so a table's SQL omits it.
+  const fillArg = fill !== undefined && format === 'time_series' ? `, ${fill === 'null' ? 'NULL' : fill}` : '';
   if (transformed) {
-    return { sql: transformedSQL(b, format, names, from, where, tagCols, interval, limitSQL) };
+    return { sql: transformedSQL(b, format, names, from, where, tagCols, interval, limitSQL, fillArg) };
   }
 
   const fields = b.select.map((s, i) => {
@@ -344,7 +402,7 @@ export function generate(b: BuilderQuery, format: Format): GenerateResult {
   }
 
   if (timeGroup) {
-    const cols = [`$__timeGroup(time, ${interval}) AS "time"`, ...tagCols, ...fields].join(', ');
+    const cols = [`$__timeGroup(time, ${interval}${fillArg}) AS "time"`, ...tagCols, ...fields].join(', ');
     const groupBy = Array.from({ length: 1 + tagCols.length }, (_, i) => String(i + 1)).join(', ');
     const order = format === 'time_series' ? 'ASC' : (b.orderByTime ?? 'ASC');
     return {
@@ -590,7 +648,8 @@ function transformedSQL(
   where: string,
   tagCols: string[],
   interval: string,
-  limitSQL: string
+  limitSQL: string,
+  fillArg: string
 ): string {
   const aggregated = b.select.some((s) => isAggregate(s.fn));
   const back = aggregated ? Math.max(...b.select.map((s) => lookback(s.transform))) : 0;
@@ -598,7 +657,7 @@ function transformedSQL(
   const innerWhere =
     back > 0 ? where.replace('$__timeFilter(time)', `$__timeFilterLookback(time, ${interval}, ${back})`) : where;
   const inner = b.select.map((s, i) => `${selectExpr(s)} AS "__v${i}"`);
-  const head = aggregated ? `$__timeGroup(time, ${interval}) AS "__t"` : 'time AS "__t"';
+  const head = aggregated ? `$__timeGroup(time, ${interval}${fillArg}) AS "__t"` : 'time AS "__t"';
   const groupBy = aggregated
     ? `\n  GROUP BY ${Array.from({ length: 1 + tagCols.length }, (_, i) => String(i + 1)).join(', ')}`
     : '';
@@ -650,7 +709,7 @@ export function valuesSQL(
   otherFilters.forEach((f, i) => validateFilter(f, i, errors));
   const usable = errors.length === 0 ? otherFilters : [];
   const c = quoteIdent(column);
-  const clauses = ['$__timeFilter(time)', ...usable.map(filterSQL)];
+  const clauses = [whereSQL(usable)];
   const q = search.trim().slice(0, 100);
   if (q) {
     // contains(), not LIKE: no wildcard escaping to get wrong.

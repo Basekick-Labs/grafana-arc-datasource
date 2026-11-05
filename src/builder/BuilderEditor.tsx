@@ -31,7 +31,7 @@ import {
   TransformKind,
   emptyBuilder,
 } from '../types';
-import { FieldError, defaultAlias, generate, isAggregate, variableName } from './generate';
+import { FieldError, defaultAlias, generate, isAggregate, lookupFilters, variableName } from './generate';
 import {
   ColumnKind,
   FUNCTIONS,
@@ -55,6 +55,14 @@ export interface BuilderEditorProps {
   range?: TimeRange;
   app?: CoreApp;
 }
+
+const FILLS: Array<{ label: string; value: string; description: string }> = [
+  { label: 'none', value: 'none', description: 'Empty buckets are left out' },
+  { label: 'null', value: 'null', description: 'Empty buckets show as gaps (InfluxQL default)' },
+  { label: 'previous', value: 'previous', description: 'The previous value' },
+  { label: 'linear', value: 'linear', description: 'Interpolated between neighbours' },
+  { label: '0', value: '0', description: 'Zero; type another number for that' },
+];
 
 const INTERVALS = ['$__interval', '1s', '10s', '30s', '1m', '5m', '10m', '15m', '30m', '1h', '6h', '12h', '1d'];
 /** A "+" segment trigger. The label sits on a wrapper: Grafana 13.3's Icon no longer passes aria-label through. */
@@ -264,7 +272,7 @@ export function BuilderEditor({
         return [];
       }
       const f = b.where[i];
-      const others = b.where.filter((_, j) => j !== i);
+      const others = lookupFilters(b.where, i);
       const opts: Array<SelectableValue<string>> = [...varOptions];
       if (kindOfColumn(f.column) === 'string' || kindOfColumn(f.column) === 'unknown') {
         const { values, more } = await datasource.getValues(b, database, f.column, others, search ?? '', range);
@@ -334,7 +342,14 @@ export function BuilderEditor({
 
   const updateFilter = (i: number, patch: Partial<Filter>) =>
     commit({ ...b, where: b.where.map((f, j) => (j === i ? { ...f, ...patch } : f)) });
-  const removeFilter = (i: number) => commit({ ...b, where: b.where.filter((_, j) => j !== i) });
+  // The first filter joins nothing: drop its connector when one moves up.
+  const removeFilter = (i: number) =>
+    commit({
+      ...b,
+      where: b.where
+        .filter((_, j) => j !== i)
+        .map((f, j) => (j === 0 && f.connector ? { ...f, connector: undefined } : f)),
+    });
   const addFilter = (column: string) => {
     const kind = kindOfColumn(column);
     commit({ ...b, where: [...b.where, { column, op: '=', valueType: valueTypeFor(kind) }] });
@@ -383,7 +398,17 @@ export function BuilderEditor({
           const valueless = f.op === 'IS NULL' || f.op === 'IS NOT NULL';
           return (
             <React.Fragment key={i}>
-              {i > 0 && <InlineLabel width="auto">AND</InlineLabel>}
+              {i > 0 && (
+                <Segment<'AND' | 'OR'>
+                  value={f.connector ?? 'AND'}
+                  aria-label={`Connector before filter ${i + 1}`}
+                  options={[
+                    { label: 'AND', value: 'AND' },
+                    { label: 'OR', value: 'OR', description: 'AND binds tighter: a AND b OR c is (a AND b) OR c' },
+                  ]}
+                  onChange={(o) => updateFilter(i, { connector: o.value === 'OR' ? 'OR' : undefined })}
+                />
+              )}
               <Segment
                 value={f.column}
                 options={columnOptions('filter')}
@@ -565,10 +590,44 @@ export function BuilderEditor({
                   options={INTERVALS.map((v) => ({ label: v, value: v }))}
                   allowCustomValue
                   onChange={(o) =>
-                    commit({ ...b, groupBy: { ...b.groupBy, time: { interval: o.value ?? '$__interval' } } })
+                    commit({
+                      ...b,
+                      groupBy: { ...b.groupBy, time: { ...b.groupBy.time, interval: o.value ?? '$__interval' } },
+                    })
                   }
                 />
                 <InlineLabel width="auto">)</InlineLabel>
+                {format === 'time_series' && (
+                  <>
+                    <InlineLabel width="auto">fill(</InlineLabel>
+                    <Segment<string>
+                      value={b.groupBy.time.fill ?? 'none'}
+                      aria-label="Fill"
+                      allowCustomValue
+                      options={FILLS.map((o) => {
+                        const why =
+                          o.value !== 'none' && o.value !== 'null' && b.select.some((s) => s.transform)
+                            ? 'not with a transformation'
+                            : undefined;
+                        return {
+                          ...o,
+                          description: why ? `${o.description}: ${why}` : o.description,
+                          isDisabled: !!why,
+                        };
+                      })}
+                      onChange={(o) =>
+                        commit({
+                          ...b,
+                          groupBy: {
+                            ...b.groupBy,
+                            time: { ...b.groupBy.time!, fill: !o.value || o.value === 'none' ? undefined : o.value },
+                          },
+                        })
+                      }
+                    />
+                    <InlineLabel width="auto">)</InlineLabel>
+                  </>
+                )}
                 {format === 'table' && (
                   <IconButton
                     name="times"

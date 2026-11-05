@@ -164,6 +164,8 @@ export interface Filter {
   /** Literal as typed, or a variable reference ($name / ${name}). Unused for IS [NOT] NULL. */
   value?: string;
   valueType?: FilterValueType;
+  /** How this filter joins the one before it; the first filter's is ignored. AND binds tighter than OR. */
+  connector?: 'AND' | 'OR';
 }
 
 export interface BuilderQuery {
@@ -173,7 +175,7 @@ export interface BuilderQuery {
    * Bumped whenever generate() can produce different SQL for the same state,
    * or the state gains fields: an older plugin then opens the query in Code
    * rather than regenerating it without them (mode.ts). 2: transformations,
-   * math, auto-suffixed default aliases.
+   * math, auto-suffixed default aliases. 3: fill, OR filters.
    */
   generatorVersion: number;
   /** Fingerprint: exactly the SQL generate() committed. '' while the query is incomplete. */
@@ -181,14 +183,18 @@ export interface BuilderQuery {
   measurement?: string;
   select: SelectItem[];
   where: Filter[];
-  groupBy: { time?: { interval: string }; tags: string[] };
+  groupBy: {
+    /** fill: NULL, previous, linear or a number lexeme for $__timeGroup's third argument; unset fills nothing. */
+    time?: { interval: string; fill?: string };
+    tags: string[];
+  };
   orderByTime?: 'ASC' | 'DESC';
   /** Integer lexeme; empty means no LIMIT. */
   limit?: string;
 }
 
 /** The generator version new and edited builder queries carry. */
-export const GENERATOR_VERSION = 2;
+export const GENERATOR_VERSION = 3;
 
 /** A fresh, empty builder state. */
 export function emptyBuilder(): BuilderQuery {
