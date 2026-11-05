@@ -1,5 +1,7 @@
 import {
   DataQueryRequest,
+  TimeRange,
+  dateTime,
   DataQueryResponse,
   MetricFindValue,
   DataSourceInstanceSettings,
@@ -9,9 +11,15 @@ import {
   LegacyMetricFindQueryOptions,
 } from '@grafana/data';
 import { frameToMetricFindValue, DataSourceWithBackend, getTemplateSrv } from '@grafana/runtime';
-import { ArcQuery, ArcDataSourceOptions, defaultQuery } from './types';
+import { ArcQuery, ArcDataSourceOptions, BuilderQuery, Filter, builderDefaultQuery, emptyBuilder } from './types';
 import { escapeLiteral, quoteLiteral, resolveTimezone } from './interpolation';
+import { resolveMode } from './builder/mode';
+import { builderFormat, rawSingle, VariableUseError } from './builder/interpolate';
+import { MEASUREMENT_RE, valuesSQL, variableName } from './builder/generate';
 import { lastValueFrom, Observable } from 'rxjs';
+
+/** The backend's database-name rule (pkg/plugin/safety.go databaseNameRe). */
+const DATABASE_RE = /^[A-Za-z0-9_-]+$/;
 
 /**
  * Shapes a `metricFindQuery` argument can arrive as. Grafana's
@@ -29,8 +37,11 @@ type VariableQueryInput = string | { sql?: string; query?: string; rawSql?: stri
  * all backend communication and frame parsing
  */
 export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSourceOptions> {
+  private readonly options: ArcDataSourceOptions;
+
   constructor(instanceSettings: DataSourceInstanceSettings<ArcDataSourceOptions>) {
     super(instanceSettings);
+    this.options = instanceSettings.jsonData ?? {};
   }
 
   /**
@@ -79,8 +90,35 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     return out;
   }
 
+  /**
+   * New queries open in the visual builder. Grafana also merges this over
+   * existing queries (alert rules, datasource switches), which is why the
+   * editor decides the mode with resolveMode rather than by `editorMode`.
+   */
   getDefaultQuery(_: CoreApp): Partial<ArcQuery> {
-    return defaultQuery;
+    return builderDefaultQuery();
+  }
+
+  /**
+   * Skips builder queries that are not complete yet (their `sql` is empty),
+   * so a dashboard refresh does not send them. Never skips a query that has
+   * SQL, or one migrated from another SQL datasource (`rawSql`).
+   */
+  filterQuery(query: ArcQuery): boolean {
+    if (resolveMode(query) === 'builder' && !(query.sql ?? '').trim()) {
+      return false;
+    }
+    return true;
+  }
+
+  /** Whether the datasource lets a query pick another database. */
+  allowsDatabaseOverride(): boolean {
+    return this.options.allowDatabaseOverride ?? true;
+  }
+
+  /** The datasource's configured database. */
+  defaultDatabase(): string {
+    return this.options.database || 'default';
   }
 
   /**
@@ -156,12 +194,144 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     });
   }
 
+  /**
+   * Interpolates variables before a query is sent. Builder queries use
+   * builderFormat (every value a complete literal); Code queries keep the
+   * historical rule above. In both, a variable database is resolved to one
+   * name and validated, and builder state is not sent to the backend.
+   */
   applyTemplateVariables(query: ArcQuery, scopedVars: ScopedVars): ArcQuery {
-    return {
-      ...query,
-      sql: getTemplateSrv().replace(query.sql, scopedVars, this.interpolateVariable),
-    };
+    const { builder, ...rest } = query;
+    const templateSrv = getTemplateSrv();
+    const out: ArcQuery = { ...rest };
+    if (query.database) {
+      out.database = interpolateName(query.database, scopedVars, 'database', DATABASE_RE);
+    }
+    if (resolveMode(query) === 'builder') {
+      const m = builder?.measurement;
+      if (m && variableName(m) !== undefined) {
+        interpolateName(m, scopedVars, 'measurement', MEASUREMENT_RE);
+      }
+      out.sql = templateSrv.replace(query.sql, scopedVars, builderFormat);
+    } else {
+      out.sql = templateSrv.replace(query.sql, scopedVars, this.interpolateVariable);
+    }
+    return out;
   }
+
+  /**
+   * Used by "New alert rule" from a panel (and Explore). Alert evaluation
+   * never interpolates variables, so the rule stores the SQL with today's
+   * values, as Code: the builder state no longer matches it.
+   */
+  interpolateVariablesInQueries(queries: ArcQuery[], scopedVars: ScopedVars): ArcQuery[] {
+    return queries.map((q) => {
+      const out = this.applyTemplateVariables(q, scopedVars);
+      return { ...out, editorMode: 'code' as const };
+    });
+  }
+
+  /** Query builder metadata (backend routes in pkg/plugin/resources.go). */
+  async getDatabases(): Promise<{ databases: string[]; scoped: boolean }> {
+    return this.getResource('databases');
+  }
+
+  async getMeasurements(database: string): Promise<string[]> {
+    const res = await this.getResource('measurements', database ? { database } : {});
+    return res.measurements ?? [];
+  }
+
+  /**
+   * Distinct values of `column` for a filter's value dropdown: at most
+   * `limit`, `more` set when there are others. The SQL comes from the
+   * builder's generator, so the other filters apply exactly as in the query,
+   * and it runs through the normal query path on the datasource's own
+   * protocol, over `range` (the panel's time range).
+   */
+  async getValues(
+    builder: BuilderQuery,
+    database: string,
+    column: string,
+    otherFilters: Filter[],
+    search: string,
+    range: TimeRange | undefined,
+    limit = 100
+  ): Promise<{ values: string[]; more: boolean }> {
+    const sql = valuesSQL(builder, column, otherFilters, search, limit);
+    if (!sql) {
+      return { values: [], more: false };
+    }
+    const to = dateTime();
+    const r: TimeRange = range ?? { from: dateTime(to).subtract(1, 'hour'), to, raw: { from: 'now-1h', to: 'now' } };
+    const target: ArcQuery = {
+      refId: 'builderValues',
+      sql,
+      format: 'table',
+      splitDuration: 'off',
+      // Marked as builder SQL so variables in the other filters are
+      // interpolated the way the builder query itself will be.
+      editorMode: 'builder',
+      builder: { ...emptyBuilder(), measurement: builder.measurement, sql },
+      ...(database ? { database } : {}),
+    };
+    const request = {
+      targets: [target],
+      range: r,
+      scopedVars: {},
+      interval: '1m',
+      intervalMs: 60000,
+    } as unknown as DataQueryRequest<ArcQuery>;
+    const rsp = await lastValueFrom(this.query(request));
+    if (rsp.errors?.length) {
+      throw new Error(rsp.errors[0].message ?? 'value lookup failed');
+    }
+    const values = this.toMetricFindValue(rsp).map((v) => String(v.text));
+    return { values: values.slice(0, limit), more: values.length > limit };
+  }
+
+  async getColumns(database: string, measurement: string): Promise<ColumnsResponse> {
+    const params: Record<string, string> = { measurement };
+    if (database) {
+      params.database = database;
+    }
+    return this.getResource('columns', params);
+  }
+}
+
+export interface ColumnInfo {
+  name: string;
+  type: string;
+}
+
+export interface ColumnsResponse {
+  columns: ColumnInfo[];
+  /** schema: Arc's stored schema; describe: inferred from recent data; none: unknown. */
+  source: 'schema' | 'describe' | 'none';
+  message?: string;
+}
+
+/**
+ * Resolves a database or measurement that may be a variable to one name and
+ * checks it. A multi-value selection or a name the backend would refuse is an
+ * error naming the variable, rather than a confusing failure from Arc.
+ */
+function interpolateName(raw: string, scopedVars: ScopedVars, what: string, re: RegExp): string {
+  if (!raw.includes('$')) {
+    return raw;
+  }
+  let value: string;
+  try {
+    value = getTemplateSrv().replace(raw, scopedVars, rawSingle);
+  } catch (e) {
+    if (e instanceof VariableUseError) {
+      throw new Error(`The ${what} variable ${raw}: ${e.message}`);
+    }
+    throw e;
+  }
+  if (!re.test(value)) {
+    throw new Error(`The ${what} variable ${raw} resolved to "${value}", which is not a valid ${what} name`);
+  }
+  return value;
 }
 
 /**

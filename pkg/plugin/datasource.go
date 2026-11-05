@@ -573,14 +573,49 @@ func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceS
 // the wire protocol the datasource is configured for. Protocol is validated
 // at instance construction, so the default arm only ever sees ProtocolArrow.
 func executeProtocolQuery(ctx context.Context, settings *ArcInstanceSettings, sql string) (*data.Frame, error) {
+	var frame *data.Frame
+	var err error
 	switch settings.settings.Protocol {
 	case ProtocolMsgpack:
-		return queryMsgpack(ctx, settings, sql)
+		frame, err = queryMsgpack(ctx, settings, sql)
 	case ProtocolJSON:
-		return queryJSON(ctx, settings, sql)
+		frame, err = queryJSON(ctx, settings, sql)
 	default:
-		return queryArrow(ctx, settings, sql)
+		frame, err = queryArrow(ctx, settings, sql)
 	}
+	return frame, explainLongSQL(err, sql)
+}
+
+// arcDefaultMaxSQLLength is Arc's default query.max_sql_length: fixed in
+// 26.09.3, configurable from 27.01.1.
+const arcDefaultMaxSQLLength = 10000
+
+// sqlTooLongError is Arc's 400 for a statement over its default length cap,
+// explained. Arc rejects those in validation, and on the Arrow endpoint says
+// only "query failed (see server logs for detail)". The message is the
+// plugin's own, so the panel can show it without exposing Arc's internals.
+type sqlTooLongError struct {
+	length int
+	cause  error
+}
+
+func (e *sqlTooLongError) Error() string {
+	return fmt.Sprintf("Arc refused the query: it is %d characters after variables and macros, and Arc refuses queries longer than its "+
+		"query.max_sql_length (%d by default). A dashboard variable with many values selected is the usual cause: "+
+		"select fewer values, or raise query.max_sql_length (Arc 27.01.1 and later).", e.length, arcDefaultMaxSQLLength)
+}
+
+func (e *sqlTooLongError) Unwrap() error { return e.cause }
+
+// explainLongSQL recognises Arc's 400 for an over-long statement. The usual
+// cause is a dashboard variable with many values selected ("All" over
+// hundreds of hosts) expanding into a long IN list.
+func explainLongSQL(err error, sql string) error {
+	var httpErr *arcHTTPError
+	if err == nil || len(sql) <= arcDefaultMaxSQLLength || !errors.As(err, &httpErr) || httpErr.Status != http.StatusBadRequest {
+		return err
+	}
+	return &sqlTooLongError{length: len(sql), cause: err}
 }
 
 // frameSchemaCompatible returns true when `f` can be safely appended into

@@ -419,7 +419,18 @@ func sanitizeUserErrorWith(refID string, err error, extra ...any) string {
 	// Typed-error matching first (preferred). String contains is a fallback
 	// for paths that don't have a typed sentinel yet.
 	var maxBytesErr *http.MaxBytesError
+	var tooLong *sqlTooLongError
+	var httpErr *arcHTTPError
 	switch {
+	case errors.As(err, &tooLong):
+		return tooLong.Error()
+	case errors.As(err, &httpErr) && (httpErr.Status == http.StatusUnauthorized || httpErr.Status == http.StatusForbidden):
+		// Arc's own text names the database and measurement refused; this
+		// message names neither, so a viewer learns nothing about what
+		// exists. Arc answers 403 for both an unknown key and a key whose
+		// RBAC role does not cover the database (issue #20 matrix).
+		return fmt.Sprintf("Arc refused access (HTTP %d): the datasource's API key is not valid, or may not read the database "+
+			"or measurement this query uses. Check the query's database, or the key's permissions in Arc.", httpErr.Status)
 	case errors.Is(err, errBlockedAddr):
 		return "Arc URL resolves to a blocked address (private/loopback). Update the datasource URL or enable 'Allow Private IPs'."
 	case errors.As(err, &maxBytesErr):

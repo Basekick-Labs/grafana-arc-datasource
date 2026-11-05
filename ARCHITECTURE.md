@@ -210,6 +210,35 @@ SELECT time_bucket(INTERVAL '1 minute', time) as time, AVG(usage)
 }
 ```
 
+A query built in the visual builder (issue #20) also carries its builder
+state. `sql` is still the only thing the backend executes; `builder` never
+leaves the browser (applyTemplateVariables strips it).
+
+```json
+{
+  "refId": "A",
+  "editorMode": "builder",
+  "format": "time_series",
+  "sql": "SELECT $__timeGroup(time, $__interval) AS \"time\", \"host\", avg(\"usage_idle\") AS \"mean\"\nFROM \"cpu\"\nWHERE $__timeFilter(time)\nGROUP BY 1, 2\nORDER BY 1",
+  "builder": {
+    "version": 1,
+    "generatorVersion": 1,
+    "sql": "<exactly the SQL above: the fingerprint>",
+    "measurement": "cpu",
+    "select": [{ "column": "usage_idle", "fn": "mean" }],
+    "where": [],
+    "groupBy": { "time": { "interval": "$__interval" }, "tags": ["host"] }
+  }
+}
+```
+
+The editor opens a query in Builder only when `builder.sql` equals `sql`
+(`src/builder/mode.ts`). Grafana merges `getDefaultQuery()` over existing
+queries in the alert editor and on a datasource switch, so `editorMode` alone
+would flip legacy queries into an empty builder; the fingerprint is what
+proves the SQL is the builder's. A query with no SQL at all is new and opens
+in Builder.
+
 ## Frontend Components
 
 ### 1. ConfigEditor.tsx
@@ -238,37 +267,33 @@ SELECT time_bucket(INTERVAL '1 minute', time) as time, AVG(usage)
 └─────────────────────────────────────────┘
 ```
 
-### 2. QueryEditor.tsx
+### 2. QueryEditor.tsx and the query builder (src/builder/)
 
-**Purpose:** SQL query builder
+**Purpose:** edit a query as SQL (Code) or with the visual builder (Builder).
 
-**Features:**
-- Multi-line SQL text area
-- Syntax hints for macros
-- Format selector (time series vs table)
-- Run on blur or explicit run
-
-**User Experience:**
-```
-┌─────────────────────────────────────────┐
-│ Format: ◉ Time series  ◯ Table         │
-├─────────────────────────────────────────┤
-│ SQL Query:                              │
-│ ┌─────────────────────────────────────┐ │
-│ │ SELECT                              │ │
-│ │   time,                             │ │
-│ │   host,                             │ │
-│ │   AVG(usage_idle) as avg_cpu        │ │
-│ │ FROM cpu                            │ │
-│ │ WHERE $__timeFilter(time)           │ │
-│ │ GROUP BY time, host                 │ │
-│ │ ORDER BY time                       │ │
-│ └─────────────────────────────────────┘ │
-│                                         │
-│ Macros: $__timeFilter(column),         │
-│         $__timeFrom(), $__timeTo()     │
-└─────────────────────────────────────────┘
-```
+- `QueryEditor.tsx`: the Builder/Code toggle, Format and Splitting, and the
+  Code editor (a SQL text area with macro hints). Switching Code to Builder
+  asks first; code changes are not parsed back into the builder.
+- `builder/BuilderEditor.tsx`: InfluxQL-style rows (FROM/WHERE, SELECT,
+  GROUP BY, ORDER BY/LIMIT) built from `@grafana/ui` segments, plus the SQL
+  preview. Every change regenerates `sql` and the fingerprint together; an
+  incomplete query saves `sql: ""`, which `filterQuery` keeps out of
+  dashboard refreshes.
+- `builder/generate.ts`: the pure generator. State in, SQL or field errors
+  out, never reading the schema. Identifiers are double-quoted, literals
+  exact (numbers as typed), negated operators NULL-inclusive
+  (`(c != 'v' OR c IS NULL)`; Arc refuses `IS DISTINCT FROM '<literal>'`).
+  `GROUP BY`/`ORDER BY` are positional.
+- `builder/interpolate.ts`: `builderFormat`, the variable format for builder
+  SQL (every value a quoted literal, an empty selection `NULL`).
+  Grafana's `:sqlstring` is not used: it escapes `"` with a backslash and
+  turns an empty selection into `IN ()`.
+- `builder/variables.ts`, `builder/columns.ts`: edit-time rules (variables
+  that cannot work where they are used; operators and functions by column
+  type).
+- Metadata comes from backend resource routes (`pkg/plugin/resources.go`:
+  `databases`, `measurements`, `columns`); filter value suggestions run a
+  `SELECT DISTINCT` built by the same generator through the normal query path.
 
 ### 3. VariableQueryEditor.tsx
 
@@ -497,10 +522,10 @@ systemctl restart grafana-server
 
 ### Planned Features
 
-1. **Query Builder UI**
-   - Visual query builder (no SQL needed)
-   - Drag-and-drop metric selection
-   - Auto-complete for tables/columns
+1. **Query builder, next iteration**
+   - `non_negative_derivative`/`derivative`, `difference`, `moving_average`,
+     `cumulative_sum`, math on fields, `fill()`, `OR` groups, `GROUP BY *`
+   - A builder for variable queries
 
 2. **Streaming Queries**
    - Real-time data updates

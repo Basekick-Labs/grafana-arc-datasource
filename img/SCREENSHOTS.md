@@ -14,6 +14,14 @@ Add these screenshots to this directory:
 - **Recommended size**: 1920x1080 or similar
 - **Tips**: Use a 6-hour time range to show good data variety
 
+### 2a. query-builder.png
+- **What to capture**: the visual query builder in panel edit
+- **Should include**:
+  - FROM / WHERE / SELECT / GROUP BY rows with a real measurement
+  - A filter value dropdown open, showing suggested values
+  - The SQL preview under the rows
+  - A time series panel with one series per tag
+
 ### 2. query-editor.png
 - **What to capture**: Query editor panel in edit mode
 - **Should include**:

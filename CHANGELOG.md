@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- A visual query builder (#20), modelled on Grafana's InfluxDB (InfluxQL)
+  editor. New queries open in it:
+  - **Rows:** FROM (database, measurement), WHERE filters, SELECT with
+    `mean`, `median`, `sum`, `count`, `count distinct`, `min`, `max`,
+    `first`, `last`, `stddev`, `spread`, `percentile` or `raw`, GROUP BY
+    `time()` and tags, ORDER BY time and LIMIT.
+  - **SQL:** every change writes Arc SQL, shown under the rows. That SQL is
+    what runs, so alerts and all three protocols work as for typed SQL.
+  - **Suggestions:** databases, measurements and columns come from Arc;
+    filter values are the distinct values in the panel's time range,
+    narrowed by the other filters.
+  - **Variables:** offered in every dropdown. On `=` and `!=` a variable
+    becomes `IN (…)` / `NOT IN (…)`, so multi-value and All selections work.
+    A database can come from a variable too.
+  - **Code mode:** existing queries open in Code, unchanged. **Edit as SQL**
+    switches a builder query to Code; going back asks first.
+  - **Alerts:** "New alert rule" from a builder panel stores the SQL with the
+    variables' current values, as Code: alert rules are evaluated without
+    dashboard variables.
 - Backend metadata routes for the upcoming visual query builder (#20): list
   databases, a database's measurements, and a measurement's columns with
   their types. They go through the plugin, so the API key stays on the
@@ -29,6 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a chunk edge came back as two partial rows with the same timestamp.
 - An empty query fails with "Query is empty" instead of being sent to Arc,
   which answered with a bare "SQL query is required".
+- A query longer than Arc's `query.max_sql_length` (10,000 characters by
+  default) now says so. Arc refuses it in validation, and on the Arrow
+  endpoint the panel showed only "query failed (see server logs for detail)".
+  The usual cause is a variable with many values selected.
+- A query Arc refuses for lack of access (HTTP 401 or 403) now says so: the
+  key is not valid, or its role may not read that database. It showed only
+  "query failed (see server logs for detail)". The message does not name the
+  refused database or measurement.
+- A `$` variable in the per-query database override is now interpolated. It
+  used to be sent literally and refused.
 - Results Arc cuts short no longer render as complete (Arc#726). Arc reports
   two different things, and the panel now shows each one:
   - **Truncated:** the stream failed part way, so the rows are not the
