@@ -182,7 +182,7 @@ The datasource provides several macros for dynamic queries:
 | `$__timeFrom()` | Start of time range | `time >= $__timeFrom()` |
 | `$__timeTo()` | End of time range | `time < $__timeTo()` |
 | `$__interval` | Grafana's calculated interval | `$__timeGroup(time, '$__interval')` |
-| `$__timeGroup(columnName, interval)` | Epoch-based time bucketing | `$__timeGroup(time, '1m') AS time` |
+| `$__timeGroup(columnName, interval)` | Epoch-based time bucketing. The interval is `<n><unit>`: `s`, `m`, `h`, `d`, `w`, or `ms`, which rounds up to whole seconds (`500ms` buckets by 1s) | `$__timeGroup(time, '1m') AS time` |
 
 ### Variables
 

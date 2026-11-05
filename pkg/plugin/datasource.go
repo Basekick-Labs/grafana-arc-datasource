@@ -110,6 +110,10 @@ type ArcInstanceSettings struct {
 	client           *http.Client
 	sem              *semaphore.Weighted
 	maxResponseBytes int64 // resolved from MaxResponseMB at construction time
+	// meta caches the query builder's metadata lookups (resources.go). A
+	// pointer, so the per-query database override's shallow copy of these
+	// settings shares it instead of copying a mutex.
+	meta *metaCache
 }
 
 // Dispose is called by the InstanceManager when the cached instance is being
@@ -174,6 +178,35 @@ func (s *ArcInstanceSettings) doRequest(ctx context.Context, path string, body a
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	return s.send(ctx, req)
+}
+
+// doGet issues a GET to an Arc API path (the metadata routes behind the
+// query builder) through the same semaphore, auth, response cap and dial
+// policy as doRequest. Same ownership rule: the caller must Close() the
+// returned reader.
+func (s *ArcInstanceSettings) doGet(ctx context.Context, path string) (*semReleasingReader, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", s.settings.URL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	return s.send(ctx, req)
+}
+
+// arcHTTPError is a non-200 answer from Arc. Error() is the message the query
+// path has always shown; Status lets callers tell "no permission" from "not
+// found" from "unavailable" without parsing it.
+type arcHTTPError struct {
+	Status int
+	Msg    string
+}
+
+func (e *arcHTTPError) Error() string { return e.Msg }
+
+// send runs req with the auth and database headers, under the shared
+// concurrency semaphore. On 200 the slot is handed to the returned reader;
+// any other status is read (bounded) into an *arcHTTPError.
+func (s *ArcInstanceSettings) send(ctx context.Context, req *http.Request) (*semReleasingReader, error) {
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	if s.settings.Database != "" {
 		req.Header.Set("X-Arc-Database", s.settings.Database)
@@ -201,7 +234,7 @@ func (s *ArcInstanceSettings) doRequest(ctx context.Context, path string, body a
 		// Arc error payload (gemini 3244935449).
 		raw, _ := io.ReadAll(io.LimitReader(capped, 16*1024))
 		_ = resp.Body.Close()
-		return nil, errors.New(parseArcError(resp.StatusCode, raw))
+		return nil, &arcHTTPError{Status: resp.StatusCode, Msg: parseArcError(resp.StatusCode, raw)}
 	}
 
 	// Transfer ownership of the semaphore slot to the returned reader —
@@ -221,15 +254,18 @@ func (s *ArcInstanceSettings) doRequest(ctx context.Context, path string, body a
 // caches per-instance settings + HTTP client so QueryData does not pay the
 // JSON-unmarshal-and-build-client cost on every refresh.
 type ArcDatasource struct {
-	im instancemgmt.InstanceManager
+	im        instancemgmt.InstanceManager
+	resources backend.CallResourceHandler // query builder metadata (resources.go)
 }
 
 // NewArcDatasource constructs the datasource with the SDK's InstanceManager
 // wired up to the newArcInstance factory.
 func NewArcDatasource() *ArcDatasource {
-	return &ArcDatasource{
+	d := &ArcDatasource{
 		im: datasource.NewInstanceManager(newArcInstance),
 	}
+	d.resources = d.newResourceHandler()
+	return d
 }
 
 // newArcInstance is the SDK InstanceFactoryFunc — invoked once per (settings,
@@ -322,6 +358,7 @@ func newArcInstance(_ context.Context, instanceSettings backend.DataSourceInstan
 		apiKey:           apiKey,
 		sem:              semaphore.NewWeighted(int64(dsSettings.MaxInFlight)),
 		maxResponseBytes: int64(dsSettings.MaxResponseMB) * 1024 * 1024,
+		meta:             newMetaCache(),
 	}
 	// SSRF dial policy is two-axis (gemini 3244943519): a loopback URL only
 	// unlocks loopback IPs (so a 302 redirect to `10.0.0.5` is still
@@ -684,6 +721,16 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	// Migrate rawSql from Postgres/MySQL/MSSQL/ClickHouse datasources.
 	if qm.SQL == "" && qm.RawSQL != "" {
 		qm.SQL = qm.RawSQL
+	}
+
+	// An empty statement is never worth a round trip: Arc answers with a bare
+	// "SQL query is required". The builder leaves `sql` empty while a query is
+	// incomplete; the editor's filterQuery keeps those out of dashboard
+	// refreshes, but alert evaluation and public dashboards run saved queries
+	// without it, so say what is actually wrong here.
+	if strings.TrimSpace(qm.SQL) == "" {
+		return backend.ErrDataResponse(backend.StatusBadRequest,
+			"Query is empty (an incomplete builder query?). Complete the query in the editor, or switch it to Code.")
 	}
 
 	// Per-query database override (R2-HI6 — confused-deputy guard):

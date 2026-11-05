@@ -27,8 +27,9 @@ func main() {
 	// design and is tracked as a standalone refactor.
 	//nolint:staticcheck
 	if err := datasource.Serve(datasource.ServeOpts{
-		QueryDataHandler:   ds,
-		CheckHealthHandler: ds,
+		QueryDataHandler:    ds,
+		CheckHealthHandler:  ds,
+		CallResourceHandler: ds,
 	}); err != nil {
 		log.DefaultLogger.Error(err.Error())
 		os.Exit(1)

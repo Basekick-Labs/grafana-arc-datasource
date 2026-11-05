@@ -439,6 +439,29 @@ func intervalMilliseconds(duration time.Duration) int64 {
 	return size.Milliseconds()
 }
 
+// skipQuoted returns the index just past the quoted span that opens at i
+// (sql[i] == q), honoring the doubled-quote escape (two single quotes in a
+// literal, two double quotes in an identifier). An unterminated span runs to the end of sql.
+//
+// The walkers here use it for double-quoted identifiers as well as literals:
+// an identifier may contain a `'` (`"it's"`), and a walker that only knows
+// about single-quoted literals reads that apostrophe as the start of one and
+// stops expanding macros for the rest of the statement (issue #20 review M5).
+func skipQuoted(sql string, i int, q byte) int {
+	i++
+	for i < len(sql) {
+		if sql[i] == q {
+			if i+1 < len(sql) && sql[i+1] == q {
+				i += 2
+				continue
+			}
+			return i + 1
+		}
+		i++
+	}
+	return len(sql)
+}
+
 // replaceMacroOccurrences walks `sql` once and rewrites every occurrence of
 // `macro` that lives outside string literals and comments. For each in-scope
 // occurrence the inner argument (between the macro's opening paren and the
@@ -466,6 +489,14 @@ func replaceMacroOccurrences(sql, macro string, rewrite func(arg string) (string
 	out.Grow(len(sql))
 	i := 0
 	for i < len(sql) {
+		// Skip "..." quoted identifiers (preserve verbatim). A `'` inside one
+		// is part of the name, not the start of a literal.
+		if sql[i] == '"' {
+			end := skipQuoted(sql, i, '"')
+			out.WriteString(sql[i:end])
+			i = end
+			continue
+		}
 		// Skip over '...' string literals (preserve verbatim).
 		if sql[i] == '\'' {
 			out.WriteByte(sql[i])
@@ -568,6 +599,15 @@ func replaceIntervalToken(sql, token, replacement string) string {
 	out.Grow(len(sql))
 	i := 0
 	for i < len(sql) {
+		// "..." quoted identifiers: copied verbatim, so a `--` or `/*` inside a
+		// column name is not taken for a comment. Literals are deliberately NOT
+		// skipped here (see above); identifiers are names, not interval text.
+		if sql[i] == '"' {
+			end := skipQuoted(sql, i, '"')
+			out.WriteString(sql[i:end])
+			i = end
+			continue
+		}
 		// Line comment: -- ... \n
 		if sql[i] == '-' && i+1 < len(sql) && sql[i+1] == '-' {
 			end := strings.IndexByte(sql[i:], '\n')
@@ -634,6 +674,14 @@ func replaceLiteralAwareTokens(sql, token, replacement string) string {
 	out.Grow(len(sql))
 	i := 0
 	for i < len(sql) {
+		// Skip "..." quoted identifiers (preserve verbatim). A `'` inside one
+		// is part of the name, not the start of a literal.
+		if sql[i] == '"' {
+			end := skipQuoted(sql, i, '"')
+			out.WriteString(sql[i:end])
+			i = end
+			continue
+		}
 		// Skip '...' string literals (preserve verbatim, including any tokens inside).
 		if sql[i] == '\'' {
 			out.WriteByte(sql[i])
@@ -699,6 +747,9 @@ func findMatchingParen(sql string, openIdx int) int {
 	for i < len(sql) {
 		c := sql[i]
 		switch c {
+		case '"':
+			// Skip a quoted identifier: `"f(x)"` holds no real parens.
+			i = skipQuoted(sql, i, '"')
 		case '\'':
 			// Skip string literal.
 			i++
@@ -996,6 +1047,12 @@ var intervalUnitSeconds = map[string]int{
 	"w": 604800, "week": 604800, "weeks": 604800,
 }
 
+// millisecondUnits are the spellings of a millisecond, which parseIntervalGrammar
+// rounds up to whole seconds rather than rejecting.
+var millisecondUnits = map[string]bool{
+	"ms": true, "msec": true, "msecs": true, "millisecond": true, "milliseconds": true,
+}
+
 // intervalPattern matches "<n><unit>" and "<n> <unit>", e.g. 30s, 2 minutes,
 // 500ms. Anchored, so anything with trailing junk is rejected rather than
 // silently truncated.
@@ -1013,9 +1070,10 @@ var intervalPattern = regexp.MustCompile(`^(\d+)\s*([a-zA-Z]+)$`)
 // parse. 1.2.0 accepted anything by silently defaulting to one hour, which
 // hid typos; parsing gets the coverage without the silence.
 //
-// Sub-second intervals (500ms) parse to 0 seconds and are rejected: epoch
-// division by zero is meaningless, and a sub-second bucket is not something
-// the epoch-seconds path can express.
+// Millisecond intervals round UP to whole seconds (500ms is 1s, 1500ms is
+// 2s): the epoch-seconds path cannot express a sub-second bucket, and Grafana
+// produces sub-second $__interval values on short ranges, so rejecting them
+// left the macro unexpanded and the query failed.
 func intervalToSeconds(interval string) (int, bool) {
 	return parseIntervalGrammar(strings.TrimSpace(interval))
 }
@@ -1030,7 +1088,25 @@ func parseIntervalGrammar(interval string) (int, bool) {
 	if err != nil || n <= 0 {
 		return 0, false
 	}
-	unit, ok := intervalUnitSeconds[strings.ToLower(m[2])]
+	unitName := strings.ToLower(m[2])
+	if millisecondUnits[unitName] {
+		// Grafana's own $__interval is sub-second on short ranges (500ms,
+		// 200ms). The epoch-seconds bucketing cannot express a sub-second
+		// bucket, and rejecting it left the macro unexpanded, so every
+		// time-series query over a few minutes failed. Round up to whole
+		// seconds instead: 500ms is a 1s bucket, 1500ms a 2s one.
+		const maxIntervalMillis = 31 * 86400 * 1000
+		if n > maxIntervalMillis {
+			return 0, false
+		}
+		secs := int((n + 999) / 1000)
+		if n%1000 != 0 {
+			log.DefaultLogger.Debug("Rounded a sub-second $__timeGroup interval up to whole seconds",
+				"interval", interval, "seconds", secs)
+		}
+		return secs, true
+	}
+	unit, ok := intervalUnitSeconds[unitName]
 	if !ok {
 		return 0, false
 	}

@@ -591,10 +591,27 @@ func TestIntervalToSeconds(t *testing.T) {
 		}
 	}
 
+	// Milliseconds round UP to whole seconds. Grafana's own $__interval is
+	// sub-second on short ranges, and rejecting it left $__timeGroup
+	// unexpanded (issue #20): every time series over a few minutes failed.
+	for _, c := range []struct {
+		input    string
+		expected int
+	}{
+		{"500ms", 1}, {"200ms", 1}, {"1ms", 1}, {"1000ms", 1}, {"1001ms", 2},
+		{"1500ms", 2}, {"2000ms", 2}, {"60000ms", 60}, {"250 msec", 1},
+		{"20 milliseconds", 1}, {"1 millisecond", 1}, {"750MS", 1},
+	} {
+		if got, ok := intervalToSeconds(c.input); !ok || got != c.expected {
+			t.Errorf("intervalToSeconds(%q) = (%d, %v), want (%d, true)", c.input, got, ok, c.expected)
+		}
+	}
+
 	// Still rejected: not an interval, or not one epoch division can express.
 	for _, input := range []string{
 		"nonsense", "", "h", "1", "-5m", "0s",
-		"500ms",                // sub-second: rounds to a zero-length bucket
+		"0ms",                  // zero is not a bucket
+		"5000000000ms",         // past the one-month ceiling, in milliseconds
 		"9223372036854775807s", // would overflow, and is meaningless anyway
 		"3000000000s",          // ~95 years: wider than any useful bucket
 		"400d",                 // over the one-month ceiling

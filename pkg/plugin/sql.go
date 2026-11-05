@@ -30,9 +30,10 @@ func newStrippedSQL(sql string) strippedSQL {
 // (e.g. `-- LIMIT 10`).
 //
 // Single-quoted literals use SQL's escaped-quote convention (`”` inside).
-// Double-quoted identifiers are NOT touched — DuckDB and Postgres use them
-// for column names that contain special characters, so keyword detection on
-// them is still desired.
+// Double-quoted identifiers are kept — DuckDB and Postgres use them for
+// column names that contain special characters, so keyword detection on them
+// is still desired — but each is copied whole, so a quote or comment marker
+// inside a name is not mistaken for one in the statement.
 func stripStringLiteralsAndComments(sql string) string {
 	var out strings.Builder
 	out.Grow(len(sql))
@@ -80,6 +81,16 @@ func stripStringLiteralsAndComments(sql string) string {
 			}
 			out.WriteByte(' ')
 			i = j
+			continue
+		}
+		// Double-quoted identifier: kept, as before, but copied as one unit.
+		// Walking it byte by byte read a `'` inside a name (`"it's"`) as the
+		// start of a literal, and the rest of the statement vanished from
+		// the stripped view (issue #20 review M5).
+		if c == '"' {
+			end := skipQuoted(sql, i, '"')
+			out.WriteString(sql[i:end])
+			i = end
 			continue
 		}
 		// Single-quoted literal
@@ -220,7 +231,14 @@ func splitCorruptsBuckets(sql string, s strippedSQL, tz string, chunk time.Durat
 		return true
 	}
 	// bucket == 0 means an interval we could not parse: assume unsafe.
-	return bucket == 0 || bucket > chunk
+	if bucket == 0 || bucket > chunk {
+		return true
+	}
+	// Chunks and buckets are both aligned to multiples of their own width
+	// from the epoch, so chunk edges fall on bucket edges only when the bucket
+	// divides the chunk. A 7m bucket over 1h chunks straddles every chunk
+	// edge and comes back as two partial rows with the same timestamp.
+	return chunk%bucket != 0
 }
 
 // aggregationFnRe matches any SQL aggregation function call. Anchored at a
