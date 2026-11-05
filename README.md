@@ -220,7 +220,33 @@ The datasource provides several macros for dynamic queries:
 | `$__timeFrom()` | Start of time range | `time >= $__timeFrom()` |
 | `$__timeTo()` | End of time range | `time < $__timeTo()` |
 | `$__interval` | Grafana's calculated interval | `$__timeGroup(time, '$__interval')` |
-| `$__timeGroup(columnName, interval)` | Epoch-based time bucketing. The interval is `<n><unit>`: `s`, `m`, `h`, `d`, `w`, or `ms`, which rounds up to whole seconds (`500ms` buckets by 1s) | `$__timeGroup(time, '1m') AS time` |
+| `$__timeGroup(columnName, interval[, fill])` | Epoch-based time bucketing. The interval is `<n><unit>`: `s`, `m`, `h`, `d`, `w`, or `ms`, which rounds up to whole seconds (`500ms` buckets by 1s). The optional `fill` fills empty buckets: see below | `$__timeGroup(time, '1m', NULL) AS time` |
+
+#### Filling gaps
+
+A third `$__timeGroup` argument gives every series a point in every bucket of the range, as in Grafana's Postgres and MySQL datasources:
+
+| Fill | Empty bucket, or NULL value, gets |
+|---|---|
+| `NULL` | null: the panel shows a gap |
+| `previous` | the series' previous value (nothing before its first) |
+| `linear` | a value interpolated by time between its neighbours (ends stay empty) |
+| a number, e.g. `0` | that number |
+
+```sql
+SELECT $__timeGroup(time, $__interval, 0) AS "time", host, count(*) AS errors
+FROM logs WHERE $__timeFilter(time) AND level = 'error'
+GROUP BY 1, 2
+```
+
+- **Time series format only.** Tables are not filled.
+- **Done by the plugin, not Arc:** the SQL is the same with or without it, and the filled points are not stored anywhere.
+- **The plugin leaves the result unfilled, with a notice, when:**
+  - the result is incomplete (Arc's row cap, or a dropped query chunk);
+  - the query has more than one `$__timeGroup`;
+  - the rows are not the macro's buckets;
+  - the range holds more than 1,000,000 bucket-and-series points.
+- **Migrated dashboards:** before this release the third argument was accepted and ignored, so a panel migrated from Postgres with `$__timeGroup(time, '5m', 0)` drew no zeros. It now fills. Remove the argument to keep the old drawing.
 
 ### Variables
 

@@ -173,6 +173,14 @@ SELECT time_bucket(INTERVAL '1 minute', time) as time, AVG(usage)
 - Dynamic aggregation granularity
 - Reusable queries across different time ranges
 
+**Gap filling** (`fill.go`). `$__timeGroup`'s optional third argument
+(`NULL`, `previous`, `linear`, a number) never changes the SQL:
+- `query()` reads it once, before any split chunk runs (`planFill`).
+- `prepareFrames` fills the merged time-series frame (`applyFill`) before long-to-wide.
+- The bucket grid comes from `bucketSpec`, the same value that renders the macro's SQL, so a filled point lands on the bucket Arc would return.
+- That holds for the four bucketing branches: epoch, local hour in :30/:45 zones, local day, and Monday week. Each was checked live against DuckDB, DST days included.
+- A result that is incomplete (row cap, dropped chunk), off the grid, or larger than 1,000,000 points is returned unfilled, with a notice.
+
 ## Configuration
 
 ### Datasource Settings

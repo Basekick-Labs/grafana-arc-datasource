@@ -867,12 +867,12 @@ func TestExpandTimeGroup_UnknownInterval(t *testing.T) {
 	}
 }
 
-// TestExpandTimeGroup_FillArgIgnored: Postgres and Timescale accept a third
-// "fill" argument, so dashboards migrated from those datasources carry it.
-// This plugin does not fill gaps (Grafana's panel options do), so the argument
-// is ignored and the macro still expands. 1.3.2 rejected it outright, leaving
-// the macro unexpanded and breaking every migrated panel.
-func TestExpandTimeGroup_FillArgIgnored(t *testing.T) {
+// TestExpandTimeGroup_FillArgLeavesSQLAlone: Postgres and Timescale accept a
+// third "fill" argument, so dashboards migrated from those datasources carry
+// it. The fill happens in the backend after the query (fill.go), so the macro
+// expands to the same SQL with or without it. 1.3.2 rejected the argument
+// outright, leaving the macro unexpanded and breaking every migrated panel.
+func TestExpandTimeGroup_FillArgLeavesSQLAlone(t *testing.T) {
 	tr := backend.TimeRange{
 		From: time.Date(2026, 2, 18, 10, 0, 0, 0, time.UTC),
 		To:   time.Date(2026, 2, 18, 11, 0, 0, 0, time.UTC),
@@ -884,7 +884,7 @@ func TestExpandTimeGroup_FillArgIgnored(t *testing.T) {
 	} {
 		result := ApplyMacros(sql, tr, "")
 		if strings.Contains(result, "$__timeGroup") {
-			t.Errorf("fill argument should be ignored, not reject the macro: %s", result)
+			t.Errorf("a fill argument must not stop the macro expanding: %s", result)
 		}
 		if !strings.Contains(result, "3600") {
 			t.Errorf("expected the 1h bucket in: %s", result)
