@@ -187,3 +187,52 @@ func containsAny(s string, subs ...string) bool {
 	}
 	return false
 }
+
+// TestLive_BuilderMetadataResources runs the query builder's metadata routes
+// (issue #20) against a real Arc: list databases, list a database's
+// measurements, and read each measurement's columns. ARC_E2E_DATABASE picks
+// the database (default "default"); it needs at least one measurement.
+//
+// To exercise the schema-less path, delete a measurement's stored schema
+// (`<storage>/_schema/<db>/<measurement>.parquet`) and restart Arc first: the
+// route then answers through DESCRIBE, which rebuilds the stored schema.
+func TestLive_BuilderMetadataResources(t *testing.T) {
+	url, token := os.Getenv("ARC_E2E_URL"), os.Getenv("ARC_E2E_TOKEN")
+	if url == "" || token == "" {
+		t.Skip("ARC_E2E_URL / ARC_E2E_TOKEN not set")
+	}
+	db := os.Getenv("ARC_E2E_DATABASE")
+	if db == "" {
+		db = "default"
+	}
+	raw, _ := jsonMarshal(map[string]any{"url": url, "database": db, "protocol": "arrow"})
+	pc := backend.PluginContext{DataSourceInstanceSettings: &backend.DataSourceInstanceSettings{
+		UID: "live-builder", JSONData: raw, DecryptedSecureJSONData: map[string]string{"apiKey": token},
+	}}
+	d := NewArcDatasource()
+
+	dbs := callResource(t, d, pc, "GET", "databases")
+	if dbs.status != 200 {
+		t.Fatalf("databases: %d %v", dbs.status, dbs.body)
+	}
+	t.Logf("databases: %v (scoped=%v)", dbs.body["databases"], dbs.body["scoped"])
+
+	ms := callResource(t, d, pc, "GET", "measurements")
+	names := strList(ms.body["measurements"])
+	if ms.status != 200 || len(names) == 0 {
+		t.Fatalf("measurements in %q: %d %v", db, ms.status, ms.body)
+	}
+	for _, m := range names {
+		cols := callResource(t, d, pc, "GET", "columns?measurement="+m)
+		list, _ := cols.body["columns"].([]any)
+		if cols.status != 200 || len(list) == 0 {
+			t.Errorf("columns of %s: %d %v", m, cols.status, cols.body)
+			continue
+		}
+		first, _ := list[0].(map[string]any)
+		if first["name"] != "time" || first["type"] == "" {
+			t.Errorf("columns of %s: first column %v, want time with a type", m, first)
+		}
+		t.Logf("%s: %d columns from %s", m, len(list), cols.body["source"])
+	}
+}

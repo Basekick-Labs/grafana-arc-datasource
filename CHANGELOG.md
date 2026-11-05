@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Backend metadata routes for the upcoming visual query builder (#20): list
+  databases, a database's measurements, and a measurement's columns with
+  their types. They go through the plugin, so the API key stays on the
+  server, and work whatever protocol the datasource uses (Arc's Arrow
+  endpoint refuses `SHOW`). A key scoped to one database gets that database
+  rather than an error. When Arc has no stored schema for a measurement, the
+  columns come from `DESCRIBE` over its last 24 hours.
+
 ### Fixed
+- `$__timeGroup` accepts millisecond intervals, rounding up to whole seconds.
+  Grafana's `$__interval` is sub-second on short time ranges (`500ms`), and
+  the macro used to be left unexpanded, so time-series panels over a few
+  minutes failed.
+- A double-quoted column name containing an apostrophe (`"it's"`) no longer
+  stops the macros after it from expanding. A `--` or `/*` inside a quoted
+  name is no longer read as a comment either.
+- Query splitting no longer splits when the `$__timeGroup` bucket does not
+  divide the chunk, for example `7m` buckets with 1h chunks. Buckets crossing
+  a chunk edge came back as two partial rows with the same timestamp.
+- An empty query fails with "Query is empty" instead of being sent to Arc,
+  which answered with a bare "SQL query is required".
 - Results Arc cuts short no longer render as complete (Arc#726). Arc reports
   two different things, and the panel now shows each one:
   - **Truncated:** the stream failed part way, so the rows are not the
