@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Results Arc cuts short no longer render as complete (Arc#726). Arc reports
+  two different things, and the panel now shows each one:
+  - **Truncated:** the stream failed part way, so the rows are not the
+    result. The query now fails with Arc's reason, on JSON, MessagePack and
+    Arrow (the `Arc-Stream-Truncated` trailer).
+  - **Row cap:** an Enterprise governance row cap stopped the query. The rows
+    are correct up to the cap, so the panel renders them with a warning
+    notice naming the cap. Read from `rows_capped`/`row_cap` on JSON and
+    MessagePack and from the `Arc-Rows-Capped` trailer on Arrow.
+
+  With query splitting, a notice from any chunk now reaches the panel. That
+  includes the existing "chunks were dropped" warning, which the split path
+  used to discard.
+
 ## [1.5.0] - 2026-09-10
 
 Timezone-aware time bucketing, plus two correctness fixes found while building

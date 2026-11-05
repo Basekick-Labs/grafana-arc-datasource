@@ -131,6 +131,16 @@ type semReleasingReader struct {
 	io.ReadCloser
 	release func()
 	once    sync.Once
+	resp    *http.Response
+}
+
+// Trailer returns the response's HTTP trailers. The client fills them in only
+// once the body has been read to EOF; before that it is empty.
+func (r *semReleasingReader) Trailer() http.Header {
+	if r.resp == nil || r.resp.Trailer == nil {
+		return http.Header{}
+	}
+	return r.resp.Trailer
 }
 
 func (r *semReleasingReader) Close() error {
@@ -152,7 +162,7 @@ func (r *semReleasingReader) Close() error {
 //
 // Collapses the previous ~50-line duplication between queryArrow and
 // queryJSON (R2-HI10).
-func (s *ArcInstanceSettings) doRequest(ctx context.Context, path string, body any) (io.ReadCloser, error) {
+func (s *ArcInstanceSettings) doRequest(ctx context.Context, path string, body any) (*semReleasingReader, error) {
 	jsonData, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
@@ -203,6 +213,7 @@ func (s *ArcInstanceSettings) doRequest(ctx context.Context, path string, body a
 			io.Closer
 		}{Reader: capped, Closer: resp.Body},
 		release: func() { s.sem.Release(1) },
+		resp:    resp,
 	}, nil
 }
 
@@ -580,6 +591,18 @@ func mergeFrames(frames []*data.Frame) *data.Frame {
 		return frames[0]
 	}
 
+	// Each chunk was its own request, so any of them can carry a notice (a
+	// row cap, for one). The merged frame is the first non-empty chunk; keep
+	// the others' notices on it too.
+	for _, f := range frames {
+		if f == nil || f == merged || f.Meta == nil {
+			continue
+		}
+		for _, n := range f.Meta.Notices {
+			addNotice(merged, n)
+		}
+	}
+
 	skipped := 0
 
 	// Count total rows to add so we can pre-allocate.
@@ -822,11 +845,14 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		return response
 	}
 
-	merged.Meta = &data.FrameMeta{
-		ExecutedQueryString: qm.SQL,
-		Custom: map[string]interface{}{
-			"splitChunks": len(chunks),
-		},
+	// Set the fields rather than replace Meta: the chunk notices (row cap,
+	// dropped chunks) are on it.
+	if merged.Meta == nil {
+		merged.Meta = &data.FrameMeta{}
+	}
+	merged.Meta.ExecutedQueryString = qm.SQL
+	merged.Meta.Custom = map[string]interface{}{
+		"splitChunks": len(chunks),
 	}
 
 	// Prepare frames (long-to-wide conversion, etc.)

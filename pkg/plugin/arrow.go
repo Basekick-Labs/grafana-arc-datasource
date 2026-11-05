@@ -36,6 +36,21 @@ func queryArrow(ctx context.Context, settings *ArcInstanceSettings, sql string) 
 		return nil, err
 	}
 
+	// Arc sends completeness as trailers after the last batch, and the HTTP
+	// client only fills them in at EOF: the IPC reader stops at the
+	// end-of-stream marker, so read the rest of the body first. A body that
+	// cannot be finished leaves completeness unknown, which is not complete.
+	if _, err := io.Copy(io.Discard, body); err != nil {
+		return nil, fmt.Errorf("failed to read the end of the Arrow response: %w", err)
+	}
+	capped, rowCap, err := arrowCompleteness(body.Trailer())
+	if err != nil {
+		return nil, err
+	}
+	if capped {
+		addNotice(frame, rowCapNotice(rowCap))
+	}
+
 	duration := time.Since(start)
 	log.DefaultLogger.Debug("Arrow query completed",
 		"duration_ms", duration.Milliseconds(),
@@ -43,12 +58,7 @@ func queryArrow(ctx context.Context, settings *ArcInstanceSettings, sql string) 
 		"fields", len(frame.Fields),
 	)
 
-	frame.Meta = &data.FrameMeta{
-		ExecutedQueryString: sql,
-		Custom: map[string]interface{}{
-			"executionTime": duration.Milliseconds(),
-		},
-	}
+	setQueryMeta(frame, sql, duration.Milliseconds())
 
 	return frame, nil
 }
