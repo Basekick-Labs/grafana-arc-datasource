@@ -93,6 +93,9 @@ type ArcQuery struct {
 	// splitSkipped names why a query the user set to split ran unsplit, for
 	// the editor (frame meta "splitSkipped"). Set by query() only.
 	splitSkipped string
+
+	// fill is the $__timeGroup fill request (fill.go), read once by query().
+	fill *fillPlan
 }
 
 // ArcInstanceSettings is the cached, parsed view of a datasource instance.
@@ -809,6 +812,13 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 
 	chunkSize, splitting := parseSplitDuration(qm.SplitDuration, query.TimeRange)
 
+	// Read before any chunk runs: the fill grid spans the whole range, and it
+	// is applied once, to the merged frame. Tables are never filled, as in
+	// Grafana's SQL datasources: their rows are not series.
+	if qm.Format != "table" {
+		qm.fill = planFill(qm.SQL, query.TimeRange.To.Sub(query.TimeRange.From), query.TimeRange.From, query.TimeRange.To, qm.Timezone)
+	}
+
 	// Compute the stripped-and-uppercased view of the SQL once and reuse it
 	// across every splitting heuristic. Without this each heuristic re-ran
 	// stripStringLiterals + ToUpper independently — three full-string passes
@@ -1090,6 +1100,8 @@ func prepareFrames(frame *data.Frame, qm ArcQuery) data.Frames {
 		// Default to time series visualization
 		frame.Meta.PreferredVisualization = data.VisTypeGraph
 	}
+
+	frame = applyFill(frame, qm.fill)
 
 	schema := frame.TimeSeriesSchema()
 

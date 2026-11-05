@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Gap filling with `$__timeGroup`'s third argument, as in Grafana's
+  Postgres and MySQL datasources: `NULL`, `previous`, `linear` or a number
+  gives every series a point in every bucket of the range. Time series
+  format only. The plugin fills the result after the query (and after
+  merging split chunks), so the SQL is unchanged. It leaves the result
+  unfilled, with a notice, when the result is incomplete (row cap, dropped
+  chunk), the query has more than one `$__timeGroup`, or the range would hold
+  more than 1,000,000 points.
 - A visual query builder (#20), modelled on Grafana's InfluxDB (InfluxQL)
   editor. New queries open in it:
   - **Rows:** FROM (database, measurement), WHERE filters, SELECT with
@@ -34,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   endpoint refuses `SHOW`). A key scoped to one database gets that database
   rather than an error. When Arc has no stored schema for a measurement, the
   columns come from `DESCRIBE` over its last 24 hours.
+
+### Changed
+- **Behaviour change:** `$__timeGroup(time, '5m', 0)` (or `NULL`, `previous`)
+  now fills gaps. Before, the third argument was accepted and ignored, so
+  dashboards migrated from Postgres drew no zeros or nulls there. Panels and
+  alert rules carrying it change: with `0`, a reducer over a new empty bucket
+  reads 0; with `NULL`, a Reduce expression in Strict mode reads NaN (use
+  "Drop non-numeric values"). Remove the argument to keep the previous
+  behaviour.
 
 ### Fixed
 - A query with a window function (`OVER`) and `$__timeGroup` is no longer

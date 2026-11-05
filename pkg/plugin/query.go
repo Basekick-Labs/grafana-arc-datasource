@@ -1143,67 +1143,26 @@ func expandTimeGroup(sql string, tz string) string {
 			log.DefaultLogger.Warn("$__timeGroup requires two arguments: $__timeGroup(column, interval)", "found", arg)
 			return "", false
 		}
-		if len(parts) > 2 {
-			// Postgres and Timescale accept a third "fill" argument
-			// ($__timeGroup(time, '5m', 0)), so dashboards migrated from those
-			// datasources carry it. This plugin does not fill gaps — Grafana's
-			// own "Connect null values" / "Fill" panel options do — so the
-			// argument is ignored rather than rejected. Rejecting it (1.3.2)
-			// left the whole macro unexpanded and broke every migrated panel.
-			log.DefaultLogger.Debug("$__timeGroup ignoring extra arguments — this plugin does not fill gaps; use the panel's fill option",
-				"found", arg, "extra_count", len(parts)-2)
-		}
+		// A third argument is the fill mode ($__timeGroup(time, '5m', 0)), as
+		// in Postgres and Timescale. It does not change the SQL: planFill reads
+		// it before the query runs and applyFill fills the merged frame
+		// (fill.go). Rejecting it (1.3.2) left the whole macro unexpanded and
+		// broke every migrated panel.
 		column := strings.TrimSpace(parts[0])
 		if err := validateColumnArg(column); err != nil {
 			log.DefaultLogger.Warn("$__timeGroup rejected unsafe column argument", "column", column, "error", err.Error())
 			return "", false
 		}
 		interval := strings.Trim(strings.TrimSpace(parts[1]), "'\"")
-		secs, ok := intervalToSeconds(interval)
+		bucket, ok := newBucketSpec(interval, tz)
 		if !ok {
 			log.DefaultLogger.Warn("$__timeGroup rejected unknown interval — expected '1s', '10s', '1m', '5m', '1h', '1d', etc.",
 				"interval", interval)
 			return "", false
 		}
-		// Use epoch_ns() (BIGINT) with // (integer division) instead of epoch() (DOUBLE)
-		// to avoid floating-point precision loss that causes timestamps near hour
-		// boundaries (e.g. 05:59:59.999) to round up to the next bucket (06:00:00).
-		// DuckDB's / operator returns DOUBLE; // returns BIGINT.
-		//
-		// A bucket of an hour or more in a NON-UTC dashboard must align to
-		// local calendar boundaries, not UTC ones: with epoch arithmetic a
-		// "day" starts at 00:00 UTC, which in UTC-6 is 18:00 the previous
-		// evening, so every bar mixes two local days. date_trunc on the
-		// wall-clock time gets this right, including across DST transitions
-		// where a local day is not 86400 seconds long.
-		//
-		// Only whole calendar units (hour/day/week) have a date_trunc
-		// equivalent. 6h, 12h, 3d and every sub-hour size stay on the epoch
-		// path, which is correct for them in whole-hour zones and also avoids
-		// DuckDB's nanosecond-residual behaviour.
-		//
-		// UTC dashboards NEVER take this branch, so their SQL is byte-identical
-		// to every release before this feature. That matters twice over:
-		// date_trunc on a TIMESTAMPTZ truncates in the DuckDB session's
-		// timezone, so a "UTC" dashboard would silently follow Arc's session
-		// setting rather than UTC.
-		if tz != "UTC" && secs >= 3600 {
-			if unit, ok := truncUnitForSeconds(secs, interval, tz); ok {
-				// timezone(tz, ts), not `ts AT TIME ZONE tz`. The infix form's
-				// direction depends on the operand's type, and which of
-				// TIMESTAMP/TIMESTAMPTZ it yields varies between DuckDB/ICU
-				// builds — on Arc's build the round trip converted forward
-				// twice and local midnight rendered as noon. The function form
-				// is explicit: the inner call takes the instant to wall-clock
-				// in tz, the outer reads that wall clock back as an instant.
-				// Verified against DuckDB 1.4.3 on Arc: a 05:59Z and a 06:01Z
-				// row land in different local days for America/Costa_Rica.
-				q := quoteTimezone(tz)
-				return fmt.Sprintf("timezone(%s, date_trunc('%s', timezone(%s, %s)))",
-					q, unit, q, column), true
-			}
-		}
-		return fmt.Sprintf("to_timestamp((epoch_ns(%s) // 1000000000 // %d) * %d)", column, secs, secs), true
+		// The bucketing rules live in newBucketSpec, shared with the fill
+		// grid (fill.go) so a filled row lands on the bucket Arc returns.
+		return bucket.sql(column), true
 	})
 }
 
