@@ -47,7 +47,7 @@ export function VariableQueryEditor({ query, onChange }: VariableQueryProps) {
       <InlineField
         label="Query"
         labelWidth={20}
-        tooltip="SQL query to generate variable values. First column will be used."
+        tooltip="SQL query to generate variable values. Values come from the first text column; SHOW TABLES uses table_name."
         grow
       >
         <TextArea
@@ -63,7 +63,8 @@ export function VariableQueryEditor({ query, onChange }: VariableQueryProps) {
       <div className={styles.examples}>
         <small>
           <strong>Examples:</strong>
-          <br />• Get distinct hosts: <code className={styles.code}>SELECT DISTINCT host FROM telegraf.cpu ORDER BY host</code>
+          <br />• Get distinct hosts:{' '}
+          <code className={styles.code}>SELECT DISTINCT host FROM telegraf.cpu ORDER BY host</code>
           <br />• Get tables: <code className={styles.code}>SHOW TABLES</code>
           <br />• Get databases: <code className={styles.code}>SHOW DATABASES</code>
         </small>

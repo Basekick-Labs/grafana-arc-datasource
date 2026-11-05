@@ -36,6 +36,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   columns come from `DESCRIBE` over its last 24 hours.
 
 ### Fixed
+- A query with a window function (`OVER`) and `$__timeGroup` is no longer
+  split. Query splitting ran it per chunk, so `lag()` had no previous row at
+  each chunk's first bucket and running sums restarted: a derivative over two
+  days came back with a gap at every 6-hour chunk edge. The frame metadata
+  records `splitSkipped: "window function"`.
+- `SHOW DATABASES` and `SHOW TABLES` work on every protocol. Arc answers them
+  only on its JSON endpoint, so on Arrow, the default, they failed with
+  "not supported on the Arrow endpoint"; the plugin now sends them there.
+- A `SHOW TABLES` variable lists the tables. Grafana takes a variable's
+  values from the first text column, which in Arc's answer is the database
+  name, so the variable had one value.
 - `$__timeGroup` accepts millisecond intervals, rounding up to whole seconds.
   Grafana's `$__interval` is sub-second on short time ranges (`500ms`), and
   the macro used to be left unexpanded, so time-series panels over a few

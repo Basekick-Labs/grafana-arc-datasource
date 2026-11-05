@@ -315,3 +315,9 @@ func containsAggregationWithoutTimeGroup(s strippedSQL) bool {
 	}
 	return false
 }
+
+// showStatementRe matches the SHOW statements Arc handles itself, in the
+// shape Arc accepts them: one statement, optionally ending in `;`. Arc
+// strips comments before matching; a commented SHOW here only misses the
+// JSON route and gets Arc's own refusal on Arrow, which names the fix.
+var showStatementRe = regexp.MustCompile(`(?i)^\s*SHOW\s+(DATABASES|TABLES|MEASUREMENTS)\b`)
