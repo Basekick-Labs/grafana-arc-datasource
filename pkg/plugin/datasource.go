@@ -89,6 +89,10 @@ type ArcQuery struct {
 	// frontend ("browser" is expanded there, where the browser is). Empty
 	// means UTC, which is what every build before 1.5.0 did.
 	Timezone string `json:"timezone"`
+
+	// splitSkipped names why a query the user set to split ran unsplit, for
+	// the editor (frame meta "splitSkipped"). Set by query() only.
+	splitSkipped string
 }
 
 // ArcInstanceSettings is the cached, parsed view of a datasource instance.
@@ -575,10 +579,15 @@ func (d *ArcDatasource) executeChunk(ctx context.Context, settings *ArcInstanceS
 func executeProtocolQuery(ctx context.Context, settings *ArcInstanceSettings, sql string) (*data.Frame, error) {
 	var frame *data.Frame
 	var err error
-	switch settings.settings.Protocol {
-	case ProtocolMsgpack:
+	switch {
+	case showStatementRe.MatchString(sql):
+		// Arc answers SHOW only on its JSON endpoint; the Arrow endpoint
+		// refuses it (query_arrow.go). The result is a short listing, so
+		// the wire format does not matter.
+		frame, err = queryJSON(ctx, settings, sql)
+	case settings.settings.Protocol == ProtocolMsgpack:
 		frame, err = queryMsgpack(ctx, settings, sql)
-	case ProtocolJSON:
+	case settings.settings.Protocol == ProtocolJSON:
 		frame, err = queryJSON(ctx, settings, sql)
 	default:
 		frame, err = queryArrow(ctx, settings, sql)
@@ -827,6 +836,15 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		log.DefaultLogger.Debug("Skipping split: bucket wider than chunk",
 			"refId", qm.RefID, "timezone", qm.Timezone, "chunk", chunkSize.String())
 		splitting = false
+	case splitting && windowFnRe.MatchString(stripped.stripped):
+		// A window function reads rows across the whole range: lag() at a
+		// chunk's first bucket has no predecessor, and running sums restart
+		// per chunk. containsAggregationWithoutTimeGroup stops at
+		// $__timeGroup, so `avg(x) - lag(avg(x)) OVER (...)` over time
+		// buckets used to be split and came back wrong at every chunk edge.
+		log.DefaultLogger.Debug("Skipping split for window function", "refId", qm.RefID)
+		splitting = false
+		qm.splitSkipped = "window function"
 	case splitting && containsAggregationWithoutTimeGroup(stripped):
 		// Aggregations without time bucketing span the full range; each chunk
 		// aggregating independently produces wrong results (COUNT duplicated,
@@ -986,6 +1004,20 @@ func (d *ArcDatasource) querySingle(ctx context.Context, settings *ArcInstanceSe
 	if len(processedFrames) == 0 {
 		log.DefaultLogger.Warn("No frames returned from query", "refId", qm.RefID)
 		return response
+	}
+
+	if qm.splitSkipped != "" {
+		for _, f := range processedFrames {
+			if f.Meta == nil {
+				f.Meta = &data.FrameMeta{}
+			}
+			custom, _ := f.Meta.Custom.(map[string]interface{})
+			if custom == nil {
+				custom = map[string]interface{}{}
+			}
+			custom["splitSkipped"] = qm.splitSkipped
+			f.Meta.Custom = custom
+		}
 	}
 
 	response.Frames = append(response.Frames, processedFrames...)

@@ -151,7 +151,7 @@ Arc keeps no tag/field marker, so the builder goes by column type: text columns 
 - `!=`, `!~` and `NOT LIKE` keep rows where the column is NULL, matching InfluxQL, where a negated tag filter keeps series that lack the tag.
 - Regular expressions use DuckDB's RE2 syntax; InfluxQL-style `/…/` delimiters are accepted.
 - A value containing `$` is substituted by Grafana like a variable.
-- A LIMIT turns off query splitting for that query.
+- A LIMIT, or a window function (`OVER`) in Code mode, turns off query splitting for that query.
 - Arc refuses SQL longer than `query.max_sql_length` (10,000 characters by default). An **All** selection over many values can exceed it; the panel then says so.
 
 **Builder and Code.** **Edit as SQL** (or the **Code** toggle) switches to the SQL editor with the builder's SQL. Going back to **Builder** asks first: code changes are not carried into the builder, which reopens its last state. Queries saved before the builder existed, and any query whose SQL was edited outside the builder, open in Code unchanged.

@@ -21,6 +21,26 @@ import { lastValueFrom, Observable } from 'rxjs';
 /** The backend's database-name rule (pkg/plugin/safety.go databaseNameRe). */
 const DATABASE_RE = /^[A-Za-z0-9_-]+$/;
 
+/** Arc's SHOW TABLES / SHOW MEASUREMENTS, which list `database` first. */
+const SHOW_TABLES_RE = /^\s*SHOW\s+(TABLES|MEASUREMENTS)\b/i;
+
+/**
+ * Grafana takes a variable's values from the first text column. Arc's SHOW
+ * TABLES puts `database` there, so every row read as the database name and
+ * the variable collapsed to one value. Moves `table_name` to the front.
+ */
+export function tableNameFirst(rsp: DataQueryResponse): DataQueryResponse {
+  const data = (rsp.data ?? []).map((frame) => {
+    const fields = frame?.fields;
+    const i = Array.isArray(fields) ? fields.findIndex((f) => f.name === 'table_name') : -1;
+    if (i <= 0) {
+      return frame;
+    }
+    return { ...frame, fields: [fields[i], ...fields.slice(0, i), ...fields.slice(i + 1)] };
+  });
+  return { ...rsp, data };
+}
+
 /**
  * Shapes a `metricFindQuery` argument can arrive as. Grafana's
  * `DataSourceApi.metricFindQuery` is typed as `(query: any, ...)` upstream so
@@ -69,7 +89,8 @@ export class ArcDataSource extends DataSourceWithBackend<ArcQuery, ArcDataSource
     // `this.query`, not `super.query`: the override stamps the dashboard
     // timezone, so a variable query using $__timeGroup buckets the same way a
     // panel query on the same dashboard does.
-    return lastValueFrom(this.query(request)).then(this.toMetricFindValue);
+    const rsp = await lastValueFrom(this.query(request));
+    return this.toMetricFindValue(SHOW_TABLES_RE.test(sqlQuery) ? tableNameFirst(rsp) : rsp);
   }
 
   toMetricFindValue(rsp: DataQueryResponse): MetricFindValue[] {
