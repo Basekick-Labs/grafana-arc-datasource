@@ -195,3 +195,20 @@ test('a multi-value variable with LIKE is refused and the query is not run', asy
   expect(screen.getByTestId('arc-builder-errors')).toHaveTextContent('can hold several values');
   expect(onRun).not.toHaveBeenCalled();
 });
+
+test('a key that cannot list databases gets the configured one and a hint to type a name', async () => {
+  const ds = fakeDatasource();
+  (ds.getDatabases as jest.Mock).mockImplementation(async () => ({ databases: ['metrics'], scoped: true }));
+  render(
+    <Harness
+      initial={{ ...(builderDefaultQuery() as ArcQuery), refId: 'A' }}
+      ds={ds}
+      onRun={jest.fn()}
+      onSeen={() => {}}
+    />
+  );
+  fireEvent.click(screen.getByText('metrics'));
+  expect(await screen.findByText('Type a name…')).toBeInTheDocument();
+  expect(screen.getByText('This API key cannot list every database')).toBeInTheDocument();
+  expect(screen.queryByText('other')).not.toBeInTheDocument();
+});
