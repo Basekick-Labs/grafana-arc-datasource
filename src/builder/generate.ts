@@ -5,7 +5,7 @@
  * same state always yields the same SQL. A column that disappeared is a
  * warning in the editor, not a different query.
  */
-import { AggregateFn, BuilderQuery, Filter, FilterOp, SelectItem } from '../types';
+import { AggregateFn, BuilderQuery, Filter, FilterOp, SelectItem, Transform } from '../types';
 
 export type Format = 'time_series' | 'table';
 
@@ -251,8 +251,6 @@ export function generate(b: BuilderQuery, format: Format): GenerateResult {
   }
 
   const tags = b.groupBy.tags;
-  const reserved = new Set(['time', ...tags.map((t) => t.toLowerCase())]);
-  const seen = new Set<string>();
   b.select.forEach((s, i) => {
     if (s.fn !== 'count_rows' && !s.column) {
       errors.push({ field: `select.${i}.column`, message: 'Pick a column' });
@@ -263,20 +261,17 @@ export function generate(b: BuilderQuery, format: Format): GenerateResult {
         errors.push({ field: `select.${i}.param`, message: 'Percentile must be a number from 0 to 100' });
       }
     }
-    const alias = (s.alias ?? '').trim() || defaultAlias(s);
-    const key = alias.toLowerCase();
-    // A raw time series selects tags as plain columns, so a raw field named
-    // like a group-by tag is the tag itself, not a collision.
-    if (reserved.has(key) && !(s.fn === 'raw' && tags.includes(s.column))) {
-      errors.push({
-        field: `select.${i}.alias`,
-        message: `"${alias}" is used by ${key === 'time' ? 'the time column' : 'a GROUP BY tag'}; give this field an alias`,
-      });
-    } else if (seen.has(key)) {
-      errors.push({ field: `select.${i}.alias`, message: `Two fields are named "${alias}"; give one an alias` });
+    if (s.transform) {
+      validateTransform(s, i, errors);
     }
-    seen.add(key);
+    if (s.math !== undefined) {
+      const m = parseMath(s.math);
+      if ('error' in m) {
+        errors.push({ field: `select.${i}.math`, message: m.error });
+      }
+    }
   });
+  const names = outputNames(b.select, tags, errors);
 
   b.where.forEach((f, i) => validateFilter(f, i, errors));
   tags.forEach((t, i) => {
@@ -295,6 +290,18 @@ export function generate(b: BuilderQuery, format: Format): GenerateResult {
   if (aggregated && format === 'time_series' && !timeGroup) {
     errors.push({ field: 'groupBy.time', message: 'An aggregated time series needs GROUP BY time' });
   }
+  const transformed = b.select.some((s) => s.transform);
+  if (transformed && (aggregated ? !timeGroup : format === 'table')) {
+    errors.push({
+      field: 'select',
+      message: 'Transformations need values in time order: use GROUP BY time, or a raw time series',
+    });
+  }
+  tags.forEach((t, i) => {
+    if (transformed && t.startsWith('__')) {
+      errors.push({ field: `groupBy.tags.${i}`, message: `A tag named "${t}" cannot be used with transformations` });
+    }
+  });
   const limit = (b.limit ?? '').trim();
   if (limit && !/^[1-9]\d{0,9}$/.test(limit)) {
     errors.push({ field: 'limit', message: 'LIMIT must be a positive whole number' });
@@ -306,19 +313,30 @@ export function generate(b: BuilderQuery, format: Format): GenerateResult {
   const from = measurementVar !== undefined ? quoteIdent('${' + measurementVar + ':raw}') : quoteIdent(m);
   const where = ['$__timeFilter(time)', ...b.where.map(filterSQL)].join(' AND ');
   const tagCols = tags.map(quoteIdent);
-  const fields = b.select.map((s) => {
-    const alias = (s.alias ?? '').trim();
-    if (s.fn === 'raw' && !alias) {
+  const limitSQL = limit ? `\nLIMIT ${limit}` : '';
+  const interval = timeGroup
+    ? timeGroup.interval === '$__interval'
+      ? '$__interval'
+      : quoteString(timeGroup.interval.trim())
+    : '';
+
+  if (transformed) {
+    return { sql: transformedSQL(b, format, names, from, where, tagCols, interval, limitSQL) };
+  }
+
+  const fields = b.select.map((s, i) => {
+    const expr = applyMath(selectExpr(s), s.math);
+    // A raw column keeps its own name unaliased: the SQL v1 always wrote.
+    if (s.fn === 'raw' && !s.math && names[i] === s.column) {
       return quoteIdent(s.column);
     }
-    return `${selectExpr(s)} AS ${quoteIdent(alias || defaultAlias(s))}`;
+    return `${expr} AS ${quoteIdent(names[i])}`;
   });
-  const limitSQL = limit ? `\nLIMIT ${limit}` : '';
 
   if (!aggregated) {
     // Raw rows: tags first so a time series splits into one series per tag set.
     const rawFields = fields.filter(
-      (_, i) => !tags.includes(b.select[i].column) || (b.select[i].alias ?? '').trim() !== ''
+      (_, i) => !tags.includes(b.select[i].column) || (b.select[i].alias ?? '').trim() !== '' || !!b.select[i].math
     );
     const cols = ['time', ...tagCols, ...rawFields].join(', ');
     const order = format === 'time_series' ? 'ASC' : (b.orderByTime ?? 'DESC');
@@ -326,7 +344,6 @@ export function generate(b: BuilderQuery, format: Format): GenerateResult {
   }
 
   if (timeGroup) {
-    const interval = timeGroup.interval === '$__interval' ? '$__interval' : quoteString(timeGroup.interval.trim());
     const cols = [`$__timeGroup(time, ${interval}) AS "time"`, ...tagCols, ...fields].join(', ');
     const groupBy = Array.from({ length: 1 + tagCols.length }, (_, i) => String(i + 1)).join(', ');
     const order = format === 'time_series' ? 'ASC' : (b.orderByTime ?? 'ASC');
@@ -340,6 +357,275 @@ export function generate(b: BuilderQuery, format: Format): GenerateResult {
   const cols = [...tagCols, ...fields].join(', ');
   const groupBy = tagCols.length ? `\nGROUP BY ${tagCols.map((_, i) => String(i + 1)).join(', ')}` : '';
   return { sql: `SELECT ${cols}\nFROM ${from}\nWHERE ${where}${groupBy}${limitSQL}` };
+}
+
+/**
+ * Output column names, in select order. An explicit alias is used as typed
+ * and must be unique; a default name (the function, or the transformation)
+ * that is already taken gets `_1`, `_2`…, as InfluxQL names
+ * `non_negative_derivative`, `non_negative_derivative_1`.
+ */
+function outputNames(select: SelectItem[], tags: string[], errors: FieldError[]): string[] {
+  const reserved = new Set(['time', ...tags.map((t) => t.toLowerCase())]);
+  const taken = new Set<string>();
+  select.forEach((s, i) => {
+    const alias = (s.alias ?? '').trim();
+    if (!alias) {
+      return;
+    }
+    const key = alias.toLowerCase();
+    if (reserved.has(key)) {
+      errors.push({
+        field: `select.${i}.alias`,
+        message: `"${alias}" is used by ${key === 'time' ? 'the time column' : 'a GROUP BY tag'}; give this field an alias`,
+      });
+    } else if (taken.has(key)) {
+      errors.push({ field: `select.${i}.alias`, message: `Two fields are named "${alias}"; give one an alias` });
+    }
+    taken.add(key);
+  });
+  return select.map((s) => {
+    const alias = (s.alias ?? '').trim();
+    if (alias) {
+      return alias;
+    }
+    const base = s.transform ? s.transform.kind : defaultAlias(s);
+    // A raw time series selects tags as plain columns, so a raw field named
+    // like a group-by tag is the tag itself, not a collision.
+    if (s.fn === 'raw' && !s.transform && !s.math && tags.includes(s.column)) {
+      return base;
+    }
+    let name = base;
+    for (let k = 1; reserved.has(name.toLowerCase()) || taken.has(name.toLowerCase()); k++) {
+      name = `${base}_${k}`;
+    }
+    taken.add(name.toLowerCase());
+    return name;
+  });
+}
+
+const TRANSFORM_KINDS: ReadonlySet<string> = new Set([
+  'derivative',
+  'non_negative_derivative',
+  'difference',
+  'non_negative_difference',
+  'moving_average',
+  'cumulative_sum',
+]);
+
+/** A derivative's unit: InfluxQL duration units, never rounded (query.go rounds ms for buckets). */
+const UNIT_RE = /^(\d{1,6})(ns|us|µs|u|ms|s|m|h|d)$/;
+const UNIT_NS: Record<string, number> = {
+  ns: 1,
+  us: 1e3,
+  µs: 1e3,
+  u: 1e3,
+  ms: 1e6,
+  s: 1e9,
+  m: 60e9,
+  h: 3600e9,
+  d: 86400e9,
+};
+
+/** A unit in nanoseconds, or undefined when it is not one. */
+export function unitNanos(unit: string): number | undefined {
+  const m = UNIT_RE.exec(unit.trim());
+  if (!m || Number(m[1]) === 0) {
+    return undefined;
+  }
+  const ns = Number(m[1]) * UNIT_NS[m[2]];
+  return Number.isSafeInteger(ns) ? ns : undefined;
+}
+
+function validateTransform(s: SelectItem, i: number, errors: FieldError[]) {
+  const t = s.transform!;
+  const at = `select.${i}.transform`;
+  if (!TRANSFORM_KINDS.has(t.kind)) {
+    errors.push({ field: at, message: `Unknown transformation "${t.kind}"` });
+    return;
+  }
+  if ((t.kind === 'derivative' || t.kind === 'non_negative_derivative') && unitNanos(t.unit ?? '1s') === undefined) {
+    errors.push({ field: `${at}.unit`, message: `"${t.unit}" is not a unit (use e.g. 1s, 10s, 1m, 500ms)` });
+  }
+  if (t.kind === 'moving_average') {
+    const n = (t.n ?? '').trim();
+    if (!/^\d{1,4}$/.test(n) || Number(n) < 2 || Number(n) > 1000) {
+      errors.push({ field: `${at}.n`, message: 'moving_average needs a window of 2 to 1000 values' });
+    }
+  }
+}
+
+const MATH_TOKEN_RE = /^\s*([-+*/])\s*(-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d{1,3})?)/;
+
+/**
+ * Parses a math chain such as `* 8 / 1024`: up to five steps, each an
+ * operator and a number. Applied left to right, so `+` and `-` cannot be
+ * mixed with `*` and `/`: InfluxQL would apply precedence, and a reader
+ * would expect it.
+ */
+export function parseMath(text: string): { steps: Array<{ op: string; value: string }> } | { error: string } {
+  let rest = text.trim();
+  const steps: Array<{ op: string; value: string }> = [];
+  if (!rest) {
+    return { steps };
+  }
+  while (rest) {
+    const m = MATH_TOKEN_RE.exec(rest);
+    if (!m || !isNumberLexeme(m[2])) {
+      return { error: `Math "${text.trim()}" is not a chain like "* 8" or "/ 1024 / 1024"` };
+    }
+    if (m[1] === '/' && Number(m[2]) === 0) {
+      return { error: 'Math divides by zero' };
+    }
+    steps.push({ op: m[1], value: m[2] });
+    rest = rest.slice(m[0].length).trim();
+  }
+  if (steps.length > 5) {
+    return { error: 'Math takes at most five steps' };
+  }
+  const additive = steps.some((s) => s.op === '+' || s.op === '-');
+  const multiplicative = steps.some((s) => s.op === '*' || s.op === '/');
+  if (additive && multiplicative) {
+    return { error: 'Math mixes + or - with * or /: use Code mode, so the order is explicit' };
+  }
+  return { steps };
+}
+
+/** Wraps expr in the math chain, fully parenthesised, negatives too: `(x) - (-5)`, never `--5`. */
+function applyMath(expr: string, math: string | undefined): string {
+  if (!math) {
+    return expr;
+  }
+  const m = parseMath(math);
+  if ('error' in m) {
+    return expr;
+  }
+  // The base is parenthesised too: spread and difference are `a - b`, and
+  // `a - b * 8` would multiply b alone.
+  return m.steps.reduce(
+    (e, s) => `(${e} ${s.op} ${s.value.startsWith('-') ? `(${s.value})` : s.value})`,
+    m.steps.length ? `(${expr})` : expr
+  );
+}
+
+/** The CTE a transformed query buckets in. Improbable, so no measurement shares it (Arc treats a same-named table as the CTE). */
+const CTE = 'arc_builder_buckets';
+const RANKED = 'arc_builder_ranked';
+const PRECEDING = 'ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING';
+
+/** Buckets before the range a transformation reads, as InfluxQL does: one for a change, n-1 for a moving average. */
+function lookback(t: Transform | undefined): number {
+  switch (t?.kind) {
+    case 'derivative':
+    case 'non_negative_derivative':
+    case 'difference':
+    case 'non_negative_difference':
+      return 1;
+    case 'moving_average':
+      return Number(t.n) - 1;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * One transformation over inner column v (row i), or undefined for a row
+ * without one. `start` is set when the inner query reads buckets before the
+ * range: a running sum must not count them.
+ */
+function transformExpr(t: Transform | undefined, i: number, partition: string, start?: string): string | undefined {
+  if (!t) {
+    return undefined;
+  }
+  const v = `"__v${i}"`;
+  // The previous non-NULL value and its time, so a NULL bucket is skipped
+  // rather than breaking the chain (InfluxQL skips nulls too).
+  const pv = `last_value(${v} IGNORE NULLS) OVER (w ${PRECEDING})`;
+  const pt = `last_value(CASE WHEN ${v} IS NOT NULL THEN "__t" END IGNORE NULLS) OVER (w ${PRECEDING})`;
+  const rate = () => `(${v} - ${pv}) / NULLIF(epoch_ns("__t") - epoch_ns(${pt}), 0) * ${unitNanos(t.unit ?? '1s')}`;
+  switch (t.kind) {
+    case 'derivative':
+      return rate();
+    case 'non_negative_derivative':
+      // Time only moves forward here, so the rate is negative exactly when the value fell.
+      return `CASE WHEN ${v} >= ${pv} THEN ${rate()} END`;
+    case 'difference':
+      return `${v} - ${pv}`;
+    case 'non_negative_difference':
+      return `CASE WHEN ${v} >= ${pv} THEN ${v} - ${pv} END`;
+    case 'moving_average': {
+      // The last n values that exist, as InfluxQL: "__k" counts the series'
+      // non-NULL values so far, and a range frame over it reaches back n of
+      // them, however many NULL buckets lie between.
+      const n = Number(t.n);
+      const k = `"__k${i}"`;
+      return `CASE WHEN ${v} IS NOT NULL AND ${k} >= ${n} THEN avg(${v}) OVER (${partition}ORDER BY ${k} RANGE BETWEEN ${n - 1} PRECEDING AND CURRENT ROW) END`;
+    }
+    case 'cumulative_sum': {
+      const counted = start ? `CASE WHEN "__t" >= ${start} THEN ${v} END` : v;
+      return `CASE WHEN ${v} IS NOT NULL THEN sum(${counted}) OVER (w ROWS UNBOUNDED PRECEDING) END`;
+    }
+  }
+}
+
+/**
+ * A query with transformations: the values are computed per bucket (or per
+ * raw row) in a CTE, and the transformations run over them as window
+ * functions, per series, in time order.
+ *
+ * - InfluxQL reads buckets before the range for a change or a moving
+ *   average, so the first bucket has a value too: the CTE reads them
+ *   ($__timeFilterLookback) and QUALIFY drops them again ($__timeGroupStart).
+ * - LIMIT and ORDER BY apply to the outer query only, so the windows see
+ *   every bucket.
+ * - A row is dropped when every transformed value in it is NULL (each
+ *   series' first, a counter reset), as InfluxQL drops those points; that
+ *   also keeps an alert's Reduce from reading NaN.
+ */
+function transformedSQL(
+  b: BuilderQuery,
+  format: Format,
+  names: string[],
+  from: string,
+  where: string,
+  tagCols: string[],
+  interval: string,
+  limitSQL: string
+): string {
+  const aggregated = b.select.some((s) => isAggregate(s.fn));
+  const back = aggregated ? Math.max(...b.select.map((s) => lookback(s.transform))) : 0;
+  const start = back > 0 ? `$__timeGroupStart(${interval})` : undefined;
+  const innerWhere =
+    back > 0 ? where.replace('$__timeFilter(time)', `$__timeFilterLookback(time, ${interval}, ${back})`) : where;
+  const inner = b.select.map((s, i) => `${selectExpr(s)} AS "__v${i}"`);
+  const head = aggregated ? `$__timeGroup(time, ${interval}) AS "__t"` : 'time AS "__t"';
+  const groupBy = aggregated
+    ? `\n  GROUP BY ${Array.from({ length: 1 + tagCols.length }, (_, i) => String(i + 1)).join(', ')}`
+    : '';
+  // Raw rows can share a timestamp; the values break the tie so the order is the same every run.
+  const orderKeys = ['"__t"', ...(aggregated ? [] : b.select.map((_, i) => `"__v${i}"`))].join(', ');
+  const partition = tagCols.length ? `PARTITION BY ${tagCols.join(', ')} ` : '';
+  let ctes = `WITH ${CTE} AS (\n  SELECT ${[head, ...tagCols, ...inner].join(', ')}\n  FROM ${from}\n  WHERE ${innerWhere}${groupBy}\n)`;
+  let source = CTE;
+  const ranked = b.select.map((s, i) => (s.transform?.kind === 'moving_average' ? i : -1)).filter((i) => i >= 0);
+  if (ranked.length) {
+    const ks = ranked.map(
+      (i) => `count("__v${i}") OVER (${partition}ORDER BY ${orderKeys} ROWS UNBOUNDED PRECEDING) AS "__k${i}"`
+    );
+    ctes += `,\n${RANKED} AS (\n  SELECT *, ${ks.join(', ')}\n  FROM ${CTE}\n)`;
+    source = RANKED;
+  }
+
+  const transforms = b.select.map((s, i) => transformExpr(s.transform, i, partition, start));
+  const outer = b.select.map((s, i) => `${applyMath(transforms[i] ?? `"__v${i}"`, s.math)} AS ${quoteIdent(names[i])}`);
+  const window = `WINDOW w AS (${partition}ORDER BY ${orderKeys})`;
+  const notNull = transforms
+    .filter((t): t is string => t !== undefined)
+    .map((t) => `(${t}) IS NOT NULL`)
+    .join(' OR ');
+  const qualify = start ? `QUALIFY "__t" >= ${start} AND (${notNull})` : `QUALIFY ${notNull}`;
+  const order = format === 'time_series' ? 'ASC' : (b.orderByTime ?? 'ASC');
+  return `${ctes}\nSELECT ${['"__t" AS "time"', ...tagCols, ...outer].join(', ')}\nFROM ${source}\n${window}\n${qualify}\nORDER BY 1${order === 'DESC' ? ' DESC' : ''}${limitSQL}`;
 }
 
 /**

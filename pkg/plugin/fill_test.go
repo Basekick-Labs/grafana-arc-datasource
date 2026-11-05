@@ -282,3 +282,25 @@ func readSQL(r *http.Request) string {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	return body.SQL
 }
+
+// The lookback filter starts n buckets before the bucket holding the range
+// start; $__timeGroupStart is that bucket. Local days step back local days.
+func TestBucketMacros(t *testing.T) {
+	from, to := utc("2026-11-05T10:07:00Z"), utc("2026-11-05T11:00:00Z")
+	for _, c := range []struct{ sql, tz, want string }{
+		{"WHERE $__timeFilterLookback(time, '5m', 1)", "UTC", "WHERE (time) >= '2026-11-05T10:00:00Z' AND (time) < '2026-11-05T11:00:00Z'"},
+		{"WHERE $__timeFilterLookback(time, '5m', 0)", "UTC", "WHERE (time) >= '2026-11-05T10:05:00Z' AND (time) < '2026-11-05T11:00:00Z'"},
+		{"QUALIFY \"__t\" >= $__timeGroupStart('5m')", "UTC", "QUALIFY \"__t\" >= '2026-11-05T10:05:00Z'"},
+		{"QUALIFY \"__t\" >= $__timeGroupStart($__interval)", "UTC", "QUALIFY \"__t\" >= '2026-11-05T10:07:00Z'"},
+		// Local days in New York: the day holding 10:07Z starts at 05:00Z
+		// (EST); two days back crosses the 1 November fall back.
+		{"WHERE $__timeFilterLookback(time, '1d', 4)", "America/New_York", "WHERE (time) >= '2026-11-01T04:00:00Z' AND (time) < '2026-11-05T11:00:00Z'"},
+		{"'$__timeFilterLookback(time, ''5m'', 1)'", "UTC", "'$__timeFilterLookback(time, ''5m'', 1)'"},
+		{"WHERE $__timeFilterLookback(time; DROP, '5m', 1)", "UTC", "WHERE $__timeFilterLookback(time; DROP, '5m', 1)"},
+	} {
+		got := applyMacrosWith(c.sql, from, to, 30*time.Second, c.tz)
+		if got != c.want {
+			t.Errorf("%s (%s):\n got %s\nwant %s", c.sql, c.tz, got, c.want)
+		}
+	}
+}

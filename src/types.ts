@@ -129,6 +129,23 @@ export type FilterOp =
 /** How a filter's value is written as a literal. Chosen from the column's type when the filter is made. */
 export type FilterValueType = 'string' | 'number' | 'boolean';
 
+export type TransformKind =
+  | 'derivative'
+  | 'non_negative_derivative'
+  | 'difference'
+  | 'non_negative_difference'
+  | 'moving_average'
+  | 'cumulative_sum';
+
+/** An InfluxQL transformation applied to a select row's values, per series, in time order. */
+export interface Transform {
+  kind: TransformKind;
+  /** derivative kinds: the rate's unit, `<n><unit>` with ns, us, ms, s, m, h, d. Default 1s. */
+  unit?: string;
+  /** moving_average: how many values, 2 to 1000. */
+  n?: string;
+}
+
 export interface SelectItem {
   /** Column name. Unused for count_rows. */
   column: string;
@@ -136,6 +153,9 @@ export interface SelectItem {
   /** percentile's n, a decimal lexeme in [0, 100]. */
   param?: string;
   alias?: string;
+  transform?: Transform;
+  /** Math applied last, as typed: a chain like `* 8 / 1024` (generate.ts parseMath). */
+  math?: string;
 }
 
 export interface Filter {
@@ -149,8 +169,13 @@ export interface Filter {
 export interface BuilderQuery {
   /** Builder model version. */
   version: 1;
-  /** Bumped whenever generate() can produce different SQL for the same state. */
-  generatorVersion: 1;
+  /**
+   * Bumped whenever generate() can produce different SQL for the same state,
+   * or the state gains fields: an older plugin then opens the query in Code
+   * rather than regenerating it without them (mode.ts). 2: transformations,
+   * math, auto-suffixed default aliases.
+   */
+  generatorVersion: number;
   /** Fingerprint: exactly the SQL generate() committed. '' while the query is incomplete. */
   sql: string;
   measurement?: string;
@@ -162,11 +187,14 @@ export interface BuilderQuery {
   limit?: string;
 }
 
+/** The generator version new and edited builder queries carry. */
+export const GENERATOR_VERSION = 2;
+
 /** A fresh, empty builder state. */
 export function emptyBuilder(): BuilderQuery {
   return {
     version: 1,
-    generatorVersion: 1,
+    generatorVersion: GENERATOR_VERSION,
     sql: '',
     select: [],
     where: [],

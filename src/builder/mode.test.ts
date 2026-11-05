@@ -1,4 +1,4 @@
-import { ArcQuery, builderDefaultQuery, emptyBuilder } from '../types';
+import { ArcQuery, GENERATOR_VERSION, builderDefaultQuery, emptyBuilder } from '../types';
 import { codeModeChange, isPristineDefault, resolveMode } from './mode';
 
 const committed = 'SELECT time, "v"\nFROM "cpu"\nWHERE $__timeFilter(time)\nORDER BY time ASC';
@@ -52,7 +52,11 @@ describe('resolveMode', () => {
   test('unknown builder or generator versions are Code', () => {
     const q = builderQuery();
     expect(resolveMode({ ...q, builder: { ...q.builder!, version: 2 as never } })).toBe('code');
-    expect(resolveMode({ ...q, builder: { ...q.builder!, generatorVersion: 2 as never } })).toBe('code');
+    // A query saved by a newer plugin opens in Code here: this plugin does
+    // not know its fields and would regenerate it without them.
+    expect(resolveMode({ ...q, builder: { ...q.builder!, generatorVersion: GENERATOR_VERSION + 1 } })).toBe('code');
+    // An older generator's query still opens in the builder; it regenerates on the next edit.
+    expect(resolveMode({ ...q, builder: { ...q.builder!, generatorVersion: 1 } })).toBe('builder');
     expect(resolveMode({ ...q, builder: { ...q.builder!, generatorVersion: undefined as never } })).toBe('code');
   });
 

@@ -420,3 +420,47 @@ func fillColumn(col []*float64, times []int64, plan *fillPlan) {
 		}
 	}
 }
+
+// expandBucketMacros expands the two macros the builder's transformations
+// use to read buckets before the range, as InfluxQL does: derivative(max(x))
+// with GROUP BY time has a value at the range's first bucket, computed from
+// the bucket before it, and that first bucket holds every point in it, not
+// only those after the range start.
+//
+//	$__timeFilterLookback(time, interval, n): like $__timeFilter, from n
+//	  buckets before the bucket holding the range start.
+//	$__timeGroupStart(interval): the start of the bucket holding the range
+//	  start, a timestamp literal, to drop the lookback rows again.
+//
+// Both use bucketSpec, so local-calendar buckets (days in a non-UTC
+// dashboard) step back by local days, as $__timeGroup buckets them.
+func expandBucketMacros(sql string, from, to time.Time, tz string) string {
+	tz = validateTimezone(tz)
+	sql = replaceMacroOccurrences(sql, "$__timeFilterLookback(", func(arg string) (string, bool) {
+		parts := strings.Split(arg, ",")
+		if len(parts) != 3 {
+			return "", false
+		}
+		column := strings.TrimSpace(parts[0])
+		if err := validateColumnArg(column); err != nil {
+			return "", false
+		}
+		b, ok := newBucketSpec(strings.Trim(strings.TrimSpace(parts[1]), "'\""), tz)
+		n, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+		if !ok || err != nil || n < 0 || n > 1000 {
+			return "", false
+		}
+		start := b.floor(from)
+		for i := 0; i < n; i++ {
+			start = b.floor(start.Add(-time.Nanosecond))
+		}
+		return fmt.Sprintf("(%s) >= '%s' AND (%s) < '%s'", column, start.Format(time.RFC3339), column, to.Format(time.RFC3339)), true
+	})
+	return replaceMacroOccurrences(sql, "$__timeGroupStart(", func(arg string) (string, bool) {
+		b, ok := newBucketSpec(strings.Trim(strings.TrimSpace(arg), "'\""), tz)
+		if !ok {
+			return "", false
+		}
+		return "'" + b.floor(from).Format(time.RFC3339) + "'", true
+	})
+}

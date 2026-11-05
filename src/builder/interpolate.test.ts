@@ -64,3 +64,17 @@ describe('rawSingle', () => {
     expect(() => rawSingle([])).toThrow(VariableUseError);
   });
 });
+
+test('the transformation macros survive interpolation; $__interval inside them is quoted', () => {
+  const v = new CustomVariable({ name: 'host', query: 'a', value: 'a', text: 'a' });
+  const scene = new EmbeddedScene({ $variables: new SceneVariableSet({ variables: [v] }), body: undefined as never });
+  const out = sceneGraph.interpolate(
+    scene,
+    'WHERE $__timeFilterLookback(time, $__interval, 1) AND "host" IN ($host) QUALIFY "__t" >= $__timeGroupStart($__interval)',
+    { __interval: { text: '10s', value: '10s' } },
+    builderFormat as never
+  );
+  expect(out).toBe(
+    `WHERE $__timeFilterLookback(time, '10s', 1) AND "host" IN ('a') QUALIFY "__t" >= $__timeGroupStart('10s')`
+  );
+});
