@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Query builder: InfluxQL transformations (`derivative`,
+  `non_negative_derivative`, `difference`, `non_negative_difference`,
+  `moving_average`, `cumulative_sum`) and math (`* 8`, `/ 1024 / 1024`) on
+  any field. Results match InfluxDB 1.8's for the same data, including the
+  range's first bucket (read from the bucket before it) and NULL buckets
+  (skipped). Such queries are never split, and the editor shows why next to
+  Splitting. A repeated default field name now gets `_1`, `_2` instead of
+  an error.
+- Macros `$__timeFilterLookback(time, interval, n)` and
+  `$__timeGroupStart(interval)`, which the builder's transformations use to
+  read buckets before the range.
 - Gap filling with `$__timeGroup`'s third argument, as in Grafana's
   Postgres and MySQL datasources: `NULL`, `previous`, `linear` or a number
   gives every series a point in every bucket of the range. Time series

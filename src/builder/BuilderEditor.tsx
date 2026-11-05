@@ -20,13 +20,25 @@ import {
 } from '@grafana/ui';
 import { css } from '@emotion/css';
 import { ArcDataSource, ColumnInfo } from '../datasource';
-import { AggregateFn, ArcQuery, BuilderQuery, Filter, FilterOp, SelectItem, emptyBuilder } from '../types';
+import {
+  AggregateFn,
+  ArcQuery,
+  BuilderQuery,
+  Filter,
+  FilterOp,
+  GENERATOR_VERSION,
+  SelectItem,
+  TransformKind,
+  emptyBuilder,
+} from '../types';
 import { FieldError, defaultAlias, generate, isAggregate, variableName } from './generate';
 import {
   ColumnKind,
   FUNCTIONS,
+  TRANSFORMS,
   defaultFunctionFor,
   functionIneligibility,
+  transformIneligibility,
   kindOf,
   operatorsFor,
   valueTypeFor,
@@ -66,7 +78,12 @@ export function commitBuilder(
   const result = generate(b, query.format ?? 'time_series');
   const sql = result.sql !== undefined && extraErrors.length === 0 ? result.sql : '';
   return {
-    query: { ...query, editorMode: 'builder', builder: { ...b, version: 1, generatorVersion: 1, sql }, sql },
+    query: {
+      ...query,
+      editorMode: 'builder',
+      builder: { ...b, version: 1, generatorVersion: GENERATOR_VERSION, sql },
+      sql,
+    },
     valid: sql !== '',
   };
 }
@@ -327,6 +344,10 @@ export function BuilderEditor({
 
   const aggregated = b.select.some((s) => isAggregate(s.fn));
   const dbHidden = !datasource.allowsDatabaseOverride();
+  // Transformations run over values in time order: buckets, or a raw time series.
+  const noTransformWhy = (aggregated ? !b.groupBy.time : format === 'table')
+    ? 'needs GROUP BY time, or a raw time series'
+    : undefined;
 
   return (
     <div className={styles.rows} data-testid="arc-query-builder">
@@ -457,10 +478,59 @@ export function BuilderEditor({
                   onChange={(o) => updateSelect(i, { column: o.value ?? '' })}
                 />
               )}
+              <Segment<TransformKind | ''>
+                value={s.transform?.kind}
+                placeholder="transform"
+                aria-label={`Transformation for field ${i + 1}`}
+                options={[
+                  { label: 'none', value: '', description: 'No transformation' },
+                  ...TRANSFORMS.map((o) => {
+                    const why = noTransformWhy ?? transformIneligibility(s.fn, kind);
+                    return {
+                      label: o.label,
+                      value: o.kind,
+                      description: why ? `${o.description}: ${why}` : o.description,
+                      isDisabled: !!why,
+                    };
+                  }),
+                ]}
+                onChange={(o) =>
+                  updateSelect(i, {
+                    transform: o.value
+                      ? { kind: o.value, n: o.value === 'moving_average' ? (s.transform?.n ?? '10') : undefined }
+                      : undefined,
+                  })
+                }
+              />
+              {(s.transform?.kind === 'derivative' || s.transform?.kind === 'non_negative_derivative') && (
+                <SegmentInput
+                  value={s.transform.unit ?? ''}
+                  placeholder="1s"
+                  aria-label={`Unit for field ${i + 1}`}
+                  onChange={(v) =>
+                    updateSelect(i, { transform: { ...s.transform!, unit: String(v).trim() || undefined } })
+                  }
+                />
+              )}
+              {s.transform?.kind === 'moving_average' && (
+                <SegmentInput
+                  value={s.transform.n ?? ''}
+                  placeholder="10"
+                  aria-label={`Window for field ${i + 1}`}
+                  onChange={(v) => updateSelect(i, { transform: { ...s.transform!, n: String(v).trim() } })}
+                />
+              )}
+              <SegmentInput
+                value={s.math ?? ''}
+                placeholder="math"
+                inputPlaceholder="* 8 / 1024"
+                aria-label={`Math for field ${i + 1}`}
+                onChange={(v) => updateSelect(i, { math: String(v).trim() || undefined })}
+              />
               <InlineLabel width="auto">AS</InlineLabel>
               <SegmentInput
                 value={s.alias ?? ''}
-                placeholder={defaultAlias(s) || 'alias'}
+                placeholder={s.transform?.kind ?? (defaultAlias(s) || 'alias')}
                 onChange={(v) => updateSelect(i, { alias: String(v).trim() || undefined })}
               />
               <IconButton name="times" size="sm" aria-label={`Remove field ${i + 1}`} onClick={() => removeSelect(i)} />

@@ -127,7 +127,7 @@ New queries open in a visual builder modelled on Grafana's InfluxDB (InfluxQL) e
 
 ```
 FROM     [database] [measurement]   WHERE  [column] [operator] [value]  +
-SELECT   [function] [column] AS [alias]                                  +
+SELECT   [function] [column] [transformation] [math] AS [alias]          +
 GROUP BY time([interval]) [tag]                                          +
 ORDER BY time [ASC|DESC]   LIMIT [n]
 ```
@@ -136,7 +136,7 @@ ORDER BY time [ASC|DESC]   LIMIT [n]
 |-----|----------------|
 | **FROM** | `FROM "measurement"`, always with `WHERE $__timeFilter(time)`. The database list comes from Arc (a key that can read only one database sees that one); the database picker is hidden when **Allow Database Override** is off. |
 | **WHERE** | AND-joined filters. Text columns get `=`, `!=`, `=~`, `!~`, `LIKE`, `NOT LIKE`; numbers get comparisons; all get `IS NULL`. Value suggestions are the distinct values in the panel's time range, narrowed by the other filters. |
-| **SELECT** | `mean`, `median`, `sum`, `count`, `count distinct`, `min`, `max`, `first`, `last` (earliest/latest by time), `stddev`, `spread`, `percentile`, `count rows`, or `raw` (no aggregation). Aliases default to the function name, as in InfluxQL. |
+| **SELECT** | `mean`, `median`, `sum`, `count`, `count distinct`, `min`, `max`, `first`, `last` (earliest/latest by time), `stddev`, `spread`, `percentile`, `count rows`, or `raw` (no aggregation). Then optionally a transformation and math (below). Aliases default to the function name (or the transformation's), as in InfluxQL; a repeated default gets `_1`, `_2`. |
 | **GROUP BY** | `time($__interval)` (or a fixed interval) and tag columns. Each tag set becomes its own series. |
 
 Arc keeps no tag/field marker, so the builder goes by column type: text columns are offered for filters and GROUP BY, numeric ones for aggregation. Columns come from Arc's stored schema; a measurement written before Arc kept one gets its columns from its last 24 hours of data (marked "inferred").
@@ -154,9 +154,28 @@ Arc keeps no tag/field marker, so the builder goes by column type: text columns 
 - A LIMIT, or a window function (`OVER`) in Code mode, turns off query splitting for that query.
 - Arc refuses SQL longer than `query.max_sql_length` (10,000 characters by default). An **All** selection over many values can exceed it; the panel then says so.
 
+**Transformations.** A field can be followed by an InfluxQL transformation, computed per series in time order:
+
+| Transformation | Value |
+|---|---|
+| `derivative(unit)` | rate of change per unit (default `1s`; e.g. `10s`, `500ms`), over the actual time between values |
+| `non_negative_derivative(unit)` | the same, with negative rates dropped: a counter reset is not a dip |
+| `difference` / `non_negative_difference` | change from the previous value |
+| `moving_average(n)` | mean of the last n values |
+| `cumulative_sum` | running total from the start of the range |
+
+A Telegraf counter panel is `max(bytes_recv)` → `non_negative_derivative` `1s`, grouped by `time($__interval)` and `host`. The results match InfluxDB 1.8's for the same data:
+- NULL buckets are skipped.
+- The range's first bucket has a value, computed from the bucket before it.
+- A point with no value (a series' first, a counter reset) is dropped.
+
+Transformations need values in time order: `GROUP BY time`, or a raw time series. Such a query is never split; the editor says so next to **Splitting**.
+
+**Math.** After the function (and transformation), a chain such as `* 8` or `/ 1024 / 1024`, applied left to right. It cannot mix `+`/`-` with `*`/`/`: use Code for that.
+
 **Builder and Code.** **Edit as SQL** (or the **Code** toggle) switches to the SQL editor with the builder's SQL. Going back to **Builder** asks first: code changes are not carried into the builder, which reopens its last state. Queries saved before the builder existed, and any query whose SQL was edited outside the builder, open in Code unchanged.
 
-Not in the builder yet (use Code): `fill()`, transformations such as `derivative` and `moving_average`, math on fields, `OR` and grouped filters, and `GROUP BY *`.
+Not in the builder yet (use Code): `fill()`, `OR` and grouped filters, math between fields, and `GROUP BY *`.
 
 ### Query Editor (Code)
 
@@ -221,6 +240,8 @@ The datasource provides several macros for dynamic queries:
 | `$__timeTo()` | End of time range | `time < $__timeTo()` |
 | `$__interval` | Grafana's calculated interval | `$__timeGroup(time, '$__interval')` |
 | `$__timeGroup(columnName, interval[, fill])` | Epoch-based time bucketing. The interval is `<n><unit>`: `s`, `m`, `h`, `d`, `w`, or `ms`, which rounds up to whole seconds (`500ms` buckets by 1s). The optional `fill` fills empty buckets: see below | `$__timeGroup(time, '1m', NULL) AS time` |
+| `$__timeFilterLookback(columnName, interval, n)` | Like `$__timeFilter`, starting `n` buckets before the bucket that holds the range start | `WHERE $__timeFilterLookback(time, '5m', 1)` |
+| `$__timeGroupStart(interval)` | The start of the bucket that holds the range start | `QUALIFY "time" >= $__timeGroupStart('5m')` |
 
 #### Filling gaps
 
@@ -310,7 +331,7 @@ allowed to read.
 
 ### Alerting
 
-The datasource fully supports Grafana alerting. Create alert rules with Arc queries:
+The datasource fully supports Grafana alerting. A rule built from a query whose result can hold NULL values (a `fill(NULL)`, or several transformed fields in one query) reduces to NaN in a Reduce expression's default Strict mode; set its mode to **Drop non-numeric values**. Create alert rules with Arc queries:
 
 **Example alert query (CPU usage > 80%):**
 ```sql

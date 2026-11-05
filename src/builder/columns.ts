@@ -5,7 +5,7 @@
  * text columns behave like InfluxQL tags (filter and group by them), numeric
  * ones like fields (aggregate them).
  */
-import { AggregateFn, FilterOp, FilterValueType } from '../types';
+import { AggregateFn, FilterOp, FilterValueType, TransformKind } from '../types';
 import { NUMERIC_ONLY } from './generate';
 
 export type ColumnKind = 'string' | 'number' | 'boolean' | 'other' | 'unknown';
@@ -107,4 +107,39 @@ export function functionIneligibility(
 /** A sensible first function for a column, InfluxQL style. */
 export function defaultFunctionFor(kind: ColumnKind): AggregateFn {
   return kind === 'number' || kind === 'unknown' ? 'mean' : 'count';
+}
+
+export interface TransformOption {
+  kind: TransformKind;
+  label: string;
+  description: string;
+}
+
+export const TRANSFORMS: TransformOption[] = [
+  {
+    kind: 'non_negative_derivative',
+    label: 'non_negative_derivative',
+    description: 'Rate per unit, negative steps (counter resets) dropped',
+  },
+  { kind: 'derivative', label: 'derivative', description: 'Rate of change per unit' },
+  {
+    kind: 'non_negative_difference',
+    label: 'non_negative_difference',
+    description: 'Change from the previous value, negative ones dropped',
+  },
+  { kind: 'difference', label: 'difference', description: 'Change from the previous value' },
+  { kind: 'moving_average', label: 'moving_average', description: 'Mean of the last N values' },
+  { kind: 'cumulative_sum', label: 'cumulative_sum', description: 'Running total from the start of the range' },
+];
+
+/**
+ * Why a transformation cannot follow `fn` over a column of `kind`, or
+ * undefined when it can: transformations do arithmetic, so the value must be
+ * a number. Counts always are; unknown kinds are allowed (Arc decides).
+ */
+export function transformIneligibility(fn: AggregateFn, kind: ColumnKind): string | undefined {
+  if (fn === 'count' || fn === 'count_rows' || fn === 'count_distinct' || kind === 'number' || kind === 'unknown') {
+    return undefined;
+  }
+  return 'needs a numeric value';
 }

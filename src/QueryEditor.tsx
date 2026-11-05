@@ -30,7 +30,7 @@ const SPLIT_OPTIONS = [
   { label: '7 days', value: '7d' },
 ];
 
-export function QueryEditor({ query, onChange, onRunQuery, datasource, range, app }: Props) {
+export function QueryEditor({ query, onChange, onRunQuery, datasource, range, app, data }: Props) {
   const styles = useStyles2(getStyles);
   const mode = resolveMode(query);
   const [confirmBuilder, setConfirmBuilder] = useState(false);
@@ -92,6 +92,12 @@ export function QueryEditor({ query, onChange, onRunQuery, datasource, range, ap
     onChange(codeModeChange(query, { database: event.target.value }));
   };
 
+  // The backend says when it ran a query unsplit, and why; the editor does
+  // not second-guess its heuristics.
+  const splitSkipped = data?.series.find((f) => f.refId === query.refId)?.meta?.custom?.splitSkipped as
+    | string
+    | undefined;
+
   return (
     <div className="gf-form-group">
       <div className={styles.toolbar}>
@@ -102,10 +108,15 @@ export function QueryEditor({ query, onChange, onRunQuery, datasource, range, ap
 
         <InlineField
           label="Splitting"
-          tooltip="Parallel time-range chunking for faster results. Applies to: time-bucketed ($__timeGroup) and raw queries. Auto-skipped for: GROUP BY, DISTINCT, COUNT/SUM/AVG without $__timeGroup, LIMIT, and no $__timeFilter."
+          tooltip="Parallel time-range chunking for faster results. Applies to: time-bucketed ($__timeGroup) and raw queries. Auto-skipped for: GROUP BY, DISTINCT, COUNT/SUM/AVG without $__timeGroup, window functions (transformations), LIMIT, and no $__timeFilter."
         >
           <Select options={SPLIT_OPTIONS} value={query.splitDuration || 'auto'} onChange={onSplitChange} width={16} />
         </InlineField>
+        {splitSkipped && (
+          <span className={styles.splitNote} data-testid="arc-split-skipped">
+            Not split: {splitSkipped}
+          </span>
+        )}
 
         {mode === 'code' && (
           <InlineField
@@ -175,6 +186,11 @@ export function QueryEditor({ query, onChange, onRunQuery, datasource, range, ap
 }
 
 const getStyles = (theme: GrafanaTheme2) => ({
+  splitNote: css({
+    alignSelf: 'center',
+    fontSize: theme.typography.bodySmall.fontSize,
+    color: theme.colors.text.secondary,
+  }),
   toolbar: css({
     display: 'flex',
     flexWrap: 'wrap',

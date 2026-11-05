@@ -14,7 +14,7 @@ import React, { useState } from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryEditor } from '../QueryEditor';
 import { ArcDataSource, ColumnsResponse } from '../datasource';
-import { ArcQuery, builderDefaultQuery, emptyBuilder } from '../types';
+import { ArcQuery, GENERATOR_VERSION, builderDefaultQuery, emptyBuilder } from '../types';
 
 const CPU: ColumnsResponse = {
   source: 'schema',
@@ -211,4 +211,48 @@ test('a key that cannot list databases gets the configured one and a hint to typ
   expect(await screen.findByText('Type a name…')).toBeInTheDocument();
   expect(screen.getByText('This API key cannot list every database')).toBeInTheDocument();
   expect(screen.queryByText('other')).not.toBeInTheDocument();
+});
+
+test('a transformation and math are picked per field, and the SQL follows', async () => {
+  const { last } = setup({ ...(builderDefaultQuery() as ArcQuery), refId: 'A' });
+  await pick('select measurement', 'cpu');
+  await waitFor(() => expect(last()?.sql).toContain('avg("usage_idle") AS "mean"'));
+  await pick('transform', 'non_negative_derivative');
+  await waitFor(() => expect(last().sql).toContain('WITH arc_builder_buckets AS ('));
+  expect(last().builder?.select[0].transform).toEqual({ kind: 'non_negative_derivative', n: undefined });
+  expect(last().sql).toContain('AS "non_negative_derivative"');
+  expect(last().builder?.generatorVersion).toBe(GENERATOR_VERSION);
+
+  fireEvent.click(screen.getByText('math'));
+  const input = await screen.findByPlaceholderText('* 8 / 1024');
+  fireEvent.change(input, { target: { value: '* 8' } });
+  fireEvent.blur(input);
+  await waitFor(() => expect(last().builder?.select[0].math).toBe('* 8'));
+  expect(last().sql).toMatch(/\* 8\) AS "non_negative_derivative"/);
+
+  // The alias placeholder shows the same name; the transformation segment comes first.
+  fireEvent.click(screen.getAllByText('non_negative_derivative')[0]);
+  fireEvent.click(await screen.findByRole('option', { name: /^none/ }));
+  await waitFor(() => expect(last().sql).not.toContain('arc_builder_buckets'));
+});
+
+test('a transformation is offered only where values come in time order', async () => {
+  setup({
+    refId: 'A',
+    editorMode: 'builder',
+    format: 'table',
+    sql: '',
+    builder: {
+      ...emptyBuilder(),
+      measurement: 'cpu',
+      select: [{ column: 'usage_idle', fn: 'mean' }],
+      groupBy: { tags: [] },
+      sql: '',
+    },
+  });
+  await waitFor(() => expect(screen.getByTestId('arc-builder-sql')).toHaveTextContent('avg("usage_idle")'));
+  fireEvent.click(screen.getByText('transform'));
+  expect(
+    await screen.findByText(/Rate of change per unit: needs GROUP BY time, or a raw time series/)
+  ).toBeInTheDocument();
 });

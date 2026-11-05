@@ -8,10 +8,10 @@
  * builder query. The fingerprint, the SQL the builder last committed, is what
  * proves the saved SQL is the builder's.
  */
-import { ArcQuery, EditorMode } from '../types';
+import { ArcQuery, EditorMode, GENERATOR_VERSION } from '../types';
 
 const KNOWN_VERSION = 1;
-const KNOWN_GENERATOR = 1;
+const KNOWN_GENERATOR = GENERATOR_VERSION;
 
 export function resolveMode(query: Partial<ArcQuery>): EditorMode {
   const b = query.builder;

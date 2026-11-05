@@ -984,6 +984,7 @@ func applyMacrosWith(sql string, filterFrom, filterTo time.Time, intervalDuratio
 	sql = replaceIntervalToken(sql, "$__interval_ms",
 		strconv.FormatInt(intervalMilliseconds(intervalDuration), 10))
 	sql = replaceIntervalToken(sql, "$__interval", calculateInterval(intervalDuration))
+	sql = expandBucketMacros(sql, filterFrom, filterTo, tz)
 	// $__timeGroup(column, interval) -> epoch-based bucketing
 	// DuckDB's date_trunc/time_bucket retains nanosecond residuals on TIMESTAMP_NS columns,
 	// causing GROUP BY to produce per-second rows. Epoch math avoids this.
