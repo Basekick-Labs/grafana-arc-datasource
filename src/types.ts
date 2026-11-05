@@ -68,8 +68,18 @@ export interface ArcSecureJsonData {
  * Arc query model
  */
 export interface ArcQuery extends DataQuery {
+  /** The only thing the backend executes, in both editor modes. */
   sql: string;
   format?: 'time_series' | 'table';
+  /**
+   * Which editor the query was last committed from. Absent on every query
+   * saved before the visual builder existed; those open in Code. Never trust
+   * this alone: see resolveMode in builder/mode.ts.
+   */
+  editorMode?: EditorMode;
+  /** Visual builder state (builder/). Ignored by the backend; stripped from requests. */
+  builder?: BuilderQuery;
+  /** Read by nothing. Kept so saved queries that carry it still type-check. */
   rawQuery?: boolean;
   rawSql?: string; // Postgres/MySQL/MSSQL/ClickHouse compatibility
   splitDuration?: string; // "off", "1h", "6h", "12h", "1d", "3d", "7d"
@@ -83,11 +93,97 @@ export interface ArcQuery extends DataQuery {
   timezone?: string;
 }
 
+export type EditorMode = 'builder' | 'code';
+
+/** Functions the builder offers, InfluxQL names. See builder/functions.ts for the SQL. */
+export type AggregateFn =
+  | 'raw'
+  | 'mean'
+  | 'median'
+  | 'sum'
+  | 'count'
+  | 'count_rows'
+  | 'count_distinct'
+  | 'min'
+  | 'max'
+  | 'first'
+  | 'last'
+  | 'stddev'
+  | 'spread'
+  | 'percentile';
+
+export type FilterOp =
+  | '='
+  | '!='
+  | '<'
+  | '<='
+  | '>'
+  | '>='
+  | '=~'
+  | '!~'
+  | 'LIKE'
+  | 'NOT LIKE'
+  | 'IS NULL'
+  | 'IS NOT NULL';
+
+/** How a filter's value is written as a literal. Chosen from the column's type when the filter is made. */
+export type FilterValueType = 'string' | 'number' | 'boolean';
+
+export interface SelectItem {
+  /** Column name. Unused for count_rows. */
+  column: string;
+  fn: AggregateFn;
+  /** percentile's n, a decimal lexeme in [0, 100]. */
+  param?: string;
+  alias?: string;
+}
+
+export interface Filter {
+  column: string;
+  op: FilterOp;
+  /** Literal as typed, or a variable reference ($name / ${name}). Unused for IS [NOT] NULL. */
+  value?: string;
+  valueType?: FilterValueType;
+}
+
+export interface BuilderQuery {
+  /** Builder model version. */
+  version: 1;
+  /** Bumped whenever generate() can produce different SQL for the same state. */
+  generatorVersion: 1;
+  /** Fingerprint: exactly the SQL generate() committed. '' while the query is incomplete. */
+  sql: string;
+  measurement?: string;
+  select: SelectItem[];
+  where: Filter[];
+  groupBy: { time?: { interval: string }; tags: string[] };
+  orderByTime?: 'ASC' | 'DESC';
+  /** Integer lexeme; empty means no LIMIT. */
+  limit?: string;
+}
+
+/** A fresh, empty builder state. */
+export function emptyBuilder(): BuilderQuery {
+  return {
+    version: 1,
+    generatorVersion: 1,
+    sql: '',
+    select: [],
+    where: [],
+    groupBy: { time: { interval: '$__interval' }, tags: [] },
+  };
+}
+
 /**
- * Default values
+ * Default values for queries Code mode creates (and the shape older code
+ * expected). New queries get builderDefaultQuery() from getDefaultQuery.
  */
 export const defaultQuery: Partial<ArcQuery> = {
   sql: 'SELECT * FROM cpu WHERE $__timeFilter(time) LIMIT 100',
   format: 'time_series',
-  rawQuery: true,
 };
+
+/** What a new query starts as: an empty builder query. */
+export function builderDefaultQuery(): Partial<ArcQuery> {
+  return { editorMode: 'builder', format: 'time_series', sql: '', builder: emptyBuilder() };
+}

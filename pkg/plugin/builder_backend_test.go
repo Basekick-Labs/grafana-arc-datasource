@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -143,5 +144,37 @@ func TestQueryRejectsEmptySQL(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{"sql": "", "rawSql": "SELECT 1 AS v", "format": "table"})
 	if resp := d.query(context.Background(), inst, backend.DataQuery{RefID: "A", JSON: raw, TimeRange: builderTestRange}); resp.Error != nil {
 		t.Errorf("rawSql migration broke: %v", resp.Error)
+	}
+}
+
+// Arc rejects SQL over its length cap with a bare 400 on the Arrow endpoint.
+// A long statement gets the likely cause added; anything else is unchanged.
+func TestExplainLongSQL(t *testing.T) {
+	long := strings.Repeat("x", arcDefaultMaxSQLLength+1)
+	arc400 := &arcHTTPError{Status: 400, Msg: "Arc error (HTTP 400): query failed (see server logs for detail)"}
+	got := explainLongSQL(arc400, long)
+	if !strings.Contains(got.Error(), "query.max_sql_length") || !strings.Contains(got.Error(), "10001 characters") {
+		t.Errorf("long SQL: %v", got)
+	}
+	var httpErr *arcHTTPError
+	if !errors.As(got, &httpErr) || httpErr.Status != 400 {
+		t.Errorf("explained error lost its cause: %#v", got)
+	}
+	// The panel shows the explanation, not the sanitiser's generic summary.
+	if shown := sanitizeUserError("A", got); !strings.Contains(shown, "query.max_sql_length") {
+		t.Errorf("panel message: %q", shown)
+	}
+	for _, c := range []struct {
+		err error
+		sql string
+	}{
+		{arc400, "SELECT 1"}, // short: some other 400
+		{&arcHTTPError{Status: 500, Msg: "boom"}, long},
+		{errors.New("network"), long},
+		{nil, long},
+	} {
+		if got := explainLongSQL(c.err, c.sql); got != c.err {
+			t.Errorf("explainLongSQL(%v, %d chars) changed the error: %v", c.err, len(c.sql), got)
+		}
 	}
 }

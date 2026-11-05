@@ -419,7 +419,10 @@ func sanitizeUserErrorWith(refID string, err error, extra ...any) string {
 	// Typed-error matching first (preferred). String contains is a fallback
 	// for paths that don't have a typed sentinel yet.
 	var maxBytesErr *http.MaxBytesError
+	var tooLong *sqlTooLongError
 	switch {
+	case errors.As(err, &tooLong):
+		return tooLong.Error()
 	case errors.Is(err, errBlockedAddr):
 		return "Arc URL resolves to a blocked address (private/loopback). Update the datasource URL or enable 'Allow Private IPs'."
 	case errors.As(err, &maxBytesErr):

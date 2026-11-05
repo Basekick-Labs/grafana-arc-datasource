@@ -28,6 +28,7 @@ High-performance Grafana datasource plugin for Arc time-series database using Ap
 - **High Performance**: Streaming deserialization straight into Grafana DataFrames
 - **Query Splitting**: Large time ranges chunked and executed in parallel, with automatic skip for queries where splitting would change results
 - **Alerting Support**: Full support for Grafana alerting and notifications
+- **Visual Query Builder**: InfluxQL-style rows (FROM, WHERE, SELECT, GROUP BY) that write Arc SQL, with database, measurement, column and value suggestions from Arc
 - **SQL Query Editor**: Direct DuckDB SQL with Grafana macro expansion
 - **Template Variables**: Dynamic dashboard filters with variable support
 - **Time-series Optimized**: Native support for DuckDB time functions
@@ -120,7 +121,44 @@ dashboard editors should.
 
 ## Usage
 
-### Query Editor
+### Query Builder
+
+New queries open in a visual builder modelled on Grafana's InfluxDB (InfluxQL) editor. Every change writes Arc SQL, shown under the rows; that SQL is what Arc runs, so panels, Explore and alerts all behave like a query you typed yourself.
+
+```
+FROM     [database] [measurement]   WHERE  [column] [operator] [value]  +
+SELECT   [function] [column] AS [alias]                                  +
+GROUP BY time([interval]) [tag]                                          +
+ORDER BY time [ASC|DESC]   LIMIT [n]
+```
+
+| Row | What it writes |
+|-----|----------------|
+| **FROM** | `FROM "measurement"`, always with `WHERE $__timeFilter(time)`. The database list comes from Arc (a key that can read only one database sees that one); the database picker is hidden when **Allow Database Override** is off. |
+| **WHERE** | AND-joined filters. Text columns get `=`, `!=`, `=~`, `!~`, `LIKE`, `NOT LIKE`; numbers get comparisons; all get `IS NULL`. Value suggestions are the distinct values in the panel's time range, narrowed by the other filters. |
+| **SELECT** | `mean`, `median`, `sum`, `count`, `count distinct`, `min`, `max`, `first`, `last` (earliest/latest by time), `stddev`, `spread`, `percentile`, `count rows`, or `raw` (no aggregation). Aliases default to the function name, as in InfluxQL. |
+| **GROUP BY** | `time($__interval)` (or a fixed interval) and tag columns. Each tag set becomes its own series. |
+
+Arc keeps no tag/field marker, so the builder goes by column type: text columns are offered for filters and GROUP BY, numeric ones for aggregation. Columns come from Arc's stored schema; a measurement written before Arc kept one gets its columns from its last 24 hours of data (marked "inferred").
+
+**Variables.** Every dropdown offers the dashboard's variables:
+- A filter on `=` or `!=` turns a variable into `IN (…)` / `NOT IN (…)`, so multi-value and **All** selections work. Other operators accept single-value variables only.
+- A variable with a custom **All** value cannot be used in a builder filter: switch the query to Code.
+- A database or measurement variable must have exactly one value selected.
+- Alert rules are evaluated without dashboard variables. **New alert rule** from a builder panel stores the SQL with the variables' current values, in Code mode.
+
+**Semantics worth knowing:**
+- `!=`, `!~` and `NOT LIKE` keep rows where the column is NULL, matching InfluxQL, where a negated tag filter keeps series that lack the tag.
+- Regular expressions use DuckDB's RE2 syntax; InfluxQL-style `/…/` delimiters are accepted.
+- A value containing `$` is substituted by Grafana like a variable.
+- A LIMIT turns off query splitting for that query.
+- Arc refuses SQL longer than `query.max_sql_length` (10,000 characters by default). An **All** selection over many values can exceed it; the panel then says so.
+
+**Builder and Code.** **Edit as SQL** (or the **Code** toggle) switches to the SQL editor with the builder's SQL. Going back to **Builder** asks first: code changes are not carried into the builder, which reopens its last state. Queries saved before the builder existed, and any query whose SQL was edited outside the builder, open in Code unchanged.
+
+Not in the builder yet (use Code): `fill()`, transformations such as `derivative` and `moving_average`, math on fields, `OR` and grouped filters, and `GROUP BY *`.
+
+### Query Editor (Code)
 
 The Arc datasource provides a SQL query editor with:
 - Time range macros expanded server-side (safe against injection via literals/comments)
