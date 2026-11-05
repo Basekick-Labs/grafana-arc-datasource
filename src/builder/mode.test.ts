@@ -80,3 +80,14 @@ describe('codeModeChange', () => {
     expect(resolveMode(next)).toBe('code');
   });
 });
+
+test('rollback: a query saved by the next generator opens in Code, so OR is never regenerated as AND', () => {
+  const q: ArcQuery = {
+    refId: 'A',
+    editorMode: 'builder',
+    sql: 'X',
+    builder: { ...emptyBuilder(), generatorVersion: GENERATOR_VERSION + 1, sql: 'X' },
+  };
+  expect(resolveMode(q)).toBe('code');
+  expect(GENERATOR_VERSION).toBe(3);
+});

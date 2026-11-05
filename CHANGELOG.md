@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Query builder: `fill()` beside GROUP BY time (none, null, previous,
+  linear or a number, through `$__timeGroup`'s fill argument), and filters
+  joined by OR as well as AND. AND binds tighter, every OR is kept inside
+  the time filter, and value suggestions use only the edited filter's AND
+  group. Builder queries now carry generator version 3; an older plugin
+  opens them in Code rather than rewriting an OR as AND.
 - Query builder: InfluxQL transformations (`derivative`,
   `non_negative_derivative`, `difference`, `non_negative_difference`,
   `moving_average`, `cumulative_sum`) and math (`* 8`, `/ 1024 / 1024`) on

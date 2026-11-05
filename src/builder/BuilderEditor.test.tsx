@@ -256,3 +256,32 @@ test('a transformation is offered only where values come in time order', async (
     await screen.findByText(/Rate of change per unit: needs GROUP BY time, or a raw time series/)
   ).toBeInTheDocument();
 });
+
+test('a filter can join by OR, and fill is picked beside GROUP BY time', async () => {
+  const { last } = setup({
+    refId: 'A',
+    editorMode: 'builder',
+    sql: '',
+    builder: {
+      ...emptyBuilder(),
+      measurement: 'cpu',
+      select: [{ column: 'usage_idle', fn: 'mean' }],
+      where: [
+        { column: 'host', op: '=', value: 'a', valueType: 'string' },
+        { column: 'region', op: '=', value: 'eu', valueType: 'string' },
+      ],
+      sql: '',
+    },
+  });
+  await waitFor(() => expect(screen.getByTestId('arc-builder-sql')).toHaveTextContent(`"region" = 'eu'`));
+  fireEvent.click(screen.getByText('AND'));
+  fireEvent.click(await screen.findByRole('option', { name: /^OR/ }));
+  await waitFor(() => expect(last()?.sql).toContain(`AND ("host" = 'a' OR "region" = 'eu')`));
+  expect(last().builder?.where[1].connector).toBe('OR');
+
+  // LIMIT also reads "none"; the fill segment comes first.
+  fireEvent.click(screen.getAllByText('none')[0]);
+  fireEvent.click(await screen.findByRole('option', { name: /^previous/ }));
+  await waitFor(() => expect(last().sql).toContain('$__timeGroup(time, $__interval, previous) AS "time"'));
+  expect(last().builder?.generatorVersion).toBe(GENERATOR_VERSION);
+});

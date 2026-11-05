@@ -126,18 +126,18 @@ dashboard editors should.
 New queries open in a visual builder modelled on Grafana's InfluxDB (InfluxQL) editor. Every change writes Arc SQL, shown under the rows; that SQL is what Arc runs, so panels, Explore and alerts all behave like a query you typed yourself.
 
 ```
-FROM     [database] [measurement]   WHERE  [column] [operator] [value]  +
+FROM     [database] [measurement]   WHERE  [column] [operator] [value]  [AND|OR] … +
 SELECT   [function] [column] [transformation] [math] AS [alias]          +
-GROUP BY time([interval]) [tag]                                          +
+GROUP BY time([interval]) fill([none|null|previous|linear|n]) [tag]     +
 ORDER BY time [ASC|DESC]   LIMIT [n]
 ```
 
 | Row | What it writes |
 |-----|----------------|
 | **FROM** | `FROM "measurement"`, always with `WHERE $__timeFilter(time)`. The database list comes from Arc (a key that can read only one database sees that one); the database picker is hidden when **Allow Database Override** is off. |
-| **WHERE** | AND-joined filters. Text columns get `=`, `!=`, `=~`, `!~`, `LIKE`, `NOT LIKE`; numbers get comparisons; all get `IS NULL`. Value suggestions are the distinct values in the panel's time range, narrowed by the other filters. |
+| **WHERE** | Filters joined by AND or OR; AND binds tighter, so `a AND b OR c` is `(a AND b) OR c`. The SQL shows the parentheses, and an OR never reaches outside the time filter. Text columns get `=`, `!=`, `=~`, `!~`, `LIKE`, `NOT LIKE`; numbers get comparisons; all get `IS NULL`. Value suggestions are the distinct values in the panel's time range, narrowed by the other filters in the same AND group. |
 | **SELECT** | `mean`, `median`, `sum`, `count`, `count distinct`, `min`, `max`, `first`, `last` (earliest/latest by time), `stddev`, `spread`, `percentile`, `count rows`, or `raw` (no aggregation). Then optionally a transformation and math (below). Aliases default to the function name (or the transformation's), as in InfluxQL; a repeated default gets `_1`, `_2`. |
-| **GROUP BY** | `time($__interval)` (or a fixed interval) and tag columns. Each tag set becomes its own series. |
+| **GROUP BY** | `time($__interval)` (or a fixed interval) and tag columns. Each tag set becomes its own series. In a time series, `fill()` gives every series a point in every bucket ([Filling gaps](#filling-gaps)); with a transformation only `null` is offered. |
 
 Arc keeps no tag/field marker, so the builder goes by column type: text columns are offered for filters and GROUP BY, numeric ones for aggregation. Columns come from Arc's stored schema; a measurement written before Arc kept one gets its columns from its last 24 hours of data (marked "inferred").
 
@@ -175,7 +175,7 @@ Transformations need values in time order: `GROUP BY time`, or a raw time series
 
 **Builder and Code.** **Edit as SQL** (or the **Code** toggle) switches to the SQL editor with the builder's SQL. Going back to **Builder** asks first: code changes are not carried into the builder, which reopens its last state. Queries saved before the builder existed, and any query whose SQL was edited outside the builder, open in Code unchanged.
 
-Not in the builder yet (use Code): `fill()`, `OR` and grouped filters, math between fields, and `GROUP BY *`.
+Not in the builder (use Code): explicit parentheses beyond AND-before-OR, math between fields, and `GROUP BY *` (Arc keeps no tag marker, so it would group by every text field too).
 
 ### Query Editor (Code)
 

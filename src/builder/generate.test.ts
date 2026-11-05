@@ -4,6 +4,7 @@ import {
   generate,
   isNumberLexeme,
   isValidInterval,
+  lookupFilters,
   parseMath,
   valuesSQL,
   variableName,
@@ -672,5 +673,86 @@ describe('generate: buckets before the range (InfluxQL parity)', () => {
       })
     );
     expect(out).toContain(`WHERE $__timeFilterLookback(time, '5m', 1) AND "host" = 'a'`);
+  });
+});
+
+describe('generate: fill (plan v2 §3.3)', () => {
+  const filled = (fill: string, patch: Partial<BuilderQuery> = {}) =>
+    b({
+      select: [{ column: 'v', fn: 'mean' }],
+      groupBy: { time: { interval: '$__interval', fill }, tags: [] },
+      ...patch,
+    });
+
+  test.each([
+    ['null', 'NULL'],
+    ['previous', 'previous'],
+    ['linear', 'linear'],
+    ['0', '0'],
+    ['-1.5', '-1.5'],
+  ])('fill %s becomes $__timeGroup’s third argument', (fill, arg) => {
+    expect(sql(filled(fill))).toContain(`$__timeGroup(time, $__interval, ${arg}) AS "time"`);
+  });
+
+  test('a table is never filled, so its SQL has no fill', () => {
+    expect(sql(filled('0'), 'table')).toContain('$__timeGroup(time, $__interval) AS "time"');
+  });
+
+  test('with a transformation, only null; it goes on the CTE’s bucket', () => {
+    const t = { select: [{ column: 'v', fn: 'max' as const, transform: { kind: 'difference' as const } }] };
+    expect(sql(filled('null', t))).toContain('$__timeGroup(time, $__interval, NULL) AS "__t"');
+    expect(errors(filled('0', t)).join()).toMatch(/fill can only be null/);
+  });
+
+  test('refuses anything else', () => {
+    expect(errors(filled('zero')).join()).toMatch(/not a fill/);
+    expect(errors(filled('0); DROP')).join()).toMatch(/not a fill/);
+  });
+});
+
+describe('generate: OR filters (plan v2 §3.4)', () => {
+  const f = (column: string, value: string, connector?: 'AND' | 'OR'): Filter => ({
+    column,
+    op: '=',
+    value,
+    valueType: 'string',
+    connector,
+  });
+  const where = (filters: Filter[]) => sql(b({ select: [{ column: 'v', fn: 'mean' }], where: filters })).split('\n')[2];
+
+  test('AND only: unchanged from v1', () => {
+    expect(where([f('a', 'x'), f('b', 'y')])).toBe(`WHERE $__timeFilter(time) AND "a" = 'x' AND "b" = 'y'`);
+  });
+
+  test('AND binds tighter; every OR branch is inside the time filter', () => {
+    expect(where([f('a', 'x'), f('b', 'y'), f('c', 'z', 'OR')])).toBe(
+      `WHERE $__timeFilter(time) AND (("a" = 'x' AND "b" = 'y') OR "c" = 'z')`
+    );
+    expect(where([f('a', 'x'), f('b', 'y', 'OR'), f('c', 'z')])).toBe(
+      `WHERE $__timeFilter(time) AND ("a" = 'x' OR ("b" = 'y' AND "c" = 'z'))`
+    );
+  });
+
+  test('the first filter’s connector is ignored', () => {
+    expect(where([f('a', 'x', 'OR'), f('b', 'y')])).toBe(`WHERE $__timeFilter(time) AND "a" = 'x' AND "b" = 'y'`);
+  });
+
+  test('a lookup applies only its own AND-group', () => {
+    const filters = [f('a', 'x'), f('b', 'y', 'OR'), f('c', 'z')];
+    expect(lookupFilters(filters, 2).map((x) => x.column)).toEqual(['b']);
+    expect(lookupFilters(filters, 0)).toEqual([]);
+    const v = valuesSQL(b({}), 'c', lookupFilters(filters, 2), '', 100)!;
+    expect(v).toContain(`WHERE $__timeFilter(time) AND "b" = 'y'\n`);
+  });
+
+  test('with transformations, the lookback filter still comes first', () => {
+    const out = sql(
+      b({
+        select: [{ column: 'v', fn: 'max', transform: { kind: 'difference' } }],
+        where: [f('a', 'x'), f('b', 'y', 'OR')],
+        groupBy: { time: { interval: '5m' }, tags: [] },
+      })
+    );
+    expect(out).toContain(`WHERE $__timeFilterLookback(time, '5m', 1) AND ("a" = 'x' OR "b" = 'y')`);
   });
 });
