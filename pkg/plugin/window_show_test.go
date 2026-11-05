@@ -25,6 +25,10 @@ func TestWindowFunctionWithTimeGroupIsNotSplit(t *testing.T) {
 		{"named window", `SELECT $__timeGroup(time, '1m') AS "time", avg(v) - lag(avg(v)) OVER w AS d FROM t WHERE $__timeFilter(time) GROUP BY 1 WINDOW w AS (ORDER BY 1)`, false},
 		{"inline window", `SELECT $__timeGroup(time, '1m') AS "time", sum(avg(v)) OVER (ORDER BY 1) AS s FROM t WHERE $__timeFilter(time) GROUP BY 1`, false},
 		{"CTE", "WITH b AS (SELECT $__timeGroup(time, '1m') AS t, max(v) AS v FROM m WHERE $__timeFilter(time) GROUP BY 1)\nSELECT t, v - lag(v) OVER (ORDER BY t) FROM b", false},
+		// A builder transformation whose buckets are wider than a chunk: the
+		// bucket rule would refuse the split too, and the editor must still
+		// learn the reason that always applies.
+		{"builder transformation", "WITH arc_builder_buckets AS (SELECT $__timeGroup(time, '2h') AS \"__t\", max(v) AS \"__v0\" FROM m WHERE $__timeFilterLookback(time, '2h', 1) GROUP BY 1)\nSELECT \"__t\" AS \"time\", \"__v0\" - lag(\"__v0\") OVER w AS d FROM arc_builder_buckets WINDOW w AS (ORDER BY \"__t\") QUALIFY \"__t\" >= $__timeGroupStart('2h')", false},
 		{"control: no window", `SELECT $__timeGroup(time, '1m') AS "time", avg(v) FROM t WHERE $__timeFilter(time) GROUP BY 1`, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {

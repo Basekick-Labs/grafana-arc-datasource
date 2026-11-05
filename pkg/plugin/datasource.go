@@ -826,6 +826,18 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 	stripped := newStrippedSQL(qm.SQL)
 
 	switch {
+	case splitting && windowFnRe.MatchString(stripped.stripped):
+		// First, so the editor learns the reason even when another rule
+		// would also refuse (the builder's transformations use
+		// $__timeFilterLookback, which the time-filter rule does not count).
+		// A window function reads rows across the whole range: lag() at a
+		// chunk's first bucket has no predecessor, and running sums restart
+		// per chunk. containsAggregationWithoutTimeGroup stops at
+		// $__timeGroup, so `avg(x) - lag(avg(x)) OVER (...)` over time
+		// buckets used to be split and came back wrong at every chunk edge.
+		log.DefaultLogger.Debug("Skipping split for window function", "refId", qm.RefID)
+		splitting = false
+		qm.splitSkipped = "window function"
 	case splitting && !hasTimeFilterMacro(stripped):
 		// No time macros (or all commented out) → nothing to split along.
 		log.DefaultLogger.Debug("Skipping split for query without time filter", "refId", qm.RefID)
@@ -846,15 +858,6 @@ func (d *ArcDatasource) query(ctx context.Context, settings *ArcInstanceSettings
 		log.DefaultLogger.Debug("Skipping split: bucket wider than chunk",
 			"refId", qm.RefID, "timezone", qm.Timezone, "chunk", chunkSize.String())
 		splitting = false
-	case splitting && windowFnRe.MatchString(stripped.stripped):
-		// A window function reads rows across the whole range: lag() at a
-		// chunk's first bucket has no predecessor, and running sums restart
-		// per chunk. containsAggregationWithoutTimeGroup stops at
-		// $__timeGroup, so `avg(x) - lag(avg(x)) OVER (...)` over time
-		// buckets used to be split and came back wrong at every chunk edge.
-		log.DefaultLogger.Debug("Skipping split for window function", "refId", qm.RefID)
-		splitting = false
-		qm.splitSkipped = "window function"
 	case splitting && containsAggregationWithoutTimeGroup(stripped):
 		// Aggregations without time bucketing span the full range; each chunk
 		// aggregating independently produces wrong results (COUNT duplicated,
