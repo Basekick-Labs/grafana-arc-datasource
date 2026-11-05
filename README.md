@@ -271,7 +271,24 @@ GROUP BY 1, 2
 
 ### Variables
 
-Create dashboard variables to make queries dynamic:
+New variables open in a builder, as InfluxQL's `SHOW` statements did:
+
+| Kind | Lists | From |
+|---|---|---|
+| **Tag values** | distinct values of a column, optionally filtered (AND/OR, variables allowed), in the dashboard's time range | `SELECT DISTINCT …`, shown in the editor |
+| **Tag keys** | a measurement's text and boolean columns (or all columns) | Arc's schema |
+| **Measurements** | measurements in a database | Arc |
+| **Databases** | databases the API key can read; a key limited to one database gets that one | Arc |
+
+- **Chaining:** a tag-values filter can use another variable, e.g. `region = $region`. A single selection becomes a quoted literal and a multi-selection an `IN` list, as in panels.
+- **Time range:** tag values follow the time range only when the variable's **Refresh** is "On time range change".
+- **Existing variables** open in **Code**, unchanged.
+
+**Downgrading** to a plugin older than this release:
+- databases and measurements variables keep working, since they store the equivalent `SHOW` statement;
+- tag keys variables fail, as they have no SQL form.
+
+In Code mode, write any SQL; the values come from the first text column:
 
 **Host variable:**
 ```sql
