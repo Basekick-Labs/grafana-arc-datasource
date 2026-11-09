@@ -283,11 +283,11 @@ func newHTTPClient(timeout time.Duration, policy dialPolicy, maxInFlight int) *h
 		maxInFlight = DefaultMaxInFlight
 	}
 	transport := &http.Transport{
-		// Honour HTTP_PROXY / HTTPS_PROXY / NO_PROXY. The custom transport
-		// added in 1.3.2 omitted this, so a Grafana behind a corporate egress
-		// proxy silently stopped reaching a cloud-hosted Arc — http.Transport
-		// defaults to no proxy, unlike http.DefaultTransport.
-		Proxy:       http.ProxyFromEnvironment,
+		// Do not use environment-configured HTTP proxies here. With a proxy,
+		// DialContext only validates the proxy address while the proxy resolves
+		// and connects to the datasource host, bypassing the destination IP
+		// policy (including the link-local/cloud-metadata blocklist). Direct
+		// dialing keeps destination resolution and validation in safeDialContext.
 		DialContext: safeDialContext(policy),
 		// This transport serves ONE host (the datasource's Arc URL), so all
 		// three limits are sized from the same budget.
