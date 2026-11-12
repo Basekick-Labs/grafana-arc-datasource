@@ -76,6 +76,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour.
 
 ### Fixed
+- With `HTTP_PROXY` / `HTTPS_PROXY` set, the datasource no longer reaches
+  addresses its URL policy forbids. The policy was applied only to the
+  connection the plugin opens itself, which behind a proxy is the proxy, so a
+  datasource URL (or a redirect) naming the cloud metadata address
+  169.254.169.254, or a private address with **Allow Private IPs** off, was
+  fetched by the proxy. Proxied requests are now checked against the same
+  policy first, including every redirect and `https` (CONNECT) targets.
+  Numeric spellings of an address that a proxy may read as an IP
+  (`2852039166`, `0xa9fea9fe`, `169.254.43518`) are refused. Proxy support
+  itself is unchanged. A host name that resolves only at the proxy is still
+  sent to it; the proxy's own egress rules cover what it resolves to. The
+  check adds one local DNS lookup per host every 30 seconds (at most 2
+  seconds) when a proxy is in use, and nothing when none is. Reported by
+  @lecodev-26 (#30).
 - A query with a window function (`OVER`) and `$__timeGroup` is no longer
   split. Query splitting ran it per chunk, so `lag()` had no previous row at
   each chunk's first bucket and running sums restarted: a derivative over two
