@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
@@ -261,6 +262,136 @@ func isLoopbackURL(raw string) bool {
 	return false
 }
 
+// proxyCheckingDestination wraps a proxy selector so a request that will go
+// through a proxy is first checked against the same dial policy as a direct
+// connection. Without it, HTTP_PROXY/HTTPS_PROXY bypassed the policy: the
+// dialer only validated the proxy's address, and the proxy then fetched
+// whatever the datasource URL (or a redirect) named, including the cloud
+// metadata address 169.254.169.254. The Transport calls this for every
+// request, so redirect hops and https (CONNECT) targets are covered too.
+//
+// The destination is resolved locally. A literal IP never needs DNS. If ANY
+// resolved address is blocked the request is refused, which is stricter than
+// the direct dialer (that one skips blocked addresses and dials the rest),
+// because which address the proxy will pick is out of our hands.
+//
+// A host that does not resolve locally is let through to the proxy: behind
+// an egress proxy, external names often resolve only at the proxy, and
+// refusing them would break exactly the deployments proxy support exists for.
+// Two exceptions are refused instead, because a proxy that resolves with
+// getaddrinfo reads them as an IP address while Go's resolver (the plugin is
+// built without cgo) does not: a host whose last label is all digits or
+// 0x-hex (`2852039166`, `0xa9fea9fe`, `169.254.43518`, `0251.0376.0251.0376`;
+// no top-level domain looks like that), and an IP with a trailing dot, which
+// is checked as that IP. The residual risk is a real name that resolves
+// differently at the proxy than here (split-horizon DNS or rebinding); the
+// proxy's own egress rules are the control for that.
+//
+// The lookup is bounded by proxyLookupTimeout, and each host's verdict is
+// cached for proxyVerdictTTL, so a local resolver that times out on external
+// names costs at most one bounded wait per host per TTL, not one per query.
+//
+// Requests that do not use a proxy (no proxy set, NO_PROXY match, loopback)
+// return here unchanged and are checked at dial time.
+func proxyCheckingDestination(proxy func(*http.Request) (*url.URL, error), policy dialPolicy) func(*http.Request) (*url.URL, error) {
+	if proxy == nil {
+		return nil
+	}
+	var mu sync.Mutex
+	verdicts := map[string]proxyVerdict{}
+	return func(req *http.Request) (*url.URL, error) {
+		proxyURL, err := proxy(req)
+		if err != nil || proxyURL == nil {
+			return proxyURL, err
+		}
+		host := req.URL.Hostname()
+		now := time.Now()
+		mu.Lock()
+		v, ok := verdicts[host]
+		mu.Unlock()
+		if !ok || now.After(v.expires) {
+			v = proxyVerdict{err: checkProxiedHost(req.Context(), host, policy), expires: now.Add(proxyVerdictTTL)}
+			if req.Context().Err() == nil {
+				mu.Lock()
+				if len(verdicts) >= proxyVerdictCacheMax {
+					clear(verdicts)
+				}
+				verdicts[host] = v
+				mu.Unlock()
+			}
+		}
+		if v.err != nil {
+			return nil, v.err
+		}
+		return proxyURL, nil
+	}
+}
+
+const (
+	proxyLookupTimeout   = 2 * time.Second
+	proxyVerdictTTL      = 30 * time.Second
+	proxyVerdictCacheMax = 256
+)
+
+type proxyVerdict struct {
+	err     error
+	expires time.Time
+}
+
+// checkProxiedHost returns an errBlockedAddr error when host must not be sent
+// to a proxy under policy, nil otherwise. See proxyCheckingDestination.
+func checkProxiedHost(ctx context.Context, host string, policy dialPolicy) error {
+	trimmed := strings.TrimSuffix(host, ".")
+	if ip := net.ParseIP(trimmed); ip != nil {
+		if isBlockedIP(ip, policy) {
+			return fmt.Errorf("%w: %s is blocked address %s (request was going through a proxy)", errBlockedAddr, host, ip)
+		}
+		return nil
+	}
+	if numericLastLabel(trimmed) {
+		return fmt.Errorf("%w: %s is not a host name or a canonical IP address (request was going through a proxy)", errBlockedAddr, host)
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, proxyLookupTimeout)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(lookupCtx, trimmed)
+	if err != nil {
+		// Resolvable only at the proxy: see proxyCheckingDestination.
+		return nil
+	}
+	for _, ip := range ips {
+		if isBlockedIP(ip.IP, policy) {
+			return fmt.Errorf("%w: %s resolves to blocked address %s (request was going through a proxy)", errBlockedAddr, host, ip.IP)
+		}
+	}
+	return nil
+}
+
+// numericLastLabel reports whether the last dot-separated label of host is all
+// decimal digits or a 0x hex number: never a valid top-level domain, but an
+// IPv4 address to inet_aton (`2852039166`, `0xa9fea9fe`, `169.254.43518`).
+func numericLastLabel(host string) bool {
+	label := host[strings.LastIndex(host, ".")+1:]
+	if label == "" {
+		return false
+	}
+	digits := label
+	if len(label) > 2 && (label[:2] == "0x" || label[:2] == "0X") {
+		digits = label[2:]
+		for _, c := range digits {
+			if !strings.ContainsRune("0123456789abcdefABCDEF", c) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // newHTTPClient builds a long-lived http.Client that:
 //   - refuses to connect to private/loopback/metadata addresses,
 //   - validates redirects against the same blocklist,
@@ -279,6 +410,14 @@ func isLoopbackURL(raw string) bool {
 // a loopback URL would also open RFC1918 redirects (gemini round 5 finding
 // 3244943519).
 func newHTTPClient(timeout time.Duration, policy dialPolicy, maxInFlight int) *http.Client {
+	return newHTTPClientWithProxy(timeout, policy, maxInFlight, http.ProxyFromEnvironment)
+}
+
+// newHTTPClientWithProxy is newHTTPClient with the proxy selector injected.
+// Production passes http.ProxyFromEnvironment, which reads the environment
+// once per process and never proxies a loopback host, so tests inject
+// http.ProxyURL instead.
+func newHTTPClientWithProxy(timeout time.Duration, policy dialPolicy, maxInFlight int, proxy func(*http.Request) (*url.URL, error)) *http.Client {
 	if maxInFlight <= 0 {
 		maxInFlight = DefaultMaxInFlight
 	}
@@ -287,7 +426,12 @@ func newHTTPClient(timeout time.Duration, policy dialPolicy, maxInFlight int) *h
 		// added in 1.3.2 omitted this, so a Grafana behind a corporate egress
 		// proxy silently stopped reaching a cloud-hosted Arc — http.Transport
 		// defaults to no proxy, unlike http.DefaultTransport.
-		Proxy:       http.ProxyFromEnvironment,
+		//
+		// When a proxy is used, DialContext only sees the PROXY's address and
+		// the proxy connects to the datasource host itself, so
+		// proxyCheckingDestination applies the dial policy to the destination
+		// before the request is handed to the proxy (#30).
+		Proxy:       proxyCheckingDestination(proxy, policy),
 		DialContext: safeDialContext(policy),
 		// This transport serves ONE host (the datasource's Arc URL), so all
 		// three limits are sized from the same budget.
